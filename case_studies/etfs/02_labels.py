@@ -28,7 +28,7 @@
 # - Size the independent information in an overlapping label, and seal a diagnostic on the
 #   label's endpoint rather than its observation date
 # - Establish the baseline a feature must clear, on the panel features are scored on, under a
-#   standard error that prices in the overlap
+#   standard error that accounts for the overlap
 #
 # ## Book reference, prerequisites and artifacts
 #
@@ -36,9 +36,8 @@
 # and dividend-adjusted daily bars via `load_etfs()` (verified in
 # [`01_feasibility_analysis`](01_feasibility_analysis.ipynb)) and `config/setup.yaml`,
 # which declares the label set, horizons and holdout boundary. Writes
-# `labels/fwd_ret_21d.parquet` and `labels/fwd_ret_5d.parquet`, each with a `.digest.json`
-# sidecar. `03_financial_features.py` reads whichever is `labels.primary`, for its feature
-# evaluation only; nothing reads the sidecars yet - see section H.
+# `labels/fwd_ret_21d.parquet` and `labels/fwd_ret_5d.parquet`;
+# `03_financial_features.py` reads whichever of the two `setup.yaml` names as primary.
 
 # %%
 """ETFs: Label Engineering."""
@@ -65,13 +64,16 @@ warnings.filterwarnings("ignore")
 CASE_DIR = get_case_study_dir("etfs")
 LABELS_DIR = CASE_DIR / "labels"
 
+# %% [markdown]
+# Three parameters to override for a shorter run. `MAX_SYMBOLS` and `START_DATE` cut the
+# universe and the history; both are unset here, so the notebook uses everything `load_etfs()`
+# returns. `MIN_SYMBOLS_FOR_DISPERSION` is a floor on the cross-section: Section E measures
+# how far apart the symbols are on each date, and a standard deviation over two or three
+# symbols is noise rather than a measurement, so dates that thin are left out of it.
+
 # %% tags=["parameters"]
-# Production runs both as None; CI overrides only START_DATE. MAX_SYMBOLS stays unset: the CI
-# fixture is already reduced, and stage 03 needs 10+ non-null labels per date to compute IC.
 MAX_SYMBOLS = None
 START_DATE = None
-# F4 takes a standard deviation across symbols on each date; across two or three symbols that
-# is noise, so thinner dates are dropped. This floor holds in CI too.
 MIN_SYMBOLS_FOR_DISPERSION = 10
 
 # %% [markdown]
@@ -116,11 +118,18 @@ print(f"Holdout starts {HOLDOUT_START}; diagnostics below are sealed on the labe
 #
 # A forward window is meaningful only on a price series that is adjusted, ordered and
 # complete; sorting by `symbol` then `timestamp` is what makes a shift mean "the next session
-# for this ETF". **No eligibility filter is applied before the shift, and that ordering is not
-# a detail:** dropping ineligible rows first makes the shift count surviving rows, so the
-# horizon stops being measured in trading sessions and the label silently spans the gap.
-# Eligibility (`eligibility.csv`) is applied *after* the labels exist: to the section G
-# baseline, and to the trainable panel in `03_financial_features`.
+# for this ETF".
+#
+# The labels are built on the full price history, and the eligibility rules in
+# `eligibility.csv` are applied afterwards - to the Section G baseline, and to the trainable
+# panel in `03_financial_features`. Doing it the other way round breaks the label: with the
+# ineligible rows already dropped, a shift of $h$ counts $h$ *surviving* rows, so a symbol
+# that leaves the universe for a year and returns gets a label spanning that year while still
+# calling itself a one-month return.
+#
+# The hash printed below covers exactly the columns the labels are built from. Section H
+# stores it beside each label file, which is what ties a stored label to the price data it
+# came from.
 
 # %%
 prices = load_etfs().select(["symbol", "timestamp", "close"]).sort(["symbol", "timestamp"])
@@ -132,8 +141,6 @@ if MAX_SYMBOLS is not None:
         pl.col("symbol").is_in(sorted(prices["symbol"].unique().to_list())[:MAX_SYMBOLS])
     )
 
-# Digest of the data the labels are built from, recorded as every label's `inputs`: a
-# re-run against a refreshed download is otherwise indistinguishable from this one.
 MARKET_DATA_DIGEST = value_digest(prices, ["symbol", "timestamp", "close"])
 
 print(f"{prices['symbol'].n_unique()} ETFs, {len(prices):,} rows")
@@ -145,19 +152,15 @@ print(f"market_data digest: {MARKET_DATA_DIGEST}")
 #
 # One execution convention, written once, applied to both horizons:
 #
-# $$\text{fwd\_ret}^{(h)}_{i,t} = \frac{P_{i,t+h}}{P_{i,t}} - 1$$
+# $$r^{(h)}_{i,t} = \frac{P_{i,t+h}}{P_{i,t}} - 1$$
 #
-# where $P$ is the adjusted close and $t+h$ counts $h$ **trading sessions** for symbol $i$:
-# Chapter 7.2's close-to-close convention. It is a deliberate choice of target, not a forced
-# one - `setup.yaml` places execution at the next open and these bars carry an open, so a
-# next-open target is expressible; close-to-close is the convention Chapter 7 develops. The
-# difference between it and the backtest's fill is a real gap that nothing here measures:
-# `16_costs` sweeps commission and half-spread, not the return definition. Both labels share
-# the anchor and differ only in $h$; Section H prints each definition.
-#
-# The arithmetic stays local rather than calling `fixed_time_horizon_labels`, which computes
-# the identical $(P_{t+h}-P_t)/P_t$ but agrees only to a rounding step - enough to change the
-# digest and everything derived from it. Adopting it is one deliberate change across all nine.
+# where $P$ is the adjusted close and $t+h$ counts $h$ **trading sessions** for symbol $i$.
+# This is Chapter 7.2's close-to-close convention, and it is a choice: these bars carry an
+# open and `setup.yaml` places execution at the next open, so a next-open target could be
+# built here instead. The gap between a close-to-close label and a next-open fill is real and
+# this notebook does not measure it; `16_costs` sweeps commission and half-spread, which are
+# different costs. The two labels, written to columns `fwd_ret_21d` and `fwd_ret_5d`, share
+# the anchor and differ only in $h$.
 
 
 # %%
@@ -180,14 +183,25 @@ print(f"Constructed {', '.join(LABEL_NAMES)}")
 # ## D. Window validity
 #
 # A shift always returns something; the question is whether it is the quantity the label
-# claims. The four properties below all fail silently, so they are asserted rather than
-# described. The tolerance for the second is derived, not tuned: $h$ trading sessions span
-# about $7h/5$ calendar days on a five-session week, plus a week for exchange holidays.
+# claims. Four properties have to hold, and each can fail without raising an error and leave
+# numbers that still look reasonable, so the cell below checks them with `assert` statements
+# that stop the run:
 #
-# Note what that second property does and does not establish. It bounds a window's *calendar*
-# span, catching a hole of a week or more - a delisting, an outage - but not one missing
-# session, which widens the window by a day and stays inside the tolerance. Proving exactly $h$
-# *exchange* sessions needs a session calendar this notebook does not carry.
+# 1. A row whose forward window is incomplete carries a null, never a value.
+# 2. No labelled window spans a gap in the data. The tolerance is derived rather than tuned:
+#    $h$ trading sessions cover about $7h/5$ calendar days on a five-session week, plus a
+#    week for exchange holidays.
+# 3. No label crosses from one symbol into the next. The labelled row count equals the bar
+#    count less $h$ rows per symbol, which can only hold if every window closed inside the
+#    symbol it opened in.
+# 4. No discrete label is derived from a null return. That is trivially true here, where both
+#    labels are continuous, and it matters wherever a direction label comes from a comparison:
+#    a null return fails the comparison and falls through to the "down" class.
+#
+# Property 2 bounds the window's *calendar* span, which catches a hole of a week or more - a
+# delisting, an outage. A single missing session widens the window by one day and stays inside
+# the tolerance, so proving exactly $h$ *exchange* sessions would need a session calendar this
+# notebook does not carry.
 
 # %%
 for label_name, horizon in HORIZONS.items():
@@ -201,18 +215,15 @@ for label_name, horizon in HORIZONS.items():
     tail = spanned.filter(pl.col("from_end") < horizon)
     labelled = spanned.drop_nulls(label_name)
 
-    # 1. An incomplete forward window is null, never a value.
+    # 1.
     assert tail[label_name].null_count() == tail.height, f"{label_name}: valued incomplete window"
-    # 2. A window spanning a gap wider than tolerance would be null; none exist here.
+    # 2.
     assert labelled.filter(pl.col("_span") > tol).height == 0, f"{label_name}: window gap"
-    # 3. No label crosses an entity boundary: the labelled count equals the bar count less
-    #    `horizon` rows per symbol, which holds only if every window closed in its symbol.
+    # 3.
     assert labelled.height == len(prices) - horizon * prices["symbol"].n_unique(), (
         f"{label_name}: label crosses a symbol boundary"
     )
-    # 4. No discrete label is derived from a null return - vacuous here by dtype, since
-    #    this notebook writes continuous labels only and that defect lives in direction
-    #    labels, where a null predicate falls through to the "down" class.
+    # 4.
     assert labels_df.schema[label_name] == pl.Float64, f"{label_name}: unexpected dtype"
 
     spans = labelled["_span"]
@@ -221,12 +232,15 @@ for label_name, horizon in HORIZONS.items():
         f"against a {tol}d tolerance, {tail.height:,} tail rows null"
     )
 
+# %% [markdown]
+# The assertions above pass or the notebook stops, but they do not show *where* the label
+# ends. The figure below does: position zero is each symbol's last session, and the share of
+# symbols carrying a label should fall to zero over exactly the last `horizon` positions and
+# sit flat at one before them. A single "N valid" count hides both of the failures this
+# catches - one label silently masked by another label's null set, and a tail filled in where
+# it should be null.
+
 # %%
-# F2. Validity at the window boundary. Position zero is each symbol's last session; the
-# non-null rate must fall to zero over exactly the last `horizon` positions and be flat at
-# one before. A scalar "N valid" shows neither failure this catches - a label masked by
-# another label's null set, or a tail fabricated instead of nulled. It reads only the null
-# structure, never a value, so it is not sealed: it describes the artifact's shape.
 profile = (
     labels_df.filter(pl.col("from_end") <= max(HORIZONS.values()) + 3)
     .group_by("from_end")
@@ -278,9 +292,13 @@ dev = {
 for label_name, frame in dev.items():
     print(f"{label_name}: {frame.height:,} development rows through {frame['timestamp'].max()}")
 
+# %% [markdown]
+# Both labels are drawn on one axis with identical bins. A table of means and standard
+# deviations would give the widths, but the claim worth checking is about shape: a label over
+# $h$ sessions should be roughly $\sqrt{h}$ times as wide as a one-session label, and whether
+# the two distributions actually stand in that relation is something only the overlay shows.
+
 # %%
-# F1. Both labels on one shared axis with identical bins. The horizon scaling - a label
-# roughly sqrt(h) times wider - is a claim about shape a column of moments cannot support.
 bins = np.linspace(-0.20, 0.20, 61)
 std = {n: dev[n][n].std() for n in LABEL_NAMES}
 ratio = std[PRIMARY_LABEL] / std[VARIANT_LABEL]
@@ -309,16 +327,18 @@ add_message_title(
 ax.legend(loc="upper left", frameon=False)
 plt.show()
 
-# %%
-# F4. Dispersion through time. A cross-sectional label is comparable across regimes only
-# if the spread the model ranks within is roughly stable; where it is not, the same IC buys
-# a different amount of return.
+# %% [markdown]
+# The second stability question is about the spread the model ranks within. A cross-sectional
+# model is scored on how well it orders symbols on a date, so the return that ordering earns
+# depends on how far apart the symbols are that day. Where the spread doubles, the same
+# information coefficient buys twice the return.
 #
-# The spread is taken across symbols on each date first, and only then averaged over the
-# year. Pooling every symbol-date in the year into one standard deviation instead would
-# measure something else - it would add the movement of the panel's own mean from date to
-# date to the spread across symbols on a date, and it is only the second that a
-# cross-sectional ranking model is scored on.
+# The spread is therefore measured across symbols on each date first, and those daily values
+# are averaged over the year. Pooling every symbol-date in a year into one standard deviation
+# would measure something else, because it would fold the movement of the panel's own mean
+# from date to date into a quantity meant to capture only the distance between symbols.
+
+# %%
 daily_dispersion = (
     dev[PRIMARY_LABEL]
     .group_by("timestamp")
@@ -365,14 +385,22 @@ print(
 # ## F. Overlap and effective sample size
 #
 # Daily sampling of a multi-session label makes consecutive rows share most of their forward
-# window, so the row count overstates the information carried. Two measurements: how fast the
-# overlap decays, and what the row count is worth once it is priced in. `effective_sample_size`
-# applies Ch7.2's average-uniqueness weighting per symbol - concurrency is a property of one
-# entity's windows.
+# window, so the row count overstates how much the sample actually tells us. Two measurements
+# follow: how fast the overlap decays, and what the row count is worth once the overlap is
+# accounted for. `effective_sample_size` applies Chapter 7.2's average-uniqueness weighting
+# one symbol at a time, since it is only one symbol's own windows that overlap each other.
+#
+# A label over $h$ sessions is built from the $h$ returns realised inside its window, and the
+# label one session later shares $h-1$ of them. Average uniqueness therefore approaches
+# $1/h$, and the effective count approaches $N/h$ - a bound worth carrying, because it says
+# what a longer horizon costs before any of it is measured.
+
+# %% [markdown]
+# The figure below shows how fast the overlap decays. It is computed across the whole panel:
+# run on a single asset the same code answers a question about that asset, and the two
+# estimates disagree most around the horizon, which is the lag the purge gap depends on.
 
 # %%
-# F3. Overlap decay across the panel. Computed on one asset this would be a claim about
-# that asset: pooled and single-symbol estimates disagree most at the lag that matters.
 max_lag = PRIMARY_HORIZON + 4
 acf = panel_autocorrelation(dev[PRIMARY_LABEL], PRIMARY_LABEL, max_lag=max_lag)
 n_rows, n_eff = effective_sample_size(dev[PRIMARY_LABEL], horizon=PRIMARY_HORIZON)
@@ -399,8 +427,6 @@ add_message_title(
 ax.legend(loc="upper right", frameon=False)
 plt.show()
 
-# A horizon-h label consumes the h returns realised over its window, and its neighbour
-# one bar later shares h-1 of them, so average uniqueness converges to 1/h.
 print(
     f"{PRIMARY_LABEL}: N={n_rows:,} N_eff={n_eff:,.0f} ({n_eff / n_rows:.2%} of N, against "
     f"{1 / PRIMARY_HORIZON:.2%} for windows that overlap as fully as this one)"
@@ -417,21 +443,29 @@ print(f"  autocorrelation at lag one {acf[0]:.3f}, at the horizon {acf[PRIMARY_H
 # %% [markdown]
 # ## G. Baseline floor
 #
-# One signal, against the primary label, on the sealed development window: the raw momentum the
-# hypothesis names, with no feature engineering. Establishing this floor first is what keeps a
-# later improvement honest. The IC is the per-date cross-sectional rank correlation averaged
-# over dates, never pooled across them, which would mix a cross-sectional claim with a
-# time-series one. The minimum cross-section is half the median rather than a bare integer, so
-# it means the same thing at a different size. The standard error is HAC-adjusted: the IC
-# series inherits the label's overlap, so the naive statistic treats correlated dates as
-# independent evidence.
+# One signal, against the primary label, on the sealed development window: the raw momentum
+# the hypothesis names, with no feature engineering. Measuring it first is what keeps a later
+# improvement honest, because every engineered feature is then compared against a number that
+# was fixed before the feature existed.
+#
+# The signal is scored the same way every feature will be. The IC is the cross-sectional rank
+# correlation computed per date and averaged over dates; pooling every symbol-date into one
+# correlation instead would answer a time-series question with a cross-sectional statistic.
+# The minimum cross-section is set at half the median rather than as a fixed count, so it
+# means the same thing on a universe of a different size. The standard error is HAC-adjusted,
+# because the IC series inherits the label's overlap and the naive standard error would count
+# correlated dates as independent evidence.
+
+# %% [markdown]
+# The baseline is measured on the same rows the features will be measured on:
+# `03_financial_features` keeps a feature row only where the `(symbol, year)` pair appears in
+# `eligibility.csv`, so the same semi-join runs here. Skipping it would score momentum on
+# symbol-years the features are never allowed to see, and a floor measured on one panel does
+# not bound what a feature achieves on another.
 
 # %%
 LOOKBACK = 126  # two quarters, the momentum window the hypothesis names
 
-# A floor is only a floor on the panel the features are scored on. `03_financial_features`
-# keeps a feature row only where (symbol, year) is in `eligibility.csv`; the same semi-join
-# applies here, or this baseline would sit above anything ever compared against it.
 eligibility = pl.read_csv(CASE_DIR / "eligibility.csv").select(
     "symbol", pl.col("eligible_year").alias("_year")
 )
@@ -447,6 +481,7 @@ baseline = (
 )
 min_obs = int(baseline.group_by("timestamp").len()["len"].median() // 2)
 
+# %%
 ic = cross_sectional_ic_series(
     baseline,
     baseline,
@@ -477,21 +512,19 @@ print(
 # %% [markdown]
 # ## H. Artifacts and the audit record
 #
-# Each label is written with a digest sidecar recording its content hash, row count, key
-# columns and the digest of the price data it was built from.
+# Each label goes to `labels/<name>.parquet`, with a small JSON file beside it holding the
+# label's *digest* - a hash of its contents - along with the row count, the key columns, and
+# the digest of the price data it was built from. Two runs against different downloads write
+# the same file name and different digests, which is what lets a later reader tell one vintage
+# of a label from another.
 #
-# A model run is already pinned to the label *bytes* it trained on: `_training_input_identity`
-# in `case_studies/utils/latent_factors/case_study.py` hashes the label parquet, the feature
-# parquets and `setup.yaml` into one aggregate digest, recorded in the training spec by stages
-# `07`-`10` and the latent-factor path, so two label vintages are distinguishable there.
+# The cross-validation folds the modelling stages use are derived from this file's own
+# timeline, so which rows land here is also what sets where the folds fall.
 #
-# The sidecar itself is not read anywhere yet. It makes the label self-describing where it is
-# written, which is the part this notebook owns; whether a consuming stage should record the
-# digest it consumed is a decision for that stage.
-#
-# **No `cv_config.json` is written here**: folds are derived by `case_studies/utils/cv_window.py`
-# from `setup.yaml` and the label parquet's timeline - from this notebook's artifact rather
-# than a second file describing it, which could only drift from the folds in force.
+# Section 7.2 closes a label definition with a short record of what was decided: the anchor
+# price, the horizon, when the outcome resolves, how much of the forward window consecutive
+# rows share, and the base rate. The second cell below prints that record for each label,
+# built from the values computed above rather than typed in.
 
 # %%
 for label_name in LABEL_NAMES:
@@ -505,8 +538,6 @@ for label_name in LABEL_NAMES:
     print(f"{label_name}.parquet: {record['n_rows']:,} rows, digest {record['digest']}")
 
 # %%
-# The record Chapter 7.2 requires to close a label definition, one row per label, built
-# from the values above rather than written by hand.
 print("\nLabel audit record")
 for label_name, horizon in HORIZONS.items():
     frame = dev[label_name]
@@ -527,20 +558,21 @@ for label_name, horizon in HORIZONS.items():
 # %% [markdown]
 # ## Key takeaways
 #
-# 1. **A label is an execution convention, not a shift.** Writing it as a formula - which
-#    price at which time, to which price at which time - makes it checkable against the
-#    backtest that has to fill it.
-# 2. **Assert the window, do not describe it.** Every property in Section D fails silently
-#    and produces plausible numbers when it does: a tail fabricated instead of nulled, a
-#    window spanning a data gap, a label crossing an entity boundary.
-# 3. **Seal on the label's endpoint.** A row observed before the holdout that resolves
-#    inside it is a holdout row; filtering on the observation date looks sealed and is not.
-# 4. **Count the information, not the rows.** Overlapping windows make the row count a poor
-#    guide to the evidence available, which is what the effective count measures. It does
-#    not set the purge gap - the label's forward window does, and only that: $N_{eff}$ moves
-#    with sampling density and panel length while the gap a fold needs stays at the horizon.
-# 5. **Establish the floor before building features, on the panel they are scored on.** A
-#    baseline measured over a wider universe than the features it gates is not a floor.
+# 1. **Write the label as a formula over tradable prices:** which price at which time, to
+#    which price at which time. Written that way it can be checked against the backtest that
+#    has to fill it.
+# 2. **Check the forward window with assertions.** Each property in Section D fails without
+#    raising an error and leaves plausible numbers behind: a tail filled in where it should
+#    be null, a window spanning a data gap, a label built across two symbols.
+# 3. **Seal on the label's endpoint.** A row observed before the holdout but resolving inside
+#    it is a holdout row; a filter on the observation date leaves it in the development set.
+# 4. **Count the information the rows carry.** Overlapping windows make the row count a poor
+#    guide to how much evidence is available, and the effective count measures what is left.
+#    The purge gap between folds is a separate quantity, set by the forward window alone:
+#    $N_{eff}$ moves with sampling density and panel length, the gap stays at the horizon.
+# 5. **Establish the floor before building features, on the panel the features are scored
+#    on.** A baseline measured over a different universe than the features it gates is not
+#    comparable to them, and here the wider universe puts the bar in the wrong place.
 #
 # **Known limitations.** Close-to-close is not the backtest's next-open execution and nothing
 # here measures the gap; the universe is a fixed, backward-looking list carrying the
