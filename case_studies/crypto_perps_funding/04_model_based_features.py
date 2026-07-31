@@ -108,11 +108,15 @@ training_frame = financial.join(labels, on=["timestamp", "symbol"], how="inner")
     ["timestamp", "symbol", *financial_feature_cols, label_col]
 )
 if MAX_SYMBOLS > 0:
-    # Same rule the shared loader applies: keep the symbols with the most rows.
+    # Same rule the shared loader applies - most rows first - but with the
+    # symbol name as an explicit tie-break. Row counts tie readily on this
+    # panel, and a tie broken by frame order is not stable across runs; the
+    # universe is passed to the loader explicitly below so both sides cannot
+    # disagree even if the rule changes.
     keep = (
         training_frame.group_by("symbol")
         .len()
-        .sort("len", descending=True)
+        .sort(["len", "symbol"], descending=[True, False])
         .head(MAX_SYMBOLS)["symbol"]
         .to_list()
     )
@@ -740,7 +744,7 @@ assert temporal.select("timestamp", "symbol", "fold").is_duplicated().sum() == 0
 FEATURES_DIR.mkdir(parents=True, exist_ok=True)
 temporal.write_parquet(FEATURES_DIR / "model_based.parquet")
 
-assembled = load_modeling_dataset(CASE_STUDY_ID, PRIMARY_LABEL, max_symbols=MAX_SYMBOLS)
+assembled = load_modeling_dataset(CASE_STUDY_ID, PRIMARY_LABEL, symbols=symbols)
 assert len(assembled.feature_names) == 44
 assert set(assembled.temporal_feature_names) == expected_temporal
 assert sorted(assembled.temporal_by_fold["fold"].unique()) == sorted(

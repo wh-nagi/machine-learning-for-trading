@@ -492,16 +492,23 @@ def extract_hmm_features(fold: dict) -> tuple[list[dict], GaussianHMM, np.ndarra
 
 # %% [markdown]
 # The HMM observations are expressed in **percent**, not in native decimal
-# returns. `GaussianHMM` floors the emission covariance at `min_covar=1e-3`, and
-# a daily FX log return has a standard deviation near 0.005, so its variance is
-# about 2.4e-5 - roughly four hundred times smaller than the floor. Fitted in
-# native units the covariance is set by the regularizer rather than by the data,
-# and on the shortest fold EM loses positive definiteness outright and no
-# restart survives the stability check. Scaling by 100 puts the variance above
-# the floor and every fold converges.
+# returns. `GaussianHMM` floors the emission covariance at `min_covar=1e-3`, so
+# an observation series whose variance sits below that floor has its covariance
+# set by the regularizer rather than by the data. Daily FX log returns are such
+# a series, and the cell below measures by how much rather than asserting it.
+# Fitted in native units the shortest fold loses positive definiteness outright
+# and no restart survives the stability check; scaling by 100 lifts the variance
+# clear of the floor and every fold converges.
 
 # %%
 HMM_SCALE = 100.0  # decimal returns -> percent, so min_covar does not dominate
+HMM_MIN_COVAR = 1e-3  # GaussianHMM default; the floor the scaling has to clear
+
+_native_var = usd_daily.drop_nulls(subset=["usd_ret"])["usd_ret"].var()
+print(f"Native daily USD-factor return variance: {_native_var:.3g}")
+print(f"GaussianHMM min_covar floor:             {HMM_MIN_COVAR:.3g}")
+print(f"Floor exceeds the native variance by:    {HMM_MIN_COVAR / _native_var:.0f}x")
+print(f"After scaling by {HMM_SCALE:.0f}:                     {_native_var * HMM_SCALE**2:.3g}")
 
 valid_usd = usd_daily.drop_nulls(subset=["usd_ret", "usd_vol_21d"])
 valid_dates = valid_usd["timestamp"].to_list()
