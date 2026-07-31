@@ -112,3 +112,50 @@ def test_microstructure_pilot_helpers_preserve_current_outputs() -> None:
     assert len(mds.splits) == 2
     assert mds.label_buffer == "15min"
     assert mds.task_type == "regression"
+
+
+def test_universe_reduction_breaks_row_count_ties_on_entity_name() -> None:
+    """Tied row counts must reduce to the same universe on every call.
+
+    ``max_symbols`` picks the entities with the most rows. When counts tie at
+    the cutoff, an unstable sort lets two callers reducing the same dataset to
+    the same size pick different symbols - a reduced stage-04 run and the
+    reduced model notebooks downstream of it, for instance. The symbols only
+    one of them chose then carry null model-based features.
+    """
+    import polars as pl
+
+    # Four symbols, all with identical row counts, so the cutoff is entirely
+    # decided by the tie-break.
+    dataset = pl.DataFrame(
+        {
+            "symbol": [s for s in ("DELTA", "ALPHA", "CHARLIE", "BRAVO") for _ in range(3)],
+            "value": list(range(12)),
+        }
+    )
+
+    def reduce(frame: pl.DataFrame, max_symbols: int) -> list[str]:
+        top = (
+            frame.group_by("symbol")
+            .len()
+            .sort(["len", "symbol"], descending=[True, False])
+            .head(max_symbols)
+        )
+        return sorted(frame.filter(pl.col("symbol").is_in(top["symbol"]))["symbol"].unique())
+
+    expected = ["ALPHA", "BRAVO"]
+    assert reduce(dataset, 2) == expected
+
+    # Same dataset, different row order: the reduction must not move.
+    shuffled = dataset.sort("value", descending=True)
+    assert reduce(shuffled, 2) == expected
+
+    # And the real loader path must use the same rule.
+    import inspect
+
+    import utils.modeling as modeling
+
+    source = inspect.getsource(modeling.load_modeling_dataset)
+    assert '.sort(["len", primary_entity], descending=[True, False])' in source, (
+        "load_modeling_dataset must break row-count ties on the entity name"
+    )

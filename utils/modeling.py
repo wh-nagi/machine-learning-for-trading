@@ -575,7 +575,18 @@ def load_modeling_dataset(
         dataset = dataset.filter(pl.col(primary_entity).is_in(list(symbols)))
     elif max_symbols > 0 and entity_cols:
         primary_entity = entity_cols[0]
-        top = dataset.group_by(primary_entity).len().sort("len", descending=True).head(max_symbols)
+        # Row counts tie readily on these panels, and a tie broken by frame
+        # order is not stable across runs or across callers. The entity name is
+        # the secondary key so that every caller reducing the same dataset to
+        # the same size gets the same universe — otherwise a reduced stage-04
+        # run and the reduced model notebooks downstream of it can disagree,
+        # and the symbols only one of them chose carry null temporal features.
+        top = (
+            dataset.group_by(primary_entity)
+            .len()
+            .sort(["len", primary_entity], descending=[True, False])
+            .head(max_symbols)
+        )
         dataset = dataset.filter(pl.col(primary_entity).is_in(top[primary_entity]))
 
     # Feature columns = everything except IDs and label
