@@ -79,6 +79,7 @@ MAX_FOLDS = 0
 KALMAN_MAXITER = 300
 START_DATE = "2011-01-01"
 N_HMM_RESTARTS = 10
+HMM_N_STATES = 2  # low-volatility vs high-volatility USD regime
 
 # %%
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
@@ -435,7 +436,7 @@ def fit_best_hmm(X_train: np.ndarray) -> tuple[GaussianHMM, float, int]:
     for seed in range(N_HMM_RESTARTS):
         try:
             model = GaussianHMM(
-                n_components=2,
+                n_components=HMM_N_STATES,
                 covariance_type="full",
                 n_iter=100,
                 random_state=seed,
@@ -492,45 +493,54 @@ def extract_hmm_features(fold: dict) -> tuple[list[dict], GaussianHMM, np.ndarra
 
 # %% [markdown]
 # The HMM observations are expressed in **percent**, not in native decimal
-# returns, because `GaussianHMM`'s two covariance regularizers are additive
-# constants chosen for data of order one.
+# returns, because `GaussianHMM` carries two additive covariance regularizers
+# whose defaults are sized for data of order one.
 #
 # - `min_covar=1e-3` is added to the diagonal of the **initial** covariance
 #   (`hmmlearn/hmm.py`, in `_init`: `cv = np.cov(X.T) + self.min_covar * np.eye(...)`).
-#   It is not a floor on the fitted covariance - EM is free to move below it.
-# - `covars_prior=1e-2` with `covars_weight=1` enters the **M-step** numerator
-#   (`_do_mstep`: `covars = (covars_prior + c_n) / c_d`), where `c_n` is the
-#   posterior-weighted sum of squared deviations for that state.
+#   It is not a floor on the fitted covariance - EM may move below it. It is in
+#   the same units as a variance, so comparing it to the series variance is the
+#   right comparison, and it says where EM starts.
+# - `covars_prior=1e-2` with `covars_weight=1` acts during fitting
+#   (`_do_mstep`: `covars = (covars_prior + c_n) / c_d`). Here `c_n` is the
+#   posterior-weighted **sum** of squared deviations over the observations
+#   assigned to a state and `c_d` is that state's posterior count, so the prior
+#   does not compare against a single-observation variance. Divided through by
+#   `c_d`, the estimate is approximately `variance + covars_prior / c_d`: the
+#   prior adds a fixed amount to every state's variance *estimate*, and how much
+#   it distorts that estimate depends on how many observations the state holds.
 #
-# Neither constant scales with the data. A daily FX log return has a variance
-# five orders of magnitude below one, so in native units the initial covariance
-# is set almost entirely by `min_covar` and the M-step numerator carries a
-# `covars_prior` term comparable to the data's own contribution. EM starts far
-# from the data and is pulled back toward the prior at every step; on the
-# shortest fold it loses positive definiteness and no restart survives the
-# stability check.
-#
-# Scaling by 100 multiplies the variance by 10,000 and moves it into the range
-# those constants were chosen for. The cell below measures the comparison rather
-# than asserting it.
+# Neither constant scales with the data, and a daily FX log return has a
+# variance five orders of magnitude below one. The cell below measures both
+# effects rather than asserting them.
 
 # %%
-HMM_SCALE = 100.0  # decimal returns -> percent, so the fixed priors do not dominate
+HMM_SCALE = 100.0  # decimal returns -> percent, so the fixed priors stay small
 HMM_MIN_COVAR = 1e-3  # GaussianHMM default: added to the *initial* covariance
 HMM_COVARS_PRIOR = 1e-2  # GaussianHMM default: additive term in the M-step numerator
 
 _native_var = usd_daily.drop_nulls(subset=["usd_ret"])["usd_ret"].var()
 _scaled_var = _native_var * HMM_SCALE**2
-print(f"Daily USD-factor return variance, native:  {_native_var:.3g}")
-print(f"                                  scaled:  {_scaled_var:.3g}")
+# Order-of-magnitude posterior count per state: the observations available to a
+# fold, split across the states. c_d in the M-step is exactly this quantity.
+_obs_per_state = usd_daily.drop_nulls(subset=["usd_ret"]).height / HMM_N_STATES
+
+print(f"Daily USD-factor return variance   native {_native_var:12.3g}   scaled {_scaled_var:.3g}")
+print(f"Approx. posterior count per state  {_obs_per_state:,.0f}")
+print()
+print("Initialisation - min_covar is added straight to the covariance:")
 print(
-    f"min_covar / variance     native {HMM_MIN_COVAR / _native_var:9.1f}x   "
-    f"scaled {HMM_MIN_COVAR / _scaled_var:7.3f}x"
+    f"  min_covar / variance             native {HMM_MIN_COVAR / _native_var:12.1f}x"
+    f"  scaled {HMM_MIN_COVAR / _scaled_var:.4f}x"
 )
-print(
-    f"covars_prior / variance  native {HMM_COVARS_PRIOR / _native_var:9.1f}x   "
-    f"scaled {HMM_COVARS_PRIOR / _scaled_var:7.3f}x"
-)
+print()
+print("Fitting - the prior's share of each state's variance estimate:")
+for _label, _var in (("native", _native_var), ("scaled", _scaled_var)):
+    _bias = HMM_COVARS_PRIOR / _obs_per_state
+    print(
+        f"  {_label:6s} covars_prior/c_d = {_bias:.3g} vs variance {_var:.3g}"
+        f"  ->  estimate inflated {1 + _bias / _var:.3f}x"
+    )
 
 valid_usd = usd_daily.drop_nulls(subset=["usd_ret", "usd_vol_21d"])
 valid_dates = valid_usd["timestamp"].to_list()
