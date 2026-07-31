@@ -492,23 +492,45 @@ def extract_hmm_features(fold: dict) -> tuple[list[dict], GaussianHMM, np.ndarra
 
 # %% [markdown]
 # The HMM observations are expressed in **percent**, not in native decimal
-# returns. `GaussianHMM` floors the emission covariance at `min_covar=1e-3`, so
-# an observation series whose variance sits below that floor has its covariance
-# set by the regularizer rather than by the data. Daily FX log returns are such
-# a series, and the cell below measures by how much rather than asserting it.
-# Fitted in native units the shortest fold loses positive definiteness outright
-# and no restart survives the stability check; scaling by 100 lifts the variance
-# clear of the floor and every fold converges.
+# returns, because `GaussianHMM`'s two covariance regularizers are additive
+# constants chosen for data of order one.
+#
+# - `min_covar=1e-3` is added to the diagonal of the **initial** covariance
+#   (`hmmlearn/hmm.py`, in `_init`: `cv = np.cov(X.T) + self.min_covar * np.eye(...)`).
+#   It is not a floor on the fitted covariance - EM is free to move below it.
+# - `covars_prior=1e-2` with `covars_weight=1` enters the **M-step** numerator
+#   (`_do_mstep`: `covars = (covars_prior + c_n) / c_d`), where `c_n` is the
+#   posterior-weighted sum of squared deviations for that state.
+#
+# Neither constant scales with the data. A daily FX log return has a variance
+# five orders of magnitude below one, so in native units the initial covariance
+# is set almost entirely by `min_covar` and the M-step numerator carries a
+# `covars_prior` term comparable to the data's own contribution. EM starts far
+# from the data and is pulled back toward the prior at every step; on the
+# shortest fold it loses positive definiteness and no restart survives the
+# stability check.
+#
+# Scaling by 100 multiplies the variance by 10,000 and moves it into the range
+# those constants were chosen for. The cell below measures the comparison rather
+# than asserting it.
 
 # %%
-HMM_SCALE = 100.0  # decimal returns -> percent, so min_covar does not dominate
-HMM_MIN_COVAR = 1e-3  # GaussianHMM default; the floor the scaling has to clear
+HMM_SCALE = 100.0  # decimal returns -> percent, so the fixed priors do not dominate
+HMM_MIN_COVAR = 1e-3  # GaussianHMM default: added to the *initial* covariance
+HMM_COVARS_PRIOR = 1e-2  # GaussianHMM default: additive term in the M-step numerator
 
 _native_var = usd_daily.drop_nulls(subset=["usd_ret"])["usd_ret"].var()
-print(f"Native daily USD-factor return variance: {_native_var:.3g}")
-print(f"GaussianHMM min_covar floor:             {HMM_MIN_COVAR:.3g}")
-print(f"Floor exceeds the native variance by:    {HMM_MIN_COVAR / _native_var:.0f}x")
-print(f"After scaling by {HMM_SCALE:.0f}:                     {_native_var * HMM_SCALE**2:.3g}")
+_scaled_var = _native_var * HMM_SCALE**2
+print(f"Daily USD-factor return variance, native:  {_native_var:.3g}")
+print(f"                                  scaled:  {_scaled_var:.3g}")
+print(
+    f"min_covar / variance     native {HMM_MIN_COVAR / _native_var:9.1f}x   "
+    f"scaled {HMM_MIN_COVAR / _scaled_var:7.3f}x"
+)
+print(
+    f"covars_prior / variance  native {HMM_COVARS_PRIOR / _native_var:9.1f}x   "
+    f"scaled {HMM_COVARS_PRIOR / _scaled_var:7.3f}x"
+)
 
 valid_usd = usd_daily.drop_nulls(subset=["usd_ret", "usd_vol_21d"])
 valid_dates = valid_usd["timestamp"].to_list()
