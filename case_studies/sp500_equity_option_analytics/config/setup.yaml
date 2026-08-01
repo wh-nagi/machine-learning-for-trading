@@ -44,6 +44,10 @@ features:
     skip_recent: 21          # skip-month momentum runs t-252 to t-21
     skip_start: 252
     risk_adjusted: 63        # the momentum horizon its own volatility scales
+    # Annualized volatility floor in the risk-adjusted momentum denominator. A share
+    # that realized almost nothing over a quarter would otherwise carry an unbounded
+    # ratio, and one such row dominates the within-date percentile taken from it.
+    risk_adjusted_vol_floor: 0.01
     iv_forward_fill: 5       # sessions a lagged surface value may be carried forward
   # Source column -> the name its within-date percentile is written under. The
   # names predate this register and later stages select by them, so the mapping
