@@ -218,9 +218,9 @@ print(f"maturity buckets {SURFACE['dte_buckets']}, delta targets {SURFACE['delta
 # ### C.1 The lag, and one null policy for the surface
 #
 # The lag is applied **first**, to the loaded columns, and everything downstream is built from the
-# lagged series. Applying it last instead - lagging the finished dynamics - would give the same
-# values here, but it puts the correctness of every later column in the hands of whoever remembers
-# to include it in the shift list, and a column added afterwards is silently unlagged.
+# lagged series. Lagging the finished dynamics instead puts the correctness of every later column
+# in the hands of whoever remembers to add it to the shift list, and a column added afterwards is
+# then silently unlagged.
 #
 # A shifted surface leaves a hole wherever a name did not quote, so a value is carried forward for
 # a bounded number of quoted sessions and then allowed to lapse. This is the notebook's **one**
@@ -232,7 +232,7 @@ print(f"maturity buckets {SURFACE['dte_buckets']}, delta targets {SURFACE['delta
 def lag_surface(df: pl.DataFrame) -> pl.DataFrame:
     """Shift every quoted column by the declared lag, then carry it a bounded distance."""
     return df.sort([ENTITY, "timestamp"]).with_columns(
-        pl.col(c).shift(IV_LAG).over(ENTITY).forward_fill(WINDOWS["iv_forward_fill"]).over(ENTITY)
+        pl.col(c).shift(IV_LAG).forward_fill(WINDOWS["iv_forward_fill"]).over(ENTITY)
         for c in SURFACE_COLS
     )
 
@@ -376,11 +376,16 @@ EQUITY_COLS = [
 def premium_and_ranks(df: pl.DataFrame) -> pl.DataFrame:
     """The IV-RV spread, its z-score, and the within-date percentiles of eight levels."""
     vol_short = WINDOWS["realized_vol"][0]
-    df = df.with_columns(
-        (pl.col("iv_30_atm") - pl.col(f"rv_{vol_short}")).alias("ivrv_spread")
-    ).with_columns(
-        rolling_zscore("ivrv_spread", WINDOWS["vrp_zscore"], ENTITY).alias(
-            f"vrp_z_{WINDOWS['vrp_zscore']}"
+    # The join above carries no ordering guarantee, and a rolling window reads the rows in the
+    # order it finds them. Sorting here is what makes the z-score below a trailing statistic
+    # rather than one taken over an arbitrary permutation of each security's history.
+    df = (
+        df.sort([ENTITY, "timestamp"])
+        .with_columns((pl.col("iv_30_atm") - pl.col(f"rv_{vol_short}")).alias("ivrv_spread"))
+        .with_columns(
+            rolling_zscore("ivrv_spread", WINDOWS["vrp_zscore"], ENTITY).alias(
+                f"vrp_z_{WINDOWS['vrp_zscore']}"
+            )
         )
     )
     return df.with_columns(
@@ -605,8 +610,8 @@ plot_timing_contract(
         "bars. Skew and term structure, the variance risk premium and realized volatility reach "
         "about minus 63. The implied volatility level and the surface quality family have a "
         "lookback of one bar and are drawn as a sliver at the right edge, the second of them "
-        "hidden behind the axis label. The one-bar information lag the register carries for the "
-        "six option-derived families is too narrow to be visible at this scale."
+        "behind the decision label. The one-bar information lag the register carries for the six "
+        "option-derived families is too narrow to be visible at this scale."
     ),
 )
 
@@ -700,8 +705,8 @@ clusters = plot_redundancy_clusters(
         "realized volatility ranks attach to that combined block. The variance risk premium, "
         "its z-score and its rank form a third. Each momentum horizon sits with its own "
         "percentile and with the risk-adjusted and skip-month forms. The term structure "
-        "features form their own block and the skew features another. Only the two surface "
-        "quality features attach near the root, sharing an ordering with nothing else."
+        "features form their own block and the skew features another. The two surface quality "
+        "features branch off at the root, sharing an ordering with nothing else."
     ),
 )
 
