@@ -1,0 +1,33 @@
+# Weekly mirror-sync from the upstream parent repo (citation-stability + bus-factor insurance for ALXCMSA).
+#
+# Design (deliberate):
+# - Uses GitHub's merge-upstream API: fast-forwards when possible; when this fork's
+#   own commits (this workflow file, prior sync merges) diverge from upstream it
+#   creates a clean merge commit; on a REAL content conflict it returns 409 and the
+#   job FAILS LOUDLY (GitHub emails the owner). The invariant is "fork contains every
+#   upstream commit", not byte-identity — the fork deliberately carries this file.
+# - Zero secrets: only this repo's ephemeral GITHUB_TOKEN (contents: write).
+# - Syncing this mirror changes NOTHING in ALXCMSA production: Lambdas install
+#   exact-pinned wheels from the S3 mirror; adopting a new upstream version is a
+#   deliberate lockstep pin-bump + parity suite (Rule-12 class), never automatic.
+# - Known GitHub caveat: scheduled workflows auto-disable after ~60 days without
+#   repo activity. Sync commits count as activity, so this only bites if upstream
+#   goes quiet 60+ days and then resumes — re-enable via the Actions tab or run
+#   scripts/sync_ml4t_forks.sh in alxcmsa (the manual backup path).
+name: sync-upstream
+on:
+  schedule:
+    - cron: '0 11 * * 6'   # Saturdays 11:00 UTC (1h before the weekly upstream-watch report)
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge-upstream main (ff or clean merge; 409 = loud failure)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch=main --jq '"\(.merge_type): \(.message)"'
