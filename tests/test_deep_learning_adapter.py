@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from importlib.metadata import version
 from types import SimpleNamespace
 
@@ -23,7 +24,9 @@ def _restore_output_root():
     workspace._clear_root_sensitive_caches()
 
 
-def test_sequence_resolver_builds_complete_v2_request(tmp_path, monkeypatch) -> None:
+def _resolve_nlinear_request(
+    tmp_path, monkeypatch, entity: str = "symbol", library: str = "pytorch"
+):
     study = Study.open(
         "etfs", workspace=tmp_path / "workspace", release_root=_seed_release(tmp_path)
     )
@@ -39,7 +42,7 @@ def test_sequence_resolver_builds_complete_v2_request(tmp_path, monkeypatch) -> 
     ]
     frame = pl.DataFrame(
         {
-            "symbol": [f"S{symbol}" for symbol in range(3) for _ in dates],
+            entity: [f"S{symbol}" for symbol in range(3) for _ in dates],
             "timestamp": dates * 3,
             "feature": [float(index) for index in range(24)],
             "fwd_ret_1d": [float(index % 3) / 100 for index in range(24)],
@@ -47,7 +50,7 @@ def test_sequence_resolver_builds_complete_v2_request(tmp_path, monkeypatch) -> 
     ).with_columns(pl.col("timestamp").str.to_date())
     label = study.labels.publish(
         LabelDefinition("fwd_ret_1d", "regression", "1D"),
-        frame.select("symbol", "timestamp", "fwd_ret_1d"),
+        frame.rename({entity: "symbol"}).select("symbol", "timestamp", "fwd_ret_1d"),
     )
     splits = [
         {
@@ -63,7 +66,7 @@ def test_sequence_resolver_builds_complete_v2_request(tmp_path, monkeypatch) -> 
         feature_names=["feature"],
         label_col="fwd_ret_1d",
         date_col="timestamp",
-        entity_cols=["symbol"],
+        entity_cols=[entity],
         splits=splits,
         task_type="regression",
         class_values=[],
@@ -83,10 +86,14 @@ def test_sequence_resolver_builds_complete_v2_request(tmp_path, monkeypatch) -> 
                 "batch_size": 64,
                 "checkpoint_interval": 2,
                 "n_epochs": 4,
-                "params": {"architecture": "nlinear", "dropout": 0.0, "lookback": 2},
+                "params": {
+                    "architecture": "tsmixer" if library == "darts" else "nlinear",
+                    "dropout": 0.0,
+                    "lookback": 2,
+                },
                 "config_name": "nlinear_probe",
                 "family": "deep_learning",
-                "library": "pytorch",
+                "library": library,
             }
         ],
     )
@@ -97,17 +104,56 @@ def test_sequence_resolver_builds_complete_v2_request(tmp_path, monkeypatch) -> 
         config_name="nlinear_probe",
         overrides={"device": "cpu", "n_epochs": 3},
     ).resolve()
+    return study, label, resolved
+
+
+def test_sequence_resolver_builds_complete_resolved_request(tmp_path, monkeypatch) -> None:
+    _study, label, resolved = _resolve_nlinear_request(tmp_path, monkeypatch)
     spec = resolved.spec
     context = resolved._context
 
-    assert spec["identity_version"] == 2
-    assert spec["label_artifact"]["digest"] == label.digest
-    assert spec["model"]["params"]["n_epochs"] == 3
-    assert [row["value"] for row in spec["checkpoint_schedule"]] == [2, 3]
-    assert spec["expected_prediction_keys"]["n_rows"] == 12
-    assert spec["sampling"] == {"max_symbols": 0, "max_train_sequences": 0}
+    computation = spec["computation"]
+    assert spec["identity_version"] == 3
+    assert computation["label_artifact"]["digest"] == label.digest
+    assert computation["model"]["params"]["n_epochs"] == 3
+    assert [row["value"] for row in computation["checkpoint_schedule"]] == [2, 3]
+    assert computation["expected_prediction_keys"]["n_rows"] == 12
+    assert computation["sampling"] == {"max_symbols": 0, "max_train_sequences": 0}
     assert context.expected_keys.height == 12
     assert context.config["n_epochs"] == 3
+
+
+def test_cached_sequence_run_resolves_predictions_at_the_published_identity(
+    tmp_path, monkeypatch
+) -> None:
+    from case_studies.research.results import Result
+    from case_studies.utils.registry import prediction_hash_from_parts, training_hash_from_spec
+
+    study, _label, resolved = _resolve_nlinear_request(tmp_path, monkeypatch)
+    spec = resolved.spec
+    requested: list[str] = []
+
+    @classmethod
+    def _record(cls, study_arg, result_hash, **kwargs):
+        requested.append(result_hash)
+        return SimpleNamespace(hash=result_hash)
+
+    monkeypatch.setattr(Result, "open", _record)
+
+    assert deep_learning._cached_sequence_run(study, spec, resolved._context) is None
+
+    training_hash = training_hash_from_spec(spec)
+    expected = [
+        prediction_hash_from_parts(
+            training_hash,
+            row["value"],
+            "validation",
+            checkpoint_kind="epoch",
+            identity_version=spec["identity_version"],
+        )
+        for row in spec["computation"]["checkpoint_schedule"]
+    ]
+    assert requested == [training_hash, *expected]
 
 
 def test_darts_request_resolves_installed_runtime_identity(tmp_path, monkeypatch) -> None:
@@ -200,8 +246,9 @@ def test_darts_request_resolves_installed_runtime_identity(tmp_path, monkeypatch
         overrides={"device": "cpu"},
     ).resolve()
 
-    assert resolved.spec["runtime_identity"]["darts"] == version("darts")
-    assert resolved.spec["model"]["implementation"] == "darts"
+    computation = resolved.spec["computation"]
+    assert computation["runtime_identity"]["darts"] == version("darts")
+    assert computation["model"]["implementation"] == "darts"
 
 
 def test_weekly_nbeats_request_applies_identity_cadence_before_cv(tmp_path, monkeypatch) -> None:
@@ -301,10 +348,11 @@ def test_weekly_nbeats_request_applies_identity_cadence_before_cv(tmp_path, monk
     assert all(timestamp.weekday() == 4 for timestamp in observed_timestamps)
     assert list(context.splits) == canonical_folds
     assert pd.Timestamp(split["val_start"]) - pd.Timestamp(split["train_end"]) >= pd.Timedelta("5D")
-    assert resolved.spec["cv"]["request"]["decision_cadence"] is None
-    assert resolved.spec["cv"]["request"]["gap"] == "5D"
-    assert resolved.spec["model"]["params"]["decision_cadence"] == "weekly_friday"
-    assert resolved.spec["preprocessing"]["decision_cadence"] == "weekly_friday"
+    computation = resolved.spec["computation"]
+    assert computation["cv"]["request"]["decision_cadence"] is None
+    assert computation["cv"]["request"]["gap"] == "5D"
+    assert computation["model"]["params"]["decision_cadence"] == "weekly_friday"
+    assert computation["preprocessing"]["decision_cadence"] == "weekly_friday"
     eligible_timestamps = [
         timestamp
         for timestamp in observed_timestamps
@@ -318,7 +366,7 @@ def test_weekly_nbeats_request_applies_identity_cadence_before_cv(tmp_path, monk
         }
     ).sort("symbol", "timestamp", "fold")
     assert context.expected_keys.equals(expected)
-    assert resolved.spec["expected_prediction_keys"]["n_rows"] == expected.height
+    assert computation["expected_prediction_keys"]["n_rows"] == expected.height
 
 
 def test_run_dl_cv_applies_preset_cadence_before_backend(monkeypatch) -> None:
@@ -425,3 +473,78 @@ def test_deep_adapters_reject_custom_cv_with_stale_temporal_geometry(split_resol
 
     with pytest.raises(ValueError, match="Custom CV cannot reuse fold-specific temporal features"):
         split_resolver(mds, {"cv": cv, "preview_reductions": {}})
+
+
+@pytest.mark.parametrize("entity", ["symbol", "product"])
+def test_sequence_resolver_accepts_either_canonical_entity_key(
+    tmp_path, monkeypatch, entity
+) -> None:
+    _study, _label, resolved = _resolve_nlinear_request(tmp_path, monkeypatch, entity=entity)
+
+    assert resolved._context.entity_col == entity
+    assert resolved._context.expected_keys.columns == ["symbol", "timestamp", "fold"]
+    assert resolved._context.expected_keys.height > 0
+
+
+def test_sequence_resolver_rejects_an_unsupported_entity_key(tmp_path, monkeypatch) -> None:
+    with pytest.raises(ValueError, match="does not support entity key 'ticker'"):
+        _resolve_nlinear_request(tmp_path, monkeypatch, entity="ticker")
+
+
+def test_darts_presets_refuse_a_non_symbol_entity_key(tmp_path, monkeypatch) -> None:
+    """The Darts key builder names its keys after the entity column, unlike the other three."""
+    with pytest.raises(ValueError, match="Darts presets require the symbol entity key"):
+        _resolve_nlinear_request(tmp_path, monkeypatch, entity="product", library="darts")
+
+
+@pytest.mark.parametrize("entity", ["symbol", "product"])
+def test_sequence_publishes_predictions_under_the_expected_key_names(entity) -> None:
+    """The runner emits the reader-facing entity key; the registry contract expects `symbol`."""
+    from case_studies.utils import deep_learning
+
+    expected_keys = pl.DataFrame(
+        {
+            "symbol": ["ES", "NQ"],
+            "timestamp": [datetime(2024, 1, 8), datetime(2024, 1, 8)],
+            "fold": [0, 0],
+        }
+    )
+    all_predictions = pl.DataFrame(
+        {
+            "config": ["nlinear_probe"] * 2,
+            "epoch": [2, 2],
+            entity: ["ES", "NQ"],
+            "timestamp": [datetime(2024, 1, 8), datetime(2024, 1, 8)],
+            "fold_id": [0, 0],
+            "y_true": [0.01, -0.01],
+            "y_score": [0.02, -0.02],
+        }
+    )
+    context = SimpleNamespace(
+        config={"config_name": "nlinear_probe"},
+        entity_col=entity,
+        expected_keys=expected_keys,
+        label_col="fwd_ret_1d",
+    )
+    published = []
+
+    def capture(_training, **kwargs):
+        published.append(kwargs["predictions"])
+        return kwargs["predictions"]
+
+    study = SimpleNamespace(results=SimpleNamespace(publish_predictions=capture))
+    computation = {"checkpoint_schedule": [{"kind": "epoch", "value": 2}]}
+
+    results = deep_learning._publish_sequence_predictions(
+        study, computation, context, object(), {"all_predictions": all_predictions}
+    )
+
+    assert len(results) == 1 and len(published) == 1
+    frame = published[0]
+    assert "symbol" in frame.columns
+    assert entity not in set(frame.columns) - {"symbol"}
+    assert (
+        frame.select("symbol", "timestamp", "fold")
+        .sort("symbol")
+        .equals(expected_keys.sort("symbol"))
+    )
