@@ -56,6 +56,8 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
+          ref: main   # upstream went private ~2026-08: explicit ref skips the
+                      # default-branch API lookup (404 anon); the deploy key still fetches
           path: test-data
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
