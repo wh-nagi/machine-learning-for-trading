@@ -1,4 +1,4 @@
-# Weekly mirror-sync from the upstream parent repo (citation-stability + bus-factor insurance for ALXCMSA).
+# Weekly mirror-sync from the ml4t upstream (bus-factor insurance for ALXCMSA).
 #
 # Design (deliberate):
 # - Uses GitHub's merge-upstream API: fast-forwards when possible; when this fork's
@@ -6,7 +6,10 @@
 #   creates a clean merge commit; on a REAL content conflict it returns 409 and the
 #   job FAILS LOUDLY (GitHub emails the owner). The invariant is "fork contains every
 #   upstream commit", not byte-identity — the fork deliberately carries this file.
-# - Zero secrets: only this repo's ephemeral GITHUB_TOKEN (contents: write).
+# - Token: SYNC_TOKEN (a fine-grained PAT with contents+workflows write on wh-nagi/*, set per fork)
+#   when present, else this repo's ephemeral GITHUB_TOKEN. The ephemeral token cannot merge a
+#   commit that touches .github/workflows/* (HTTP 422 "without workflows permission") — that is
+#   exactly how the 2026-09-05 sync failed on all seven mirrors after upstream edited its CI file.
 # - Syncing this mirror changes NOTHING in ALXCMSA production: Lambdas install
 #   exact-pinned wheels from the S3 mirror; adopting a new upstream version is a
 #   deliberate lockstep pin-bump + parity suite (Rule-12 class), never automatic.
@@ -27,7 +30,7 @@ jobs:
     steps:
       - name: Merge-upstream main (ff or clean merge; 409 = loud failure)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
         run: |
           gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" \
             -f branch=main --jq '"\(.merge_type): \(.message)"'
