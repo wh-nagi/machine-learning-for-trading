@@ -27,16 +27,16 @@ import pytest
 import yaml
 
 from utils.cv_splits import (
-    _assert_newest_first,
+    _assert_chronological,
     _map_calendar_id,
     _normalize_duration,
-    _normalize_label_buffer,
     earliest_train_start,
     generate_cv_splits,
     load_evaluation_config,
     make_walk_forward_config,
     make_wf_config,
     most_recent_split,
+    normalize_label_buffer,
 )
 from utils.modeling import validate_temporal_fold_coverage, validate_temporal_split_geometry
 
@@ -82,7 +82,7 @@ def test_normalize_duration(raw, normalized) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Pure: _normalize_label_buffer (inherits normalization + M → days)
+# Pure: normalize_label_buffer (inherits normalization + M → days)
 # -----------------------------------------------------------------------------
 
 
@@ -97,7 +97,7 @@ def test_normalize_duration(raw, normalized) -> None:
     ],
 )
 def test_normalize_label_buffer(raw, normalized) -> None:
-    assert _normalize_label_buffer(raw) == normalized
+    assert normalize_label_buffer(raw) == normalized
 
 
 # -----------------------------------------------------------------------------
@@ -180,9 +180,9 @@ def test_generate_cv_splits_etfs_intra_fold_chronology(etfs_splits) -> None:
 
 
 def test_generate_cv_splits_etfs_backward_walk_forward(etfs_splits) -> None:
-    """fold_direction=backward → fold 0 is the most recent, folds step back."""
+    """fold_direction=backward builds from the holdout boundary and emits forward."""
     for i in range(len(etfs_splits) - 1):
-        assert etfs_splits[i]["val_start"] > etfs_splits[i + 1]["val_start"]
+        assert etfs_splits[i]["val_start"] < etfs_splits[i + 1]["val_start"]
 
 
 def test_generate_cv_splits_etfs_embargo_respects_label_buffer(etfs_splits) -> None:
@@ -260,8 +260,11 @@ def test_generate_cv_splits_crypto_purges_variant_endpoint_at_holdout() -> None:
         label_buffer="24H",
     )
 
-    assert splits[0]["val_end"] == pd.Timestamp("2023-12-30 16:00")
-    assert splits[0]["val_end"] + pd.Timedelta(hours=24) < pd.Timestamp("2024-01-01")
+    # The purge is at the holdout boundary, so it is the latest fold that carries
+    # it - read by boundary, not by position.
+    latest = most_recent_split(splits)
+    assert latest["val_end"] == pd.Timestamp("2023-12-30 16:00")
+    assert latest["val_end"] + pd.Timedelta(hours=24) < pd.Timestamp("2024-01-01")
 
 
 # -----------------------------------------------------------------------------
@@ -518,12 +521,22 @@ def test_temporal_interior_gap_is_not_excused(warmup_temporal_fixture) -> None:
         validate_temporal_fold_coverage(dataset, _temporal_from(keep), splits, date_col="timestamp")
 
 
-def test_sp500_options_temporal_producer_uses_canonical_split_ids() -> None:
+def test_sp500_options_temporal_producer_takes_its_windows_from_generate_cv_splits() -> None:
+    """The notebook reads fold windows from the splitter, and writes no fold column.
+
+    It used to fit one parameter set per fold and stamp the fold id on every row, and this
+    test held it to using the splitter's ids rather than deriving them from a calendar year.
+    It now fits on a refit schedule instead, so there is one value per symbol and session and
+    no fold column at all - but section F still scores over the folds' validation windows, so
+    those windows still have to come from `generate_cv_splits` and not from a year.
+    """
     source = Path("case_studies/sp500_options/04_model_based_features.py").read_text()
 
     assert "generate_cv_splits(" in source
-    assert 'fold_idx = fold["fold"]' in source
+    assert '_fold["val_start"]' in source and '_fold["val_end"]' in source
     assert "first_test_year" not in source
+    # The artifact is fold-free. A `fold` key on the write is the per-fold design returning.
+    assert 'keys=["timestamp", "symbol"],' in source
 
 
 # -----------------------------------------------------------------------------
@@ -573,64 +586,62 @@ def test_make_wf_config_is_alias_of_make_walk_forward_config() -> None:
 # -----------------------------------------------------------------------------
 
 
-def test_generate_cv_splits_returns_folds_newest_first(etfs_splits) -> None:
-    """Fold 0 validates most recently. Roughly forty call sites read it that way."""
+def test_generate_cv_splits_returns_folds_oldest_first(etfs_splits) -> None:
+    """Fold 0 validates earliest, from ml4t-diagnostic 0.1.4 on."""
     val_starts = [s["val_start"] for s in etfs_splits]
-    assert val_starts == sorted(val_starts, reverse=True)
-    assert etfs_splits[0]["val_end"] > etfs_splits[-1]["val_end"]
+    assert val_starts == sorted(val_starts)
+    assert etfs_splits[0]["val_end"] < etfs_splits[-1]["val_end"]
 
 
-def test_fold_0_carries_the_latest_train_start_not_the_earliest(etfs_splits) -> None:
-    """The shape behind the measured defect: indexing for "everything available"."""
-    assert etfs_splits[0]["train_start"] > etfs_splits[-1]["train_start"]
-    assert etfs_splits[0]["train_start"] != earliest_train_start(etfs_splits)
+def test_fold_0_carries_the_earliest_train_start(etfs_splits) -> None:
+    """The order changed, so the fold that indexing lands on changed with it."""
+    assert etfs_splits[0]["train_start"] < etfs_splits[-1]["train_start"]
+    assert etfs_splits[0]["train_start"] == earliest_train_start(etfs_splits)
 
 
-def test_an_ascending_fold_list_is_refused_rather_than_returned() -> None:
+def test_a_descending_fold_list_is_refused_rather_than_returned() -> None:
     """A library change to fold_direction must fail here, not at forty call sites."""
-    ascending = [
-        {"fold": 0, "val_start": pd.Timestamp("2020-01-01"), "val_end": pd.Timestamp("2020-12-31")},
-        {"fold": 1, "val_start": pd.Timestamp("2021-01-01"), "val_end": pd.Timestamp("2021-12-31")},
+    descending = [
+        {"fold": 0, "val_start": pd.Timestamp("2021-01-01"), "val_end": pd.Timestamp("2021-12-31")},
+        {"fold": 1, "val_start": pd.Timestamp("2020-01-01"), "val_end": pd.Timestamp("2020-12-31")},
     ]
-    with pytest.raises(RuntimeError, match="not ordered newest first"):
-        _assert_newest_first(ascending)
+    with pytest.raises(RuntimeError, match="not ordered oldest first"):
+        _assert_chronological(descending)
 
-    # Reversing the list alone leaves fold 0 on the oldest window. Every join is
+    # Reversing the list alone leaves fold 0 on the newest window. Every join is
     # by id, so the ids have to move with the positions.
     with pytest.raises(RuntimeError, match="fold ids"):
-        _assert_newest_first(list(reversed(ascending)))
+        _assert_chronological(list(reversed(descending)))
 
-    _assert_newest_first([{**split, "fold": i} for i, split in enumerate(reversed(ascending))])
+    _assert_chronological([{**split, "fold": i} for i, split in enumerate(reversed(descending))])
 
 
 def test_a_precomputed_split_set_is_held_to_the_same_order() -> None:
     """A caller cannot tell which path produced its list, so both owe the contract.
 
-    The two committed configs disagree with each other:
-    us_firm_characteristics/config/cv_config.json runs newest first, and
-    fx_pairs/config/cv_config.json runs oldest first - fold 0 validates from
-    2015-10-28 against fold 7 at 2022-12-15 - while fx_pairs/04_model_based_features
-    tags its artifact through generate_cv_splits. Fold 0 then means the earliest
-    window on one side of the join and the latest on the other.
+    Under 0.1.4 the generated path emits oldest first, which is the order
+    fx_pairs/config/cv_config.json already runs in. us_firm_characteristics/config/
+    cv_config.json still runs newest first and is refused here until it is
+    renumbered together with the registry rows carrying its fold ids.
     """
     df = pl.DataFrame({"timestamp": pd.date_range("2010-01-01", "2020-01-01", freq="B")})
-    ascending = {
+    descending = {
         "splits": [
-            {"fold": 0, "val_start": "2015-10-28", "val_end": "2016-10-28"},
-            {"fold": 1, "val_start": "2016-11-15", "val_end": "2017-11-15"},
+            {"fold": 0, "val_start": "2016-11-15", "val_end": "2017-11-15"},
+            {"fold": 1, "val_start": "2015-10-28", "val_end": "2016-10-28"},
         ]
     }
-    with pytest.raises(RuntimeError, match="not ordered newest first"):
-        generate_cv_splits(df, cv_config=ascending)
+    with pytest.raises(RuntimeError, match="not ordered oldest first"):
+        generate_cv_splits(df, cv_config=descending)
 
-    # Reversing the list is not the fix: fold 0 still names the oldest window and
+    # Reversing the list is not the fix: fold 0 still names the newest window and
     # every downstream join is by id.
-    reversed_only = {"splits": list(reversed(ascending["splits"]))}
+    reversed_only = {"splits": list(reversed(descending["splits"]))}
     with pytest.raises(RuntimeError, match="fold ids"):
         generate_cv_splits(df, cv_config=reversed_only)
 
     renumbered = {
-        "splits": [{**split, "fold": i} for i, split in enumerate(reversed(ascending["splits"]))]
+        "splits": [{**split, "fold": i} for i, split in enumerate(reversed(descending["splits"]))]
     }
     assert [s["fold"] for s in generate_cv_splits(df, cv_config=renumbered)] == [0, 1]
 
@@ -682,17 +693,17 @@ def test_fx_materialized_folds_match_the_canonical_label_clock() -> None:
 
 def test_the_order_check_reads_a_stored_config_spelling() -> None:
     """A legacy config writes test_start where the generated path writes val_start."""
-    _assert_newest_first(
+    _assert_chronological(
         [
-            {"fold": 0, "test_start": pd.Timestamp("2020-01-01")},
-            {"fold": 1, "test_start": pd.Timestamp("2019-01-01")},
+            {"fold": 0, "test_start": pd.Timestamp("2019-01-01")},
+            {"fold": 1, "test_start": pd.Timestamp("2020-01-01")},
         ]
     )
     with pytest.raises(RuntimeError):
-        _assert_newest_first(
+        _assert_chronological(
             [
-                {"fold": 0, "test_start": pd.Timestamp("2019-01-01")},
-                {"fold": 1, "test_start": pd.Timestamp("2020-01-01")},
+                {"fold": 0, "test_start": pd.Timestamp("2020-01-01")},
+                {"fold": 1, "test_start": pd.Timestamp("2019-01-01")},
             ]
         )
 

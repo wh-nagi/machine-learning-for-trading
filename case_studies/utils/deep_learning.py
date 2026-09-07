@@ -30,7 +30,7 @@ import subprocess
 import time
 import uuid
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,9 +41,13 @@ import pandas as pd
 import polars as pl
 import torch
 import torch.nn as nn
+import yaml
 from ml4t.diagnostic.metrics import cross_sectional_ic
 from torch.utils.data import DataLoader
 
+from case_studies.research.identity import ResolvedSpec
+from case_studies.research.models import ModelRun
+from case_studies.utils.artifact_digest import value_digest
 from case_studies.utils.cv_results import (
     assemble_cv_result,
     combine_cv_results,
@@ -54,6 +58,7 @@ from case_studies.utils.registry.store import (
     flush_fold_predictions,
     flush_fold_training_log,
 )
+from case_studies.utils.runtime import cpu_seconds
 from case_studies.utils.sequence_dataset import (
     FoldSequenceDataset,
     collate_with_metadata,
@@ -70,7 +75,29 @@ from utils.modeling import RANDOM_SEED, seed_everything
 if TYPE_CHECKING:
     from case_studies.research.workspace import Study
 
-_SEQUENCE_PREVIEW_FIELDS = {"folds", "max_symbols", "max_train_sequences"}
+from case_studies.utils.preview_fields import (
+    SEQUENCE_PREVIEW_FIELDS as _SEQUENCE_PREVIEW_FIELDS,
+)
+
+SEQUENCE_RUNNER_VERSION = 1
+# 2: #767 (174154ad) changed what a sequence family is fitted on. `np.nan_to_num(..., nan=0.0)`
+# used to run in `_build_symbol_arrays` BEFORE `_compute_feature_stats`, so a missing feature
+# became a raw zero, entered the mean and the standard deviation, and was then standardized like
+# a real observation - on seoa's `garch_cond_vol` landing at -1.64 sd, below anything observed,
+# and skewing every other symbol's normalization on the way. It is now imputed at the training
+# mean. That is a different design matrix, not a rename, so a version-1 run and a run under the
+# corrected fill must not share a training identity.
+SEQUENCE_PREPARATION_VERSION = 2
+SEQUENCE_STATE_VERSION = 1
+SEQUENCE_BACKEND_VERSIONS = {"darts": 1, "pytorch": 1}
+SEQUENCE_ARCHITECTURE_VERSIONS = {
+    "lstm": 1,
+    "nbeats": 1,
+    "nlinear": 1,
+    "patchtst": 1,
+    "tcn": 1,
+    "tsmixer": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -90,6 +117,11 @@ class SequenceResearchContext:
     expected_keys: pl.DataFrame
     max_train_sequences: int
     runtime_provenance: dict[str, Any]
+    prediction_split: str = "validation"
+    published_checkpoints: tuple[int, ...] | None = None
+    # Preview-only, and deliberately absent from `sequence_identity_params`: capping how
+    # many validation windows are scored changes what the run covers, never what it fits.
+    max_predict_sequences: int = 0
 
 
 def _sha256(path: Path) -> str:
@@ -100,20 +132,22 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _sequence_source_identity(config: dict[str, Any]) -> dict[str, str]:
-    from case_studies.utils import deep_model_state, sequence_dataset
-
-    paths = [Path(__file__), Path(deep_model_state.__file__), Path(sequence_dataset.__file__)]
-    if config.get("library") == "darts":
-        from case_studies.utils import darts_forecasting
-
-        paths.append(Path(darts_forecasting.__file__))
-    else:
-        architecture = str(config["params"]["architecture"])
-        model_class = _get_model_registry()[architecture]
-        module = __import__(model_class.__module__, fromlist=[model_class.__name__])
-        paths.append(Path(module.__file__))
-    return {path.name: _sha256(path) for path in paths}
+def _sequence_source_identity(config: dict[str, Any]) -> dict[str, int | str]:
+    """Return the declared implementation versions that can change sequence results."""
+    architecture = str(config["params"]["architecture"])
+    library = "darts" if config.get("library") == "darts" else "pytorch"
+    try:
+        architecture_version = SEQUENCE_ARCHITECTURE_VERSIONS[architecture]
+        backend_version = SEQUENCE_BACKEND_VERSIONS[library]
+    except KeyError as exc:
+        raise ValueError(f"no implementation version declared for {exc.args[0]!r}") from exc
+    return {
+        "sequence_runner": SEQUENCE_RUNNER_VERSION,
+        "sequence_preparation": SEQUENCE_PREPARATION_VERSION,
+        "sequence_state": SEQUENCE_STATE_VERSION,
+        "backend": f"{library}/v{backend_version}",
+        "architecture": f"{architecture}/v{architecture_version}",
+    }
 
 
 def _sequence_runtime_identity(config: dict[str, Any]) -> dict[str, str]:
@@ -229,7 +263,7 @@ def _sequence_splits(mds, request: dict[str, Any]) -> tuple[list[dict[str, Any]]
 
 
 def _resolve_sequence_config(config: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
-    resolved = {**config, "params": dict(config.get("params") or {})}
+    resolved: dict[str, Any] = {**config, "params": dict(config.get("params") or {})}
     top_level = {"batch_size", "checkpoint_interval", "n_epochs", "seed"}
     runtime_fields = {"device", "num_threads"}
     unknown = set(overrides) - top_level - runtime_fields - set(resolved["params"])
@@ -256,6 +290,90 @@ def _resolve_sequence_config(config: dict[str, Any], overrides: dict[str, Any]) 
         int(resolved.get("checkpoint_interval", 5)),
     )
     return resolved
+
+
+def resolve_dl_device(config: Mapping[str, Any] | None, requested: str | None = None) -> str:
+    """Resolve the sequence-training backend a case study declares, into a torch device.
+
+    ``config`` is a case study's ``modeling.dl`` block and ``requested`` is a runtime
+    override, empty meaning "use what the case study declared". The declaration is
+    required: a notebook that falls back to ``gpu`` when nothing declares one turns a
+    missing config section into a hardware requirement nobody wrote down, and a
+    CUDA-free environment then fails on it.
+
+    The resolved device is part of what a run is registered under, so an unavailable
+    accelerator raises here rather than letting the run retrain on CPU and register the
+    result as though it had the accelerator. Passing ``requested="cpu"`` is how a CPU run
+    is asked for and recorded as one.
+    """
+    declared = (config or {}).get("device")
+    source = "the DEVICE override"
+    if requested:
+        device = str(requested).lower()
+    elif declared:
+        device, source = str(declared).lower(), "modeling.dl.device"
+    else:
+        raise ValueError(
+            "modeling.dl.device must be declared explicitly in config/setup.yaml, "
+            "or supplied as the DEVICE parameter"
+        )
+    if device == "gpu":
+        device = "cuda"
+    if device not in {"cpu", "cuda"}:
+        raise ValueError(f"unsupported sequence device {device!r} (from {source})")
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"{source} requests a GPU and no CUDA device is visible. Make the GPU "
+            f"available, or set DEVICE='cpu' so the change is recorded with the run."
+        )
+    return device
+
+
+def resolve_dl_max_train_sequences(
+    config: Mapping[str, Any] | None, reduction: int = 0
+) -> tuple[int, int]:
+    """Resolve how many training windows a sequence configuration draws per fold.
+
+    Returns ``(effective, reduction)``. ``config`` is a case study's ``modeling.dl``
+    block; ``reduction`` is what a preview asked for, 0 meaning it asked for nothing.
+
+    **The cap is a property of the model, not of the execution tier.** Every row of a
+    panel starts a window, so on a minute panel an uncapped fold builds tens of millions
+    of near-identical overlapping sequences - consecutive windows share all but one
+    observation. How many windows are drawn therefore changes what is fitted, and the
+    same named configuration must not mean one model when someone previews it and a
+    different one when it runs for real. This is `modeling.gbm.max_bin` one axis over:
+    that value used to be read off whichever device was visible until it was made an
+    explicit declaration, for exactly this reason.
+
+    Until this existed the only source was ``preview_reductions``, so a canonical run was
+    necessarily uncapped and the declaration had nowhere to live.
+
+    Absent means uncapped, which is what the daily panels want and what every converted
+    case study already registers, so adding the key moves no existing identity. A preview
+    may only lower the effective cap: raising it would let a reduced run fit on more
+    windows than the canonical one it is rehearsing.
+    """
+    declared_raw = (config or {}).get("max_train_sequences")
+    declared = 0 if declared_raw is None else int(declared_raw)
+    if declared < 0:
+        raise ValueError(
+            f"modeling.dl.max_train_sequences must be zero (uncapped) or positive, not {declared}"
+        )
+    reduction = int(reduction or 0)
+    if reduction < 0:
+        raise ValueError(
+            f"the max_train_sequences preview reduction must be zero or positive, not {reduction}"
+        )
+    if declared and reduction:
+        if reduction > declared:
+            raise ValueError(
+                f"a preview asked for {reduction} training sequences where "
+                f"modeling.dl.max_train_sequences declares {declared}. A preview "
+                "rehearses the canonical run and cannot fit on more windows than it."
+            )
+        return reduction, reduction
+    return (reduction or declared), reduction
 
 
 def _sequence_runtime_spec(
@@ -291,8 +409,6 @@ def _configure_sequence_runtime(spec: dict[str, Any]) -> None:
 
 def resolve_model_request(study: Study, request: dict[str, Any]):
     from case_studies.research.contracts import ExecutionTier
-    from case_studies.research.identity import ResolvedSpec
-    from case_studies.utils.artifact_digest import value_digest
     from case_studies.utils.deep_model_state import declared_epoch_checkpoints
     from utils.cv_splits import make_walk_forward_config
     from utils.modeling import load_configs, load_modeling_dataset
@@ -304,7 +420,7 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
         raise ValueError(f"unsupported sequence preview reductions: {sorted(unknown_reductions)}")
     study.require_writable()
     study.activate(tier)
-    label_ref = study.labels.get(request["label"])
+    label_ref = study.labels.get(request["label"], execution_tier=tier)
     mds = load_modeling_dataset(
         study.case_study,
         label_ref.name,
@@ -321,7 +437,9 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
     splits, cv_record = _sequence_splits(mds, request)
     configs = {
         config["config_name"]: config
-        for config in load_configs(study.case_study, label_ref.name, "deep_learning")
+        for config in load_configs(
+            study.case_study, label_ref.name, "deep_learning", case_dir=study.root
+        )
     }
     try:
         configured = configs[request["config_name"]]
@@ -352,7 +470,21 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
         seed=seed,
         num_threads=int(request["overrides"].get("num_threads", 8)),
     )
-    max_train_sequences = int(reductions.get("max_train_sequences", 0))
+    setup = yaml.safe_load((study.root / "config" / "setup.yaml").read_text()) or {}
+    max_train_sequences, sequence_reduction = resolve_dl_max_train_sequences(
+        (setup.get("modeling") or {}).get("dl") or {},
+        int(reductions.get("max_train_sequences", 0)),
+    )
+    # Preview-only, with no counterpart under `modeling.dl`: a declared cap on the
+    # training sample is a property of the model, while a cap on how much of validation
+    # gets scored is only ever a reduction in coverage. There is nothing for a
+    # configuration to declare here, so this reads from the preview alone.
+    predict_reduction = int(reductions.get("max_predict_sequences", 0))
+    if predict_reduction < 0:
+        raise ValueError(
+            "the max_predict_sequences preview reduction must be zero or positive, "
+            f"not {predict_reduction}"
+        )
     calendar_id = make_walk_forward_config(study.case_study, date_col=mds.date_col).calendar_id
     lookback = int(config["params"].get("lookback", 60))
     dataset_pd = dataset.to_pandas()
@@ -369,6 +501,15 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
         # than fail later on a key that is missing from the digest.
         if entity_col != "symbol":
             raise ValueError(f"Darts presets require the symbol entity key, not {entity_col!r}")
+        # Refused rather than ignored. Darts forecasts whole series, so thinning the key
+        # set would not shorten the forward pass - it would only publish fewer keys than
+        # the model produced. A reduction that silently does nothing is worse than one
+        # that is unavailable, because the preview would still look reduced.
+        if predict_reduction:
+            raise ValueError(
+                "max_predict_sequences is not supported for Darts presets: they forecast "
+                "whole series, so capping prediction keys saves no work"
+            )
 
         expected = darts_validation_keys(
             dataset_pd,
@@ -379,6 +520,7 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
             date_col=mds.date_col,
             entity_col=entity_col,
             case_study=study.case_study,
+            calendar_id=calendar_id,
             temporal_by_fold=mds.temporal_by_fold,
             temporal_keys=list(mds.temporal_keys),
             temporal_feature_names=list(mds.temporal_feature_names),
@@ -393,6 +535,7 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
         preprocessing = {
             "class": "fold_train_standardization",
             "base_target": sequence_identity["base_target_data_spec"],
+            "calendar_id": calendar_id,
             "decision_cadence": decision_cadence,
             "input_chunk_length": sequence_identity["input_chunk_length"],
             "output_chunk_length": sequence_identity["output_chunk_length"],
@@ -406,6 +549,7 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
             entity_col=entity_col,
             lookback=lookback,
             calendar_id=calendar_id,
+            max_predict_sequences=predict_reduction,
         )
         sequence_identity = {
             "input_data_spec": mds.input_lineage,
@@ -414,6 +558,7 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
         }
         preprocessing = {
             "class": "fold_train_standardization",
+            "calendar_id": calendar_id,
             "gap_policy": "exclude_windows_crossing_missing_expected_periods",
             "lookback": lookback,
         }
@@ -451,9 +596,18 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
             "n_folds": expected["fold"].n_unique(),
         },
         "input_data_spec": sequence_identity,
+        # `sampling` records what a PREVIEW reduced, not what the configuration
+        # declares. The locked holdout runner reads it as "was this run reduced" and
+        # refuses anything non-zero, so a declared cap - which is part of the model and
+        # applies to the holdout refit too - rides in `input_data_spec` instead.
+        # The key is omitted when unused rather than written as zero: `computation` is
+        # hashed whole, so an unconditional third key would move the training_hash of
+        # every sequence run ever registered. A preview that sets it gets a spec the
+        # locked holdout runner already refuses, which is the behaviour we want.
         "sampling": {
             "max_symbols": int(reductions.get("max_symbols", 0)),
-            "max_train_sequences": max_train_sequences,
+            "max_train_sequences": sequence_reduction,
+            **({"max_predict_sequences": predict_reduction} if predict_reduction else {}),
         },
         "numerics": runtime,
         "source_identity": _sequence_source_identity(config),
@@ -486,9 +640,374 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
         temporal_feature_names=tuple(mds.temporal_feature_names),
         expected_keys=expected,
         max_train_sequences=max_train_sequences,
+        max_predict_sequences=predict_reduction,
         runtime_provenance=runtime_provenance,
     )
     return spec, context
+
+
+@dataclass(frozen=True)
+class LockedSequenceInputs:
+    """Everything a locked sequence specification determines about its own inputs.
+
+    Derived from the spec and never from a preset, so an edit to a preset since the run
+    cannot change what is reconstructed. Both callers below need exactly this set, and they
+    need it to be the SAME set: `rekey_holdout_spec` writes the eligibility manifest and
+    `reconstruct_locked_request` checks it, so a second derivation is two statements of one
+    rule that agree until they do not.
+    """
+
+    label_ref: Any
+    mds: Any
+    split: dict[str, Any]
+    config: dict[str, Any]
+    dataset_pd: Any
+    lookback: int
+    decision_cadence: str | None
+    preprocessing: dict[str, Any]
+
+
+def locked_sequence_inputs(study: Study, spec: dict[str, Any]) -> LockedSequenceInputs:
+    """Rebuild a locked sequence run's inputs from its own specification.
+
+    The configuration comes out of the recorded model block rather than out of
+    `load_configs`, for the reason `reconstruct_locked_request` has always given: a preset is
+    mutable and the spec is not, so reading the preset would let an edit since selection
+    change what is refitted without changing anything a reader can see.
+
+    The dataset is thinned to the locked decision cadence before any window is built,
+    because `resolve_model_request` thins it there too. A weekly-cadence lock reconstructed
+    on every session is not a cheaper refit, it is a different model.
+    """
+    from case_studies.research.contracts import ExecutionTier
+    from case_studies.research.models import locked_holdout_split
+    from case_studies.utils.registry import training_hash_from_spec
+    from utils.modeling import load_modeling_dataset
+
+    computation = spec["computation"]
+    label_ref = study.labels.get(spec["label"], execution_tier=ExecutionTier.CANONICAL)
+    mds = load_modeling_dataset(study.case_study, label_ref.name, max_symbols=0)
+    if mds.date_col != "timestamp" or mds.entity_cols[:1] not in (["symbol"], ["product"]):
+        raise ValueError("locked sequence runner requires canonical entity and timestamp keys")
+    if mds.task_type != "regression":
+        raise ValueError("locked sequence runner currently supports regression labels only")
+    split = locked_holdout_split(spec, mds.dataset, mds.date_col, study.case_study)
+
+    model = computation.get("model")
+    if not isinstance(model, dict) or not isinstance(model.get("params"), dict):
+        raise ValueError("locked sequence model specification is missing")
+    model_params = dict(model["params"])
+    required_training = {
+        name: model_params.pop(name, None)
+        for name in ("batch_size", "checkpoint_interval", "n_epochs")
+    }
+    if any(value is None for value in required_training.values()):
+        raise ValueError("locked sequence model omits exact training parameters")
+    config = _resolve_sequence_config(
+        {
+            "family": "deep_learning",
+            "library": model.get("implementation"),
+            "config_name": str(
+                spec.get("config_name") or f"locked-{training_hash_from_spec(spec)}"
+            ),
+            "params": model_params,
+            **required_training,
+            "seed": int(spec["seed"]),
+        },
+        {},
+    )
+
+    preprocessing = computation.get("preprocessing")
+    if not isinstance(preprocessing, dict) or not preprocessing.get("calendar_id"):
+        raise ValueError("locked sequence preprocessing omits the exact calendar")
+    decision_cadence = config["params"].get("decision_cadence")
+    locked_cv = computation.get("cv") or {}
+    locked_cv_request = locked_cv.get("request") or {}
+    # Presence, not truth. CVSpec.calendar is None whenever it was left unset, and a
+    # resolved CV record still writes the key, so None is an exactly reproducible
+    # choice rather than a missing one - rejecting it would refuse a canonical weekly
+    # run that simply never named a calendar. Only a block that never mentions the key
+    # leaves nothing to reproduce, and defaulting there would silently thin on a
+    # different calendar than the fit did once resolve_rebalance_timestamps honors it.
+    for block in (locked_cv, locked_cv_request):
+        if "calendar" in block:
+            cadence_calendar = block["calendar"]
+            break
+    else:
+        if decision_cadence is not None:
+            raise ValueError(
+                "locked cadence-selected sequence training does not record its calendar, "
+                "so its observation selection cannot be reproduced"
+            )
+        cadence_calendar = None
+    dataset_pd = _select_sequence_observations(
+        mds.dataset,
+        date_col=mds.date_col,
+        cadence=decision_cadence,
+        calendar=cadence_calendar,
+    ).to_pandas()
+    return LockedSequenceInputs(
+        label_ref=label_ref,
+        mds=mds,
+        split=split,
+        config=config,
+        dataset_pd=dataset_pd,
+        lookback=int(config["params"].get("lookback", 60)),
+        decision_cadence=decision_cadence,
+        preprocessing=dict(preprocessing),
+    )
+
+
+def locked_sequence_expected_keys(
+    study: Study,
+    inputs: LockedSequenceInputs,
+    *,
+    splits: list[dict[str, Any]],
+):
+    """The eligibility manifest for ``splits``, by the branch the locked configuration names.
+
+    One function, two callers, and that is the whole point of it. `rekey_holdout_spec` writes
+    what this returns into the spec; `reconstruct_locked_request` checks the spec against what
+    this returns. Stated twice they would agree until a change touched one of them, and the
+    disagreement would not surface as a failure - `validate_locked_expected_keys` compares the
+    manifest against the rule that wrote it, so a holdout built on a second version of the rule
+    registers, validates, and is wrong where nothing looks.
+
+    A sequence model predicts only where a full lookback of history exists and no window
+    crosses a missing expected period, so these keys are not every (entity, date) in the fold.
+    That rule lives in `sequence_validation_keys` and `darts_validation_keys`, which the
+    validation path calls, and this calls them rather than restating what they do.
+    """
+    config = inputs.config
+    mds = inputs.mds
+    calendar_id = str(inputs.preprocessing["calendar_id"])
+    if config.get("library") == "darts":
+        from case_studies.utils.darts_forecasting import darts_validation_keys
+
+        return darts_validation_keys(
+            inputs.dataset_pd,
+            splits,
+            config=config,
+            feature_names=list(mds.feature_names),
+            label_col=mds.label_col,
+            date_col=mds.date_col,
+            entity_col=mds.entity_cols[0],
+            case_study=study.case_study,
+            calendar_id=calendar_id,
+            temporal_by_fold=mds.temporal_by_fold,
+            temporal_keys=list(mds.temporal_keys),
+            temporal_feature_names=list(mds.temporal_feature_names),
+        )
+    return sequence_validation_keys(
+        inputs.dataset_pd,
+        splits,
+        label_col=mds.label_col,
+        date_col=mds.date_col,
+        entity_col=mds.entity_cols[0],
+        lookback=inputs.lookback,
+        calendar_id=calendar_id,
+    )
+
+
+def rekey_holdout_spec(
+    study: Study,
+    spec: dict[str, Any],
+    *,
+    validation_spec: dict[str, Any],
+) -> None:
+    """Recompute the fold-derived fields against the holdout fold, in place, before a lock.
+
+    The sequence half of the hook `case_studies.research.holdout._rekey_holdout_spec`
+    dispatches to. Until this existed every sequence holdout refused with
+    `NotImplementedError`, which is what stopped `sp500_options` the day a corrected label
+    buffer moved its selection from `linear/lasso_f0.7` to `deep_learning/patchtst`.
+
+    One field is re-keyed, and only one. `expected_prediction_keys` describes the validation
+    folds on arrival and has to describe the derived holdout fold instead: carrying it forward
+    locks a manifest `validate_locked_run` rejects, and dropping it locks one it rejects
+    differently. There is no second field. A sequence model resolves no parameter from a
+    fold's own training rows - its `model` block is `{class, implementation, objective,
+    params}` and every one of those is declared - so it carries no `effective_params_by_fold`
+    for `linear`'s replay-and-verify step to apply to.
+
+    `validation_spec` is unused for the same reason it is unused in the latent-factor hook: it
+    exists so the dispatch can pass it to every family, and only a family with data-derived
+    parameters has anything to verify against it.
+    """
+    inputs = locked_sequence_inputs(study, spec)
+    expected = locked_sequence_expected_keys(study, inputs, splits=[inputs.split])
+    spec["computation"]["expected_prediction_keys"] = {
+        "digest": value_digest(expected, ("symbol", "timestamp", "fold")),
+        "n_rows": expected.height,
+        "n_folds": expected["fold"].n_unique(),
+    }
+
+
+def reconstruct_locked_request(
+    study: Study,
+    spec: dict[str, Any],
+    *,
+    checkpoint_kind: str,
+    checkpoint_value: int | None,
+):
+    """Reconstruct a sequence holdout fit without consulting a mutable preset."""
+    from case_studies.research.contracts import ExecutionTier
+    from case_studies.research.cv import (
+        require_fold_scoped_temporal_holdout_coverage,
+    )
+    from case_studies.research.models import (
+        ResolvedModelRequest,
+        locked_holdout_split,
+        validate_locked_expected_keys,
+    )
+    from case_studies.utils.artifact_digest import value_digest
+    from case_studies.utils.deep_model_state import declared_epoch_checkpoints
+    from case_studies.utils.registry import training_hash_from_spec
+    from utils.modeling import load_modeling_dataset
+
+    if checkpoint_kind != "epoch" or checkpoint_value is None:
+        raise ValueError("sequence holdout requires one locked epoch checkpoint")
+    study.require_writable()
+    study.activate(ExecutionTier.CANONICAL)
+    computation = spec["computation"]
+    if computation.get("sampling") != {"max_symbols": 0, "max_train_sequences": 0}:
+        raise ValueError("locked sequence holdout requires unreduced canonical inputs")
+    # `sampling` above proves no PREVIEW reduced this run. A cap the configuration
+    # DECLARES is a different thing and has to reach the refit: it is part of the model,
+    # so a holdout drawing a different number of windows than the validation fit is not a
+    # cheaper run, it is a different model answering the holdout - and nothing in the
+    # output would show it. Taken from the stored spec rather than re-read from
+    # setup.yaml, so an edit since selection cannot silently change what is refitted.
+    locked_max_train_sequences = int(
+        (computation.get("input_data_spec") or {}).get("max_train_sequences", 0)
+    )
+    inputs = locked_sequence_inputs(study, spec)
+    label_ref = inputs.label_ref
+    mds = inputs.mds
+    split = inputs.split
+    config = inputs.config
+    model = spec["computation"].get("model")
+    if mds.temporal_by_fold is not None and mds.temporal_keys and mds.temporal_feature_names:
+        # Coverage, not fold-boundary compatibility - the branch `latent_factors/adapter.py:603`
+        # and `gbm.py` already take, for the same reason. Compatibility asks whether the stage-04
+        # artifact declares a fold with this geometry, and for a holdout that question has no good
+        # answer: the fold is derived after stage 04 ran, so the artifact does not declare it, and
+        # rebuilding it to declare it changes the sha256 the selection was made under. The
+        # features are joined by (entity, date), so what the run needs is rows spanning the dates
+        # it trains and evaluates on, not a fold labelled for it.
+        require_fold_scoped_temporal_holdout_coverage(
+            split,
+            mds.temporal_by_fold,
+            source_timeline=mds.dataset.get_column(mds.date_col),
+            date_col=mds.date_col,
+        )
+
+    expected_model = {
+        "class": config["params"]["architecture"],
+        "implementation": config.get("library", "pytorch"),
+        "objective": "regression",
+        "params": {
+            **config["params"],
+            "batch_size": int(config["batch_size"]),
+            "checkpoint_interval": int(config["checkpoint_interval"]),
+            "n_epochs": int(config["n_epochs"]),
+        },
+    }
+    if model != expected_model:
+        raise ValueError("locked sequence model specification does not reproduce exactly")
+    checkpoints = declared_epoch_checkpoints(
+        int(config["n_epochs"]), int(config["checkpoint_interval"])
+    )
+    expected_schedule = [{"kind": "epoch", "value": value} for value in checkpoints]
+    if (
+        computation.get("checkpoint_schedule") != expected_schedule
+        or checkpoint_value not in checkpoints
+    ):
+        raise ValueError("locked sequence checkpoint is absent from its exact schedule")
+    numerics = computation.get("numerics")
+    if not isinstance(numerics, dict):
+        raise ValueError("locked sequence numerics are missing")
+    reproduced_numerics = _sequence_runtime_spec(
+        str(numerics.get("device")),
+        seed=int(numerics.get("seed")),
+        num_threads=int(numerics.get("num_threads")),
+    )
+    if numerics != reproduced_numerics or int(spec["seed"]) != int(numerics["seed"]):
+        raise ValueError("locked sequence numerics cannot be reproduced")
+
+    preprocessing = inputs.preprocessing
+    decision_cadence = inputs.decision_cadence
+    dataset_pd = inputs.dataset_pd
+    lookback = inputs.lookback
+    expected = locked_sequence_expected_keys(study, inputs, splits=[split])
+    if config.get("library") == "darts":
+        from case_studies.utils.darts_forecasting import darts_training_identity
+
+        input_data_spec = darts_training_identity(
+            config,
+            mds.label_col,
+            case_study=study.case_study,
+            input_data_spec=mds.input_lineage,
+            max_train_sequences=locked_max_train_sequences,
+        )
+        expected_preprocessing = {
+            "class": "fold_train_standardization",
+            "base_target": input_data_spec["base_target_data_spec"],
+            "calendar_id": preprocessing["calendar_id"],
+            "decision_cadence": decision_cadence,
+            "input_chunk_length": input_data_spec["input_chunk_length"],
+            "output_chunk_length": input_data_spec["output_chunk_length"],
+        }
+    else:
+        input_data_spec = {
+            "input_data_spec": mds.input_lineage,
+            "lookback": lookback,
+            "max_train_sequences": locked_max_train_sequences,
+        }
+        expected_preprocessing = {
+            "class": "fold_train_standardization",
+            "calendar_id": preprocessing["calendar_id"],
+            "gap_policy": "exclude_windows_crossing_missing_expected_periods",
+            "lookback": lookback,
+        }
+    validate_locked_expected_keys(spec, expected)
+    expected_inputs = {
+        "label_artifact": {"digest": label_ref.digest, "name": label_ref.name},
+        "feature_artifacts": mds.input_lineage["artifacts"],
+        "feature_names": list(mds.feature_names),
+        "task": {
+            "type": "regression",
+            "class_values": [],
+            "continuous_eval_label": label_ref.definition.continuous_eval_label,
+        },
+        "preprocessing": expected_preprocessing,
+        "input_data_spec": input_data_spec,
+        "source_identity": _sequence_source_identity(config),
+        "runtime_identity": _sequence_runtime_identity(config),
+    }
+    for name, expected_value in expected_inputs.items():
+        if computation.get(name) != expected_value:
+            raise ValueError(f"locked sequence {name} does not match the available computation")
+    context = SequenceResearchContext(
+        dataset_pd=dataset_pd,
+        splits=(split,),
+        config=config,
+        feature_names=tuple(mds.feature_names),
+        label_col=mds.label_col,
+        date_col=mds.date_col,
+        entity_col=mds.entity_cols[0],
+        task_type=mds.task_type,
+        class_values=tuple(mds.class_values),
+        temporal_by_fold=mds.temporal_by_fold,
+        temporal_keys=tuple(mds.temporal_keys),
+        temporal_feature_names=tuple(mds.temporal_feature_names),
+        expected_keys=expected,
+        max_train_sequences=locked_max_train_sequences,
+        runtime_provenance=_sequence_runtime_provenance(study, config),
+        prediction_split="holdout",
+        published_checkpoints=(int(checkpoint_value),),
+    )
+    return ResolvedModelRequest(study, "deep_learning", spec, context)
 
 
 def _cached_sequence_run(study: Study, spec: dict[str, Any], context: SequenceResearchContext):
@@ -497,7 +1016,9 @@ def _cached_sequence_run(study: Study, spec: dict[str, Any], context: SequenceRe
     from case_studies.utils.registry import prediction_hash_from_parts, training_hash_from_spec
 
     training_hash = training_hash_from_spec(spec)
-    checkpoint_values = tuple(item["value"] for item in spec["computation"]["checkpoint_schedule"])
+    computation = spec["computation"]
+    checkpoint_values = tuple(int(item["value"]) for item in computation["checkpoint_schedule"])
+    published = context.published_checkpoints or checkpoint_values
     try:
         training = Result.open(
             study, training_hash, include_preview=spec["execution_tier"] == "preview"
@@ -508,13 +1029,13 @@ def _cached_sequence_run(study: Study, spec: dict[str, Any], context: SequenceRe
                 prediction_hash_from_parts(
                     training_hash,
                     checkpoint,
-                    "validation",
+                    context.prediction_split,
                     checkpoint_kind="epoch",
                     identity_version=spec["identity_version"],
                 ),
                 include_preview=spec["execution_tier"] == "preview",
             )
-            for checkpoint in checkpoint_values
+            for checkpoint in published
         )
     except KeyError:
         return None
@@ -549,7 +1070,279 @@ def _cached_sequence_run(study: Study, spec: dict[str, Any], context: SequenceRe
             )
     except ValueError:
         return None
-    return ModelRun(training=training, predictions=predictions)
+    complete_predictions = tuple(
+        result for result in predictions if isinstance(result, PredictionResult)
+    )
+    return ModelRun(
+        training=training,
+        predictions=complete_predictions,
+        diagnostics={"reused": True},
+    )
+
+
+def _predict_reconstructed_sequence(
+    model: nn.Module,
+    sequences: np.ndarray,
+    device: torch.device,
+    *,
+    batch_size: int,
+) -> np.ndarray:
+    model.eval()
+    parts = []
+    with torch.no_grad():
+        for start in range(0, len(sequences), batch_size):
+            batch = torch.as_tensor(
+                sequences[start : start + batch_size], dtype=torch.float32, device=device
+            )
+            parts.append(model(batch).detach().cpu().numpy())
+    if not parts:
+        raise ValueError("locked sequence checkpoint produced no predictions")
+    return np.concatenate(parts)
+
+
+def _reconstruct_pytorch_predictions(
+    model_root: Path,
+    context: SequenceResearchContext,
+    computation: dict[str, Any],
+) -> pl.DataFrame:
+    from case_studies.utils.deep_model_state import deep_checkpoint_path, restore_deep_model
+    from case_studies.utils.sequence_dataset import materialize_sequences
+
+    frames = []
+    lookback = int(context.config["params"].get("lookback", 60))
+    calendar_id = str(computation["preprocessing"]["calendar_id"])
+    device = torch.device(str(computation["numerics"]["device"]))
+
+    def model_factory(name: str, config: Mapping[str, Any]) -> nn.Module:
+        return create_model(name, dict(config))
+
+    dates = context.dataset_pd[context.date_col]
+    for split in context.splits:
+        train_mask = (dates >= split["train_start"]) & (dates <= split["train_end"])
+        val_mask = (dates >= split["val_start"]) & (dates <= split["val_end"])
+        train_store, val_store, _ = prepare_fold_sequence_stores(
+            context.dataset_pd,
+            train_mask=train_mask,
+            val_mask=val_mask,
+            feature_names=list(context.feature_names),
+            label_col=context.label_col,
+            date_col=context.date_col,
+            entity_col=context.entity_col,
+            lookback=lookback,
+            # The reconstruction only asserts a training store exists - the
+            # standardization it checks comes from the stored checkpoint, not from these
+            # rows. Drawing the cap the run declared rather than every window keeps that
+            # assertion from materializing millions of sequences on a minute panel.
+            max_train_sequences=int(
+                (computation.get("input_data_spec") or {}).get("max_train_sequences", 0)
+            ),
+            temporal_by_fold=context.temporal_by_fold,
+            temporal_keys=list(context.temporal_keys),
+            temporal_feature_names=list(context.temporal_feature_names),
+            fold_id=int(split["fold"]),
+            val_start=split["val_start"],
+            calendar_id=calendar_id,
+        )
+        if not train_store.n_sequences or not val_store.n_sequences:
+            raise ValueError(f"locked sequence fold {split['fold']} cannot be reconstructed")
+        sequences, actual, timestamps, entities = materialize_sequences(val_store)
+        for checkpoint in computation["checkpoint_schedule"]:
+            value = int(checkpoint["value"])
+            model, preprocessing, metadata = restore_deep_model(
+                deep_checkpoint_path(
+                    model_root,
+                    context.config["config_name"],
+                    int(split["fold"]),
+                    value,
+                ),
+                model_factory,
+            )
+            expected_metadata = {
+                "config_name": context.config["config_name"],
+                "fold": int(split["fold"]),
+                "checkpoint_kind": "epoch",
+                "checkpoint_value": value,
+            }
+            if metadata != expected_metadata:
+                raise ValueError("locked sequence checkpoint metadata changed")
+            stored_mean = preprocessing.get("mean")
+            stored_scale = preprocessing.get("scale")
+            if (
+                preprocessing.get("feature_names") != list(context.feature_names)
+                or int(preprocessing.get("lookback", -1)) != lookback
+                or stored_mean is None
+                or stored_scale is None
+                or train_store.feature_mean is None
+                or train_store.feature_scale is None
+                or not np.array_equal(stored_mean, train_store.feature_mean)
+                or not np.array_equal(stored_scale, train_store.feature_scale)
+            ):
+                raise ValueError("locked sequence preprocessing state changed")
+            model = model.to(device)
+            prediction = _predict_reconstructed_sequence(
+                model,
+                sequences,
+                device,
+                batch_size=int(context.config["batch_size"]),
+            )
+            frames.append(
+                pl.DataFrame(
+                    {
+                        context.date_col: timestamps,
+                        context.entity_col: entities,
+                        "fold_id": int(split["fold"]),
+                        "y_score": prediction,
+                        "y_true": actual,
+                        "config": context.config["config_name"],
+                        "epoch": value,
+                    }
+                )
+            )
+    if not frames:
+        raise ValueError("locked sequence fitted state produced no predictions")
+    return pl.concat(frames).sort(context.entity_col, context.date_col, "fold_id", "epoch")
+
+
+def _reconstruct_darts_predictions(
+    model_root: Path,
+    context: SequenceResearchContext,
+    computation: dict[str, Any],
+    case_study: str,
+) -> pl.DataFrame:
+    from case_studies.utils.darts_forecasting import (
+        _attach_darts_target,
+        _attach_expected_periods,
+        _overlay_fold_temporal_features,
+        _parse_label_horizon,
+        _predict_fold,
+        _prepare_fold_series,
+        _resolve_chunk_lengths,
+        darts_checkpoint_path,
+        darts_forecast_reduction,
+        load_darts_checkpoint,
+    )
+
+    config = context.config
+    input_chunk_length, output_chunk_length = _resolve_chunk_lengths(
+        config, _parse_label_horizon(context.label_col)
+    )
+    # Same pipeline and same order as darts_validation_keys: expected periods first,
+    # because the lagged-label target is built from them, then _attach_darts_target,
+    # which dispatches on params.darts_target. Calling _attach_base_target directly
+    # built the one-period target for every config, so replaying a lagged-label
+    # checkpoint scored it against a target the fit never saw.
+    dataset = _attach_expected_periods(
+        context.dataset_pd.copy(),
+        date_col=context.date_col,
+        calendar_id=str(computation["preprocessing"]["calendar_id"]),
+        case_study=case_study,
+    )
+    dataset = _attach_darts_target(
+        dataset,
+        case_study=case_study,
+        date_col=context.date_col,
+        entity_col=context.entity_col,
+        label_col=context.label_col,
+        config=config,
+    )
+    frames = []
+    has_temporal = bool(
+        context.temporal_by_fold is not None
+        and context.temporal_keys
+        and context.temporal_feature_names
+    )
+    for split in context.splits:
+        fold_dataset = (
+            _overlay_fold_temporal_features(
+                dataset,
+                split,
+                context.date_col,
+                context.temporal_by_fold,
+                list(context.temporal_keys),
+                list(context.temporal_feature_names),
+            )
+            if has_temporal
+            else dataset
+        )
+        fold_series = _prepare_fold_series(
+            fold_dataset,
+            split,
+            list(context.feature_names),
+            context.label_col,
+            context.date_col,
+            context.entity_col,
+            input_chunk_length,
+            output_chunk_length,
+        )
+        for checkpoint in computation["checkpoint_schedule"]:
+            value = int(checkpoint["value"])
+            model, metadata = load_darts_checkpoint(
+                darts_checkpoint_path(
+                    model_root,
+                    config["config_name"],
+                    int(split["fold"]),
+                    value,
+                ),
+                device=str(computation["numerics"]["device"]),
+            )
+            expected_metadata = {
+                "config_name": config["config_name"],
+                "fold": int(split["fold"]),
+                "checkpoint_kind": "epoch",
+                "checkpoint_value": value,
+            }
+            if metadata != expected_metadata:
+                raise ValueError("locked Darts checkpoint metadata changed")
+            frame = _predict_fold(
+                model,
+                fold_series,
+                int(split["fold"]),
+                context.date_col,
+                context.entity_col,
+                output_chunk_length,
+                forecast_reduction=darts_forecast_reduction(config.get("params", {})),
+            ).with_columns(
+                pl.lit(config["config_name"]).alias("config"),
+                pl.lit(value).alias("epoch"),
+            )
+            frames.append(frame)
+    if not frames or any(frame.is_empty() for frame in frames):
+        raise ValueError("locked Darts fitted state produced incomplete predictions")
+    return pl.concat(frames).sort(context.entity_col, context.date_col, "fold_id", "epoch")
+
+
+def _reconstruct_sequence_predictions(
+    model_root: Path,
+    context: SequenceResearchContext,
+    computation: dict[str, Any],
+    case_study: str,
+) -> dict[str, Any]:
+    _configure_sequence_runtime(computation["numerics"])
+    checkpoints = tuple(int(item["value"]) for item in computation["checkpoint_schedule"])
+    fold_ids = tuple(int(split["fold"]) for split in context.splits)
+    if context.config.get("library") == "darts":
+        from case_studies.utils.darts_forecasting import validate_darts_checkpoint_population
+
+        validate_darts_checkpoint_population(
+            model_root,
+            config_name=context.config["config_name"],
+            fold_ids=fold_ids,
+            checkpoints=checkpoints,
+            architecture=context.config["params"]["architecture"],
+        )
+        predictions = _reconstruct_darts_predictions(model_root, context, computation, case_study)
+    else:
+        from case_studies.utils.deep_model_state import validate_deep_checkpoint_population
+
+        validate_deep_checkpoint_population(
+            model_root,
+            config_name=context.config["config_name"],
+            fold_ids=fold_ids,
+            checkpoints=checkpoints,
+            architecture=context.config["params"]["architecture"],
+        )
+        predictions = _reconstruct_pytorch_predictions(model_root, context, computation)
+    return {"all_predictions": predictions, "grid_results": []}
 
 
 def _publish_sequence_predictions(
@@ -559,9 +1352,15 @@ def _publish_sequence_predictions(
     training,
     result: dict[str, Any],
 ) -> tuple:
-    """Register one prediction set per declared checkpoint under the expected key names."""
+    """Register one prediction set per published checkpoint under the expected key names."""
     prediction_results = []
-    for checkpoint in (item["value"] for item in computation["checkpoint_schedule"]):
+    # A locked holdout run publishes only the checkpoint its lock selected, on the
+    # holdout split. Every other run publishes the whole declared schedule as
+    # validation, which is what published_checkpoints being None means.
+    published = context.published_checkpoints or tuple(
+        int(item["value"]) for item in computation["checkpoint_schedule"]
+    )
+    for checkpoint in published:
         predictions = (
             result["all_predictions"]
             .filter(
@@ -580,7 +1379,7 @@ def _publish_sequence_predictions(
                 training,
                 checkpoint_kind="epoch",
                 checkpoint_value=int(checkpoint),
-                split="validation",
+                split=context.prediction_split,
                 predictions=predictions,
                 expected_keys=context.expected_keys,
                 task_type="regression",
@@ -601,6 +1400,7 @@ def run_resolved_request(
     cached = _cached_sequence_run(study, spec, context)
     if cached is not None:
         return cached
+    computation = spec["computation"]
     training = study.results.register_training(
         spec,
         execution_tier=spec["execution_tier"],
@@ -608,50 +1408,158 @@ def run_resolved_request(
     )
     train_dir = training.root / "run_log" / "training" / training.hash
     model_dir = train_dir / "models"
-    if model_dir.exists():
-        raise ValueError(f"partial fitted-state directory requires inspection: {model_dir}")
-    staging = train_dir / f".models.{uuid.uuid4().hex}.tmp"
-    computation = spec["computation"]
-    _configure_sequence_runtime(computation["numerics"])
-    try:
-        result = run_dl_cv(
-            context.dataset_pd,
-            list(context.splits),
-            configs=[context.config],
-            n_features=len(context.feature_names),
-            feature_names=list(context.feature_names),
-            label_col=context.label_col,
-            date_col=context.date_col,
-            entity_col=context.entity_col,
-            device=computation["numerics"]["device"],
-            save_dir=train_dir / "diagnostics",
-            max_train_sequences=context.max_train_sequences,
-            register=False,
-            case_study=study.case_study,
-            temporal_by_fold=context.temporal_by_fold,
-            temporal_keys=list(context.temporal_keys),
-            temporal_feature_names=list(context.temporal_feature_names),
-            checkpoint_root=staging,
-            strict=True,
-            seed=int(spec["seed"]),
-            num_threads=int(computation["numerics"]["num_threads"]),
+    reused_fitted_state = model_dir.exists()
+    if reused_fitted_state:
+        result = _reconstruct_sequence_predictions(
+            model_dir, context, computation, study.case_study
         )
-        os.replace(staging, model_dir)
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+    else:
+        staging = train_dir / f".models.{uuid.uuid4().hex}.tmp"
+        _configure_sequence_runtime(computation["numerics"])
+        fit_wall_t0 = time.perf_counter()
+        fit_cpu_t0 = cpu_seconds()
+        try:
+            result = run_dl_cv(
+                context.dataset_pd,
+                list(context.splits),
+                configs=[context.config],
+                n_features=len(context.feature_names),
+                feature_names=list(context.feature_names),
+                label_col=context.label_col,
+                date_col=context.date_col,
+                entity_col=context.entity_col,
+                device=computation["numerics"]["device"],
+                save_dir=train_dir / "diagnostics",
+                max_train_sequences=context.max_train_sequences,
+                max_predict_sequences=context.max_predict_sequences,
+                register=False,
+                case_study=study.case_study,
+                temporal_by_fold=context.temporal_by_fold,
+                temporal_keys=list(context.temporal_keys),
+                temporal_feature_names=list(context.temporal_feature_names),
+                checkpoint_root=staging,
+                strict=True,
+                seed=int(spec["seed"]),
+                num_threads=int(computation["numerics"]["num_threads"]),
+            )
+            os.replace(staging, model_dir)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        fit_wall_s = time.perf_counter() - fit_wall_t0
+        fit_cpu_s = cpu_seconds() - fit_cpu_t0
 
     prediction_results = _publish_sequence_predictions(
         study, computation, context, training, result
     )
     runtime_path = train_dir / "runtime.json"
-    if runtime_path.exists():
+    if runtime_path.exists() and not reused_fitted_state:
         runtime = json.loads(runtime_path.read_text())
-        runtime["elapsed_s"] = sum(
-            float(row.get("elapsed_s", 0.0)) for row in result["grid_results"]
-        )
+        if result["grid_results"]:
+            runtime["elapsed_s"] = sum(
+                float(row.get("elapsed_s", 0.0)) for row in result["grid_results"]
+            )
         runtime_path.write_text(json.dumps(runtime, indent=2, sort_keys=True) + "\n")
-    return ModelRun(training=training, predictions=prediction_results)
+    if result["grid_results"] and not reused_fitted_state:
+        # The seconds above land in runtime.json, which is the artifact compared byte for byte
+        # when the same identity is registered again and which no query reads.
+        # `training_runs.elapsed_s` is the column `reference/case-study-runtimes.md` is built
+        # from, and it was NULL on every sequence row the fleet had registered. Only the fitting
+        # path records: a run served from persisted state has no fit cost, and writing one would
+        # overwrite what its original fit measured.
+        from case_studies.utils.registry.registration import record_training_runtime
+        from case_studies.utils.runtime import resource_measurement
+
+        record_training_runtime(
+            study.case_study,
+            training.hash,
+            case_dir=training.root,
+            # Both numbers come from the same interval - the fit block - because
+            # `cores_used` is their ratio, and a CPU total measured over one span divided by
+            # a wall total measured over another is not a core count. The per-fold sum still
+            # goes to runtime.json above; this is what the registry is priced from.
+            measured=resource_measurement(
+                elapsed_s=fit_wall_s,
+                cpu_s=fit_cpu_s,
+            ),
+        )
+    return ModelRun(
+        training=training,
+        predictions=prediction_results,
+        diagnostics={"reused": reused_fitted_state},
+    )
+
+
+def validate_locked_run(
+    study: Study,
+    spec: dict[str, Any],
+    context: SequenceResearchContext,
+    run: ModelRun,
+) -> str:
+    """Validate selected predictions and the persisted sequence checkpoint population."""
+    from case_studies.utils.registry import training_hash_from_spec
+    from case_studies.utils.registry.specs import canonical_json
+
+    if run.training.hash != training_hash_from_spec(spec) or len(run.predictions) != 1:
+        raise ValueError("locked sequence run has the wrong training or prediction identity")
+    selected = context.published_checkpoints
+    prediction = run.predictions[0]
+    record = prediction.registry_record()
+    if (
+        selected is None
+        or len(selected) != 1
+        or (
+            record["split"],
+            record["checkpoint_kind"],
+            record["checkpoint_value"],
+        )
+        != (context.prediction_split, "epoch", selected[0])
+    ):
+        raise ValueError("locked sequence run published the wrong checkpoint")
+    # prediction.load() returns what was published, and publishing renames the entity to
+    # `symbol`; the reconstruction still carries the reader key, so bring it to the
+    # published contract before comparing rather than sorting a column that is not there.
+    published = prediction.load().sort("symbol", "timestamp", "fold")
+    reopened = _cached_sequence_run(study, spec, context)
+    if reopened is None or reopened.predictions[0].hash != prediction.hash:
+        raise ValueError("locked sequence fitted state cannot be reused exactly")
+    model_root = run.training.root / "run_log" / "training" / run.training.hash / "models"
+    reconstructed_all = _reconstruct_sequence_predictions(
+        model_root,
+        context,
+        spec["computation"],
+        study.case_study,
+    )["all_predictions"]
+    reconstructed = (
+        reconstructed_all.filter(
+            (pl.col("config") == context.config["config_name"]) & (pl.col("epoch") == selected[0])
+        )
+        .drop("config", "epoch")
+        .rename({"fold_id": "fold", "y_true": "actual", "y_score": "prediction"})
+    )
+    if context.entity_col != "symbol":
+        reconstructed = reconstructed.rename({context.entity_col: "symbol"})
+    reconstructed = reconstructed.sort("symbol", "timestamp", "fold")
+    key_columns = ["symbol", "timestamp", "fold"]
+    value_columns = ["prediction", "actual"]
+    if not reconstructed.select(key_columns).equals(
+        published.select(key_columns)
+    ) or not np.allclose(
+        reconstructed.select(value_columns).to_numpy(),
+        published.select(value_columns).to_numpy(),
+        rtol=1e-7,
+        atol=1e-7,
+        equal_nan=False,
+    ):
+        raise ValueError("locked sequence fitted state does not reproduce published predictions")
+    files = {
+        str(path.relative_to(model_root)): _sha256(path)
+        for path in sorted(model_root.rglob("*"))
+        if path.is_file()
+    }
+    if not files:
+        raise ValueError("locked sequence run has no fitted state")
+    return hashlib.sha256(canonical_json(files).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -1037,6 +1945,61 @@ def _decision_time_checkpoint_metrics(
 # ---------------------------------------------------------------------------
 
 
+def sequence_identity_params(
+    config: dict[str, Any],
+    *,
+    identity_params: dict[str, Any] | None,
+    input_data_spec: dict[str, Any] | None,
+    label_col: str,
+    case_study: str | None,
+    max_train_sequences: int,
+    device: str,
+) -> dict[str, Any] | None:
+    """The identity-bearing fields of one sequence training run.
+
+    ``device`` is one of them. Two fits of the same configuration on CPU and on GPU are
+    not the same fit - different kernels, different reduction orders, a different
+    nondeterminism profile (``reference/gpu-reproducibility.md``) - so they must not
+    share a ``training_hash``. Without it a completed CPU run satisfies the
+    already-complete check that skips a GPU fit, and a run registers under a device it
+    did not have. The device index is dropped: ``cuda:0`` and ``cuda:1`` are the same
+    claim about what the numbers came from.
+    """
+    from case_studies.utils.darts_forecasting import darts_training_identity, uses_darts_backend
+
+    params = dict(identity_params or {})
+    params["device"] = torch.device(str(device).lower().replace("gpu", "cuda")).type
+    # The preparation version belongs on every sequence identity, not only on the ones assembled
+    # through the runner's own spec. `us_equities_panel/12_dl_weekly.py` registers through this
+    # function directly, so without it that notebook keeps a version-1 identity for a fit whose
+    # design matrix changed under #767 - and it is the notebook Table 13.5 cites, so the stale
+    # identity would be read as a result.
+    params["sequence_preparation"] = SEQUENCE_PREPARATION_VERSION
+    if input_data_spec is not None:
+        if uses_darts_backend([config]):
+            if case_study is None:
+                raise ValueError("Darts identity requires case_study")
+            params.update(
+                darts_training_identity(
+                    config,
+                    label_col,
+                    case_study=case_study,
+                    input_data_spec=input_data_spec,
+                    max_train_sequences=max_train_sequences,
+                )
+            )
+        else:
+            params.update(
+                {
+                    "batch_size": config.get("batch_size", 2048),
+                    "input_data_spec": input_data_spec,
+                    "lookback": config.get("params", {}).get("lookback", 60),
+                    "max_train_sequences": max_train_sequences,
+                }
+            )
+    return params or None
+
+
 def run_dl_cv(
     dataset_pd: pd.DataFrame,
     splits: list[dict[str, Any]],
@@ -1050,6 +2013,7 @@ def run_dl_cv(
     device: str = "cuda",
     save_dir: Path | None = None,
     max_train_sequences: int = 0,
+    max_predict_sequences: int = 0,
     register: bool = False,
     case_study: str | None = None,
     notebook: str | None = None,
@@ -1140,30 +2104,15 @@ def run_dl_cv(
     cached_result = None
 
     def _config_identity_params(cfg: dict[str, Any]) -> dict[str, Any] | None:
-        params = dict(identity_params or {})
-        if input_data_spec is not None:
-            if uses_darts_backend([cfg]):
-                if case_study is None:
-                    raise ValueError("Darts identity requires case_study")
-                params.update(
-                    darts_training_identity(
-                        cfg,
-                        label_col,
-                        case_study=case_study,
-                        input_data_spec=input_data_spec,
-                        max_train_sequences=max_train_sequences,
-                    )
-                )
-            else:
-                params.update(
-                    {
-                        "batch_size": cfg.get("batch_size", 2048),
-                        "input_data_spec": input_data_spec,
-                        "lookback": cfg.get("params", {}).get("lookback", 60),
-                        "max_train_sequences": max_train_sequences,
-                    }
-                )
-        return params or None
+        return sequence_identity_params(
+            cfg,
+            identity_params=identity_params,
+            input_data_spec=input_data_spec,
+            label_col=label_col,
+            case_study=case_study,
+            max_train_sequences=max_train_sequences,
+            device=device,
+        )
 
     from case_studies.utils.registry import build_training_spec
 
@@ -1267,23 +2216,19 @@ def run_dl_cv(
         configs = pending_configs
 
     if register and case_study and force_retrain:
-        from case_studies.utils.registry import (
-            build_training_spec,
-            clear_prediction_sets,
-            training_hash_from_spec,
-        )
+        from case_studies.utils.registry import clear_prediction_sets, training_hash_from_spec
 
         for cfg in configs:
-            spec = build_training_spec(
-                cfg["family"],
-                cfg["config_name"],
-                label_col,
-                n_folds=len(splits),
-                n_epochs=cfg.get("n_epochs"),
-            )
+            # The spec this run registers under, not a second one built from a subset of
+            # its fields. Rebuilding here dropped `extra_params`, so the clear targeted a
+            # hash nothing was ever written to and every stale prediction set survived the
+            # retrain, sitting alongside the new one. The two used to coincide for a caller
+            # that passed neither `identity_params` nor `input_data_spec`, which is why it
+            # went unnoticed; `sequence_identity_params` always emits `device`, so from
+            # here on they could never coincide for anyone.
             removed = clear_prediction_sets(
                 case_study,
-                training_hash_from_spec(spec),
+                training_hash_from_spec(training_specs[cfg["config_name"]]),
                 split=prediction_split,
             )
             if removed["prediction_sets"]:
@@ -1384,6 +2329,7 @@ def run_dl_cv(
             entity_col=entity_col,
             lookback=lookback,
             max_train_sequences=max_train_sequences,
+            max_predict_sequences=max_predict_sequences,
             temporal_by_fold=temporal_by_fold if _has_fold_temporal else None,
             temporal_keys=temporal_keys,
             temporal_feature_names=temporal_feature_names,

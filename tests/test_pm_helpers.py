@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -9,6 +10,7 @@ import yaml
 
 from tests import pm_helpers
 from tests.pm_helpers import (
+    PREVIEW_TRANSLATED_PARAMETERS,
     RECORD_REPLAY,
     RECORD_REWRITE,
     TIER_ON_DEMAND,
@@ -20,8 +22,10 @@ from tests.pm_helpers import (
     get_record_mode,
     get_reruns,
     get_tier,
+    injected_parameters,
     missing_required_env,
     research_preview_parameters,
+    resolved_registry_path,
     unusable_parameters,
 )
 
@@ -176,6 +180,28 @@ def test_credential_gated_notebooks_declare_requires_env_not_skip(overrides: dic
     }
 
     assert hard_skipped_despite_a_gate == set()
+
+
+def test_no_entry_declares_a_reason_for_a_skip_it_does_not_take(overrides: dict) -> None:
+    """``skip_reason`` without ``skip`` is text nothing reads.
+
+    Every one of its seven call sites reaches it only inside a branch already taken on
+    ``skip``, so a reason standing alone describes a notebook that runs anyway. That is
+    worse than silence: ``00_holdout_predictions`` carried "Requires trained model
+    registry (not available in CI test data)" while executing every case study in the
+    registry, and the entry looked accounted for until it timed out.
+
+    What routes a notebook away from a job belongs in the key that does the routing -
+    ``requires_env``, ``docker_env``, ``gpu``, ``tier`` - and each says what it needs
+    without a second copy in prose.
+    """
+    reason_without_skip = {
+        key
+        for key, value in overrides.items()
+        if isinstance(value, dict) and value.get("skip_reason") and not value.get("skip")
+    }
+
+    assert reason_without_skip == set()
 
 
 def _executable(tmp_path: Path) -> Path:
@@ -354,21 +380,213 @@ def test_every_override_key_names_a_notebook(overrides: dict) -> None:
     assert orphaned == []
 
 
-def test_every_declared_parameter_reaches_its_notebook(overrides: dict) -> None:
-    """Every name in a `parameters` block must survive papermill's injection.
+@pytest.mark.parametrize("research_preview", [True, False], ids=["preview", "canonical"])
+def test_every_declared_parameter_reaches_its_notebook(
+    overrides: dict, research_preview: bool
+) -> None:
+    """Every name in a `parameters` block must survive papermill's injection, on both paths.
 
     Driven through `unusable_parameters` rather than a copy of its predicate, so
     the sweep cannot go on asserting a rule the helper has stopped applying.
+
+    Parametrised over the tier because `tests/overrides.yaml` has two consumers and they
+    inject differently. The smoke path calls `run_notebook(research_preview=True)`, where
+    `_collect_preview_reductions` folds MAX_FOLDS and MAX_SYMBOLS into PREVIEW_REDUCTIONS;
+    `tests/generate_intermediates.py:315` passes False, where they are passed through by
+    name and papermill drops any the parameters cell does not declare. Asking only the
+    preview question is what let `us_equities_panel` 06 and 07 carry a reduction the
+    fixture generator could not apply: both ran unreduced on 2026-09-06, and 06_linear
+    then failed because fold 0's 223-session training window is shorter than the
+    756-session burn-in `model_based.regime` declares, leaving 19 declared features
+    entirely missing from its design matrix.
     """
     unreachable = {
-        key: unusable_parameters(REPO_ROOT / f"{key}.py", value["parameters"])
+        key: unusable
         for key, value in overrides.items()
-        if isinstance(value, dict)
-        and isinstance(value.get("parameters"), dict)
-        and unusable_parameters(REPO_ROOT / f"{key}.py", value["parameters"])
+        if isinstance(value, dict) and isinstance(value.get("parameters"), dict)
+        for unusable in [
+            unusable_parameters(
+                REPO_ROOT / f"{key}.py",
+                value["parameters"],
+                research_preview=research_preview,
+            )
+        ]
+        if unusable
     }
 
     assert unreachable == {}
+
+
+def _accepted_reduction_fields() -> tuple[set[str], set[str]]:
+    """Every reduction key some family accepts, and the four the DML resolver requires.
+
+    Imported from `case_studies/utils/preview_fields.py`, the module each family resolver
+    reads its own set from, rather than restated here: the guard and the resolver share one
+    object, so the guard cannot go on accepting a name its consumer has dropped. The sets sit
+    apart from the resolvers because four of the five family modules import `torch` at module
+    scope and this job has no torch.
+    """
+    from case_studies.utils.preview_fields import (
+        DML_PREVIEW_FIELDS,
+        GBM_PREVIEW_FIELDS,
+        LATENT_PREVIEW_FIELDS,
+        LINEAR_PREVIEW_FIELDS,
+        SEQUENCE_PREVIEW_FIELDS,
+        TABM_PREVIEW_FIELDS,
+    )
+
+    return set().union(
+        DML_PREVIEW_FIELDS,
+        GBM_PREVIEW_FIELDS,
+        LATENT_PREVIEW_FIELDS,
+        LINEAR_PREVIEW_FIELDS,
+        SEQUENCE_PREVIEW_FIELDS,
+        TABM_PREVIEW_FIELDS,
+    ), set(DML_PREVIEW_FIELDS)
+
+
+def _declared_reductions(overrides: dict) -> dict[str, dict]:
+    return {
+        key: value["parameters"]["PREVIEW_REDUCTIONS"]
+        for key, value in overrides.items()
+        if isinstance(value, dict)
+        and isinstance(value.get("parameters"), dict)
+        and isinstance(value["parameters"].get("PREVIEW_REDUCTIONS"), dict)
+    }
+
+
+def test_every_declared_reduction_key_is_one_some_family_accepts(overrides: dict) -> None:
+    """A misspelled reduction key must fail here rather than as a timeout.
+
+    Each family resolver rejects a key outside its own set, but it does so inside the run,
+    after the fit has been planned. In CI that surfaces as a papermill per-cell timeout and
+    reads as flakiness - which is the confusion #942 was filed about, and it is not
+    distinguishable from contention by timing. The name is knowable without running
+    anything, so it is checked without running anything.
+    """
+    accepted, _ = _accepted_reduction_fields()
+    unknown = {
+        key: sorted(set(reductions) - accepted)
+        for key, reductions in _declared_reductions(overrides).items()
+        if set(reductions) - accepted
+    }
+
+    assert unknown == {}
+
+
+def test_a_causal_reduction_declares_all_four_fields(overrides: dict) -> None:
+    """The DML resolver requires its four fields, and a partial mapping is worse than none.
+
+    `resolve_causal_request` rejects a key outside its four and also rejects a mapping
+    missing one, because a preview that omits `max_samples` would resolve the *full*
+    population under a preview tier - a run priced as a smoke test that costs a canonical
+    one. Entries are identified by the notebook submitting a `study.causal(` request rather
+    than by their stem, so a renamed notebook stays covered.
+    """
+    _, dml_fields = _accepted_reduction_fields()
+    incomplete = {}
+    for key, reductions in _declared_reductions(overrides).items():
+        source_path = REPO_ROOT / f"{key}.py"
+        if not source_path.exists():
+            continue
+        if "study.causal(" not in source_path.read_text(encoding="utf-8"):
+            continue
+        if set(reductions) != dml_fields:
+            incomplete[key] = sorted(reductions)
+
+    assert incomplete == {}
+
+
+def test_requested_configurations_survive_the_fixture_trim(overrides: dict) -> None:
+    """A `CONFIG_NAMES` entry must name a configuration the fixture's menu still declares.
+
+    `preset_patches._trim_label_configs` rewrites the fixture's copy of every
+    `config/training/fwd_*.yaml`, keeping the first `_MAX_CONFIGS_PER_FAMILY` entries of
+    each family in `_TRIM_FAMILIES`, and both `generate_intermediates.py` and `conftest.py`
+    call it. `load_model_configs` raises on any name the resulting menu does not declare, so
+    an override naming a configuration the trim removed is a failed stage rather than a
+    narrower one.
+
+    Nothing checked this. `us_equities_panel/07_gbm` asked for `leaves_31_mse` while the trim
+    kept `default_mse` and `default_mae`, and the entry was wrong and untested at the same
+    time: `06_linear` failed ahead of it on every regeneration that reached that far, so the
+    name was never resolved.
+    """
+    from tests.preset_patches import _MAX_CONFIGS_PER_FAMILY, _TRIM_FAMILIES
+
+    def declared_after_trim(case_study: str, labels: list[str] | None) -> set[str]:
+        menus = REPO_ROOT / "case_studies" / case_study / "config" / "training"
+        names: set[str] = set()
+        for menu in sorted(menus.glob("*.yaml")):
+            if labels and menu.stem not in labels:
+                continue
+            for family, configs in (yaml.safe_load(menu.read_text()) or {}).items():
+                if not isinstance(configs, list):
+                    continue
+                keep = configs[:_MAX_CONFIGS_PER_FAMILY] if family in _TRIM_FAMILIES else configs
+                names |= set(keep)
+        return names
+
+    missing = {}
+    for key, value in overrides.items():
+        if not isinstance(value, dict):
+            continue
+        params = value.get("parameters") or {}
+        requested = params.get("CONFIG_NAMES")
+        if not requested:
+            continue
+        case_study = key.split("/")[1]
+        if not (REPO_ROOT / "case_studies" / case_study / "config" / "training").is_dir():
+            continue
+        absent = sorted(set(requested) - declared_after_trim(case_study, params.get("LABELS")))
+        if absent:
+            missing[key] = absent
+
+    assert missing == {}
+
+
+def test_resolved_registry_path_follows_the_tier_the_harness_binds(tmp_path: Path) -> None:
+    """The path a caller snapshots must be the one the run under that tier opens.
+
+    Asserted against ``Study.storage_root`` rather than against a second spelling of
+    ``.preview``, so the two cannot drift: whatever the workspace decides a preview run
+    writes under is what the harness has to hand its caller. Naming the canonical path
+    in ``test_model_registry.py`` instead is what made migrated notebooks report
+    "found no training run" while having registered normally.
+    """
+    from case_studies.research import Study
+    from tests.test_research_workspace import _seed_release
+
+    release = _seed_release(tmp_path)
+    workspace = tmp_path / "workspace"
+    study = Study.open("etfs", workspace=workspace, release_root=release)
+
+    py = _notebook(
+        tmp_path / "nb",
+        '# %%\nimport os\n\n# %% tags=["parameters"]\n'
+        'EXECUTION_TIER = "canonical"\nWORKSPACE: str = ""\n\n'
+        "# %%\nprint(EXECUTION_TIER, WORKSPACE)\n",
+    )
+    injected = research_preview_parameters(py, None, workspace)
+    assert injected["EXECUTION_TIER"] == "preview"
+
+    resolved = resolved_registry_path(py, workspace, "etfs", research_preview=True)
+    assert resolved == study.storage_root("preview") / "run_log" / "registry.db"
+
+
+def test_resolved_registry_path_stays_canonical_for_an_unmigrated_notebook(
+    tmp_path: Path,
+) -> None:
+    """A notebook that declares no tier is not moved, so neither is its registry."""
+    py = _notebook(
+        tmp_path / "nb",
+        '# %%\nimport os\n\n# %% tags=["parameters"]\nMAX_SYMBOLS = 5\n\n'
+        "# %%\nprint(MAX_SYMBOLS)\n",
+    )
+
+    assert resolved_registry_path(py, tmp_path, "etfs", research_preview=True) == (
+        tmp_path / "etfs" / "run_log" / "registry.db"
+    )
 
 
 def _notebook(tmp_path: Path, body: str) -> Path:
@@ -376,6 +594,124 @@ def _notebook(tmp_path: Path, body: str) -> Path:
     py = tmp_path / "notebook.py"
     py.write_text(body)
     return py
+
+
+def _paired_notebook(tmp_path: Path, body: str) -> Path:
+    """A `.py` and the `.ipynb` beside it, because papermill only reads the notebook.
+
+    `_notebook` writes the source alone, which is all the AST analysis needs. The
+    papermill-visibility check asks papermill itself, and papermill takes a notebook, so a test
+    for that check has to produce the pair.
+
+    Written with `nbformat` rather than by shelling out to `jupytext --set-kernel python3`, which
+    needs a registered `python3` kernelspec: that exists on a workstation and not on the CI
+    runner, where the call exits 1 and takes these three tests with it. The kernelspec is declared
+    here instead, because it is what papermill reads to choose a language translator - the only
+    thing about the notebook these tests depend on.
+    """
+    py = _notebook(tmp_path, body)
+    cells = []
+    for chunk in body.split("# %%"):
+        chunk = chunk.strip("\n")
+        if not chunk:
+            continue
+        tags = ["parameters"] if chunk.startswith(' tags=["parameters"]') else []
+        source = chunk.split("\n", 1)[1] if chunk.startswith(" ") else chunk
+        cells.append(
+            {
+                "id": f"cell{len(cells)}",
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {"tags": tags},
+                "outputs": [],
+                "source": source.splitlines(keepends=True),
+            }
+        )
+    py.with_suffix(".ipynb").write_text(
+        json.dumps(
+            {
+                "cells": cells,
+                "metadata": {
+                    "kernelspec": {
+                        "display_name": "Python 3",
+                        "language": "python",
+                        "name": "python3",
+                    },
+                    "language_info": {"name": "python"},
+                },
+                "nbformat": 4,
+                "nbformat_minor": 5,
+            }
+        )
+    )
+    return py
+
+
+_VISIBILITY_BODY = '# %% tags=["parameters"]\n{decl}\n\n# %%\nprint({name})\n'
+
+
+def test_unusable_parameters_rejects_a_union_annotated_declaration(tmp_path: Path) -> None:
+    """`X: int | None = None` is invisible to papermill, so the override never lands.
+
+    The notebook reads the name and never rebinds it, so every other test in this helper
+    passes it. What fails is earlier than any of them: papermill splits the cell's lines on
+    `=` rather than parsing them, cannot read the `|`, and injects nothing. Measured
+    2026-08-30 on `etfs/17_costs`, where `TOP_N_COMBOS: 2` had been silently discarded.
+    """
+    py = _paired_notebook(
+        tmp_path,
+        _VISIBILITY_BODY.format(decl="TOP_N_COMBOS: int | None = None", name="TOP_N_COMBOS"),
+    )
+
+    assert "papermill cannot see it" in unusable_parameters(py, ["TOP_N_COMBOS"])["TOP_N_COMBOS"]
+
+
+def test_unusable_parameters_rejects_an_equals_sign_in_a_trailing_comment(tmp_path: Path) -> None:
+    """`TOP_K = 0  # 0 = the smallest k` splits in the wrong place, and is dropped."""
+    py = _paired_notebook(
+        tmp_path,
+        _VISIBILITY_BODY.format(decl="TOP_K = 0  # 0 = the smallest feasible k", name="TOP_K"),
+    )
+
+    assert "papermill cannot see it" in unusable_parameters(py, ["TOP_K"])["TOP_K"]
+
+
+def test_unusable_parameters_accepts_the_forms_that_carry_the_same_meaning(
+    tmp_path: Path,
+) -> None:
+    """Both defects have a fix that keeps the prose: drop the union, lift the comment.
+
+    Asserted together with the two rejections above so the rule is pinned from both sides -
+    a check that only ever rejects would also pass if it rejected everything.
+    """
+    py = _paired_notebook(
+        tmp_path,
+        '# %% tags=["parameters"]\n'
+        "# None defers to the configured count; an int caps it.\n"
+        "TOP_N_COMBOS = None\n"
+        "# 0 = the smallest feasible k\n"
+        "TOP_K = 0\n"
+        "\n# %%\nprint(TOP_N_COMBOS, TOP_K)\n",
+    )
+
+    assert unusable_parameters(py, ["TOP_N_COMBOS", "TOP_K"]) == {}
+
+
+def test_unusable_parameters_asks_nothing_of_papermill_without_a_paired_notebook(
+    tmp_path: Path,
+) -> None:
+    """No `.ipynb` means the question cannot be put to papermill, so it is not answered.
+
+    Every other test in this file writes the `.py` alone. Reporting those as invisible
+    would make the check fire on the absence of a file rather than on the declaration, and
+    would fail this suite wholesale rather than the notebooks the defect is in.
+    """
+    py = _notebook(
+        tmp_path,
+        _VISIBILITY_BODY.format(decl="TOP_N_COMBOS: int | None = None", name="TOP_N_COMBOS"),
+    )
+
+    assert unusable_parameters(py, ["TOP_N_COMBOS"]) == {}
 
 
 def test_unusable_parameters_accepts_a_name_bound_in_the_parameters_cell(tmp_path: Path) -> None:
@@ -569,9 +905,11 @@ def test_unusable_parameters_does_not_take_a_function_local_for_a_read(tmp_path:
 
 
 def test_unusable_parameters_ignores_a_committed_injected_parameters_cell(tmp_path: Path) -> None:
-    """`case_studies/etfs/11a_pca` has one: a leftover from a papermill run, which
-    the next run replaces. Reading it as notebook code would report the notebook
-    overwriting exactly what papermill is about to inject."""
+    """Papermill writes such a cell into any notebook it executes, and the next run
+    replaces it, so reading it as notebook code would report the notebook overwriting
+    exactly what papermill is about to inject. `case_studies/etfs/11a_pca` and
+    `11b_ipca` carried one committed each - the last two in the repo - until their
+    migrations rewrote the parameters cell; the helper still has to ignore one."""
     py = _notebook(
         tmp_path,
         '# %% tags=["parameters"]\nUSE_CACHE = True\n\n'
@@ -594,6 +932,42 @@ def test_unusable_parameters_does_not_take_a_comprehension_target_for_a_rebind(
     )
 
     assert unusable_parameters(py, ["SYMBOLS"]) == {}
+
+
+def test_unusable_parameters_accepts_a_name_that_reaches_by_preview_translation(
+    tmp_path: Path,
+) -> None:
+    """A PREVIEW_REDUCTIONS notebook never names MAX_FOLDS; the harness folds it in.
+
+    `research_preview_parameters` pops the names in `PREVIEW_TRANSLATED_PARAMETERS` into the
+    PREVIEW_REDUCTIONS mapping, so the notebook reads the reduction and not the override name.
+    Measured on agent/us-equities-panel-notebooks: `06_linear` and `07_gbm` were reported
+    unreachable on MAX_FOLDS and MAX_SYMBOLS, both of which do reach them.
+    """
+    py = _notebook(
+        tmp_path,
+        '# %% tags=["parameters"]\nPREVIEW_REDUCTIONS = {}\n\n# %%\nprint(PREVIEW_REDUCTIONS)\n',
+    )
+    assert unusable_parameters(py, sorted(PREVIEW_TRANSLATED_PARAMETERS)) == {}
+
+
+def test_unusable_parameters_still_rejects_an_untranslated_name_on_such_a_notebook(
+    tmp_path: Path,
+) -> None:
+    """The exemption covers the translated names only, not every name on the notebook."""
+    py = _notebook(
+        tmp_path,
+        '# %% tags=["parameters"]\nPREVIEW_REDUCTIONS = {}\n\n# %%\nprint(PREVIEW_REDUCTIONS)\n',
+    )
+    assert "never reads it" in unusable_parameters(py, ["TOP_N_COMBOS"])["TOP_N_COMBOS"]
+
+
+def test_unusable_parameters_does_not_exempt_a_translated_name_without_the_mapping(
+    tmp_path: Path,
+) -> None:
+    """No PREVIEW_REDUCTIONS declared means no translation, so MAX_SYMBOLS must be read."""
+    py = _notebook(tmp_path, '# %% tags=["parameters"]\nLABELS = []\n\n# %%\nprint(LABELS)\n')
+    assert "never reads it" in unusable_parameters(py, ["MAX_SYMBOLS"])["MAX_SYMBOLS"]
 
 
 def test_unusable_parameters_rejects_a_notebook_with_no_parameters_cell(tmp_path: Path) -> None:
@@ -1049,3 +1423,195 @@ def test_notebook_worker_caps_the_same_pools(tmp_path: Path, monkeypatch) -> Non
     )
 
     assert seen == dict.fromkeys(pm_helpers.KERNEL_THREAD_CAPS, pm_helpers.KERNEL_THREAD_CAP)
+
+
+def test_injected_parameters_drops_preview_reductions_on_a_canonical_run() -> None:
+    """A canonical run must not carry a preview-only parameter.
+
+    ``tests/generate_intermediates.py`` reads the same override entries with
+    ``research_preview=False``. The DML request builder rejects a canonical request that
+    declares reductions, so injecting them there fails at request construction.
+    """
+    declared = {"PREVIEW_REDUCTIONS": {"max_samples": 5000}, "MAX_SYMBOLS": 5}
+    resolved = injected_parameters(
+        Path("case_studies/cme_futures/11_causal_dml.py"),
+        declared,
+        None,
+        research_preview=False,
+    )
+    assert resolved == {"MAX_SYMBOLS": 5}
+    assert declared["PREVIEW_REDUCTIONS"] == {"max_samples": 5000}
+
+
+def test_injected_parameters_strips_every_preview_prefixed_name_on_a_canonical_run() -> None:
+    """The strip is a prefix rule, not a list of names that has to be maintained.
+
+    `tests/generate_intermediates.py` passes `overrides["parameters"]` verbatim with
+    `research_preview=False`, so a preview-only name left in reaches a notebook whose
+    EXECUTION_TIER is still "canonical" - and the notebooks that refuse one raise on their
+    first cell. The strip named `PREVIEW_REDUCTIONS` alone while `tests/overrides.yaml` had
+    grown to fourteen `PREVIEW_` names, so thirteen were passing through.
+
+    The invented name is the point: it is the only assertion here that a named list cannot
+    satisfy, so a regression to one fails rather than passing on the four real names.
+
+    This does not claim no preview-only parameter can reach a canonical run. `MAX_SYMBOLS`
+    is preview-only for `us_equities_panel` 16-19 and carries no prefix, and the test below
+    pins that it survives because elsewhere it is a legitimate canonical parameter. That gap
+    is named in `injected_parameters`' docstring.
+    """
+    overrides = {
+        "PREVIEW_REDUCTIONS": {"max_folds": 1},
+        "PREVIEW_LABELS": ["fwd_ret_21d"],
+        "PREVIEW_MAX_PREDICTIONS": 4,
+        "PREVIEW_MAX_BASELINE_ROWS": 2,
+        "PREVIEW_SOMETHING_NOT_INVENTED_YET": 7,
+    }
+    declined = (
+        injected_parameters(
+            Path("case_studies/cme_futures/13_backtest.py"),
+            overrides,
+            None,
+            research_preview=False,
+        )
+        or {}
+    )
+    leaked = sorted(key for key in declined if key.startswith("PREVIEW_"))
+    assert not leaked, f"canonical injection carries preview-only parameters: {leaked}"
+
+
+def test_injected_parameters_keeps_everything_else_on_a_canonical_run() -> None:
+    parameters = {"MAX_SYMBOLS": 5, "TOP_K": 2}
+    assert (
+        injected_parameters(
+            Path("case_studies/cme_futures/13_backtest.py"),
+            parameters,
+            None,
+            research_preview=False,
+        )
+        == parameters
+    )
+
+
+def test_injected_parameters_keeps_preview_reductions_under_the_preview_tier(
+    tmp_path: Path,
+) -> None:
+    resolved = injected_parameters(
+        REPO_ROOT / "case_studies/cme_futures/11_causal_dml.py",
+        {"PREVIEW_REDUCTIONS": {"max_samples": 5000, "n_folds": 2}},
+        tmp_path,
+        research_preview=True,
+    )
+    assert resolved["PREVIEW_REDUCTIONS"]["max_samples"] == 5000
+    assert resolved["EXECUTION_TIER"] == "preview"
+
+
+def test_unusable_parameters_catches_a_preview_mapping_the_notebook_never_reads(
+    tmp_path: Path,
+) -> None:
+    """Declaring PREVIEW_REDUCTIONS is not on its own proof the reduction reaches anything.
+
+    The translated names are analysed through the mapping they are folded into. A notebook that
+    declares the mapping and then never reads it discards every reduction, so the preview run is a
+    canonical run wearing the preview label - which is what this helper exists to catch. Exempting
+    the translated names outright would have passed it.
+    """
+    py = _notebook(
+        tmp_path,
+        '# %% tags=["parameters"]\nPREVIEW_REDUCTIONS = {}\n\n# %%\nprint("nothing reads it")\n',
+    )
+    problems = unusable_parameters(py, sorted(PREVIEW_TRANSLATED_PARAMETERS))
+    assert set(problems) == set(PREVIEW_TRANSLATED_PARAMETERS)
+    for name, reason in problems.items():
+        assert "never reads it" in reason
+        assert "PREVIEW_REDUCTIONS" in reason, name
+
+
+def test_unusable_parameters_catches_a_preview_mapping_rebound_before_any_read(
+    tmp_path: Path,
+) -> None:
+    """A mapping rebound below the parameters cell throws the injected reductions away.
+
+    Same condition as the overwrite check on an ordinary name, reached through the translation:
+    every read below the parameters cell is on a path that rebinds PREVIEW_REDUCTIONS first, so
+    nothing the harness folded in survives to be read.
+    """
+    py = _notebook(
+        tmp_path,
+        '# %% tags=["parameters"]\nPREVIEW_REDUCTIONS = {}\n\n'
+        "# %%\nPREVIEW_REDUCTIONS = {}\nprint(PREVIEW_REDUCTIONS)\n",
+    )
+    problems = unusable_parameters(py, sorted(PREVIEW_TRANSLATED_PARAMETERS))
+    assert set(problems) == set(PREVIEW_TRANSLATED_PARAMETERS)
+    for name, reason in problems.items():
+        assert "overwrites the injected value" in reason, name
+        assert "PREVIEW_REDUCTIONS" in reason, name
+
+
+def test_unusable_parameters_catches_a_preview_mapping_rebound_above_every_reader(
+    tmp_path: Path,
+) -> None:
+    """A helper that reads the mapping does not save it when the rebind runs before every call.
+
+    The deferred-reader exemption asks whether anything can observe the injected value. Here the
+    unconditional rebind sits above the only call site, so every read the helper performs sees the
+    notebook's own mapping and none see the reductions the harness folded in. Reached through the
+    translation, so it also pins that the redirect keeps the reader analysis rather than bypassing
+    it.
+    """
+    py = _notebook(
+        tmp_path,
+        '# %% tags=["parameters"]\nPREVIEW_REDUCTIONS = {}\n\n'
+        "# %%\ndef fit():\n    return dict(PREVIEW_REDUCTIONS)\n\n"
+        "# %%\nPREVIEW_REDUCTIONS = {}\nprint(fit())\n",
+    )
+    problems = unusable_parameters(py, sorted(PREVIEW_TRANSLATED_PARAMETERS))
+    assert set(problems) == set(PREVIEW_TRANSLATED_PARAMETERS)
+    for name, reason in problems.items():
+        assert "PREVIEW_REDUCTIONS" in reason, name
+
+
+def test_a_complete_causal_mapping_is_not_given_a_fold_key_its_resolver_rejects(
+    tmp_path: Path,
+) -> None:
+    """`MAX_FOLDS` must not reach a mapping that already states its fold count as `n_folds`.
+
+    `_QUICK_PARAMS` sets `MAX_FOLDS` for every model notebook, and the translation used to
+    add `folds` to any mapping that lacked that exact key. A causal override declares the four
+    fields `resolve_causal_request` requires and none of them is named `folds`, so the default
+    fired and the request was refused with "unsupported DML preview reductions: ['folds']"
+    before any fit. The consumer's own field set is the assertion, so this stays true if that
+    set changes.
+    """
+    from case_studies.utils.causal import _DML_PREVIEW_FIELDS
+
+    declared = {
+        "PREVIEW_REDUCTIONS": {
+            "max_samples": 5000,
+            "max_symbols": 5,
+            "n_folds": 2,
+            "n_placebo": 25,
+        },
+        "MAX_FOLDS": 2,
+        "MAX_SYMBOLS": 5,
+    }
+    resolved = injected_parameters(
+        REPO_ROOT / "case_studies/cme_futures/11_causal_dml.py",
+        declared,
+        tmp_path,
+        research_preview=True,
+    )
+    reductions = resolved["PREVIEW_REDUCTIONS"]
+    assert set(reductions) == _DML_PREVIEW_FIELDS
+    assert reductions["n_folds"] == 2
+
+
+def test_a_model_mapping_without_a_fold_count_still_gets_one(tmp_path: Path) -> None:
+    """The translation still applies where the notebook states no fold count of its own."""
+    resolved = injected_parameters(
+        REPO_ROOT / "case_studies/cme_futures/10a_pca.py",
+        {"PREVIEW_REDUCTIONS": {"max_samples": 5000}, "MAX_FOLDS": 2},
+        tmp_path,
+        research_preview=True,
+    )
+    assert resolved["PREVIEW_REDUCTIONS"]["folds"] == [0, 1]

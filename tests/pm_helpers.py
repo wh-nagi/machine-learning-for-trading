@@ -23,6 +23,24 @@ overrides.yaml schema (per-notebook, all optional):
         way the test runs at production scale while this file states a reduction.
         ``unusable_parameters`` is the detector and tests/test_pm_helpers.py
         fails the build on what it finds, with no allowlist.
+    research_preview: bool — default true. Chooses the TIER only; the isolated
+        workspace is injected either way, and there is deliberately no way to ask the
+        harness for the in-place production path. The harness runs a notebook that
+        declares both EXECUTION_TIER and WORKSPACE at the preview tier in a fresh
+        workspace,
+        because that pair means "this notebook can run self-contained at reduced
+        scale". That is exact for a notebook that WRITES at the tier it is given: a
+        model notebook fits something small and registers it into the workspace it
+        was handed, so it needs nothing else to be there. It is wrong for a notebook
+        that only READS at that tier - it is self-contained only if its producer ran
+        into the same workspace, and the per-notebook suite runs each notebook alone,
+        so it filters for preview rows nobody wrote and stops at its first cell. Set
+        this false for a reader, and it runs at its declared tier, in an isolated
+        workspace, against the canonical rows the fixture seeds - the third combination
+        `open_study`'s docstring names, "the same computation at full scale writing to an
+        isolated registry ... without being able to damage" the published one. Real
+        coverage rather than a skip. Do NOT instead seed preview-tier rows: that
+        fabricates predictions at a tier nothing fitted.
     skip: bool — hard skip in uv-native run (Docker tests ignore)
     skip_reason: str
     requires_import: str | list[str]
@@ -51,18 +69,31 @@ overrides.yaml schema (per-notebook, all optional):
 import ast
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import yaml
 
 REPO_ROOT = Path(__file__).parent.parent
 OVERRIDES_PATH = REPO_ROOT / "tests" / "overrides.yaml"
+
+STAGE_RE = re.compile(r"^(\d{2})([a-z]?)_")
+
+
+def stage_sort_key(path: Path) -> tuple[str, int, str]:
+    """Order lettered producer notebooks before the bare aggregate for a stage number."""
+    match = STAGE_RE.match(path.name)
+    if match is None:
+        return (path.name, 1, path.name)
+    number, letter = match.group(1), match.group(2)
+    return (number, 1 if not letter else 0, path.name)
+
 
 # Thread-pool caps for the papermill kernel.
 #
@@ -553,7 +584,69 @@ def _deferred_readers(tree: ast.Module) -> tuple[dict[str, set[str]], set[str]]:
     return readers, opaque
 
 
-def unusable_parameters(py_path: Path, names: Iterable[str]) -> dict[str, str]:
+def _papermill_visible(py_path: Path) -> set[str] | None:
+    """The parameter names papermill itself can find, or None when it cannot be asked.
+
+    Papermill does not read the parameters cell with `ast`. It scans the cell line by line
+    and splits each on `=`, so two declarations that are valid Python and obviously
+    parameters to a reader are invisible to it:
+
+    - a PEP 604 union annotation, `TOP_N_COMBOS: int | None = None`, whose `|` it cannot
+      parse (`Optional[int]` and a bare `int` are both fine);
+    - a trailing comment containing `=`, as in `TOP_K = 0  # 0 = smallest feasible k`,
+      which it splits in the wrong place.
+
+    Either one drops the override silently: papermill logs "Passed unknown parameter" and
+    the notebook runs its own default, so a CI entry that says it reduces a workload does
+    not, and the job goes on passing while measuring something else. Measured 2026-08-30:
+    ten notebooks across six case studies were in that state.
+
+    Asked of papermill rather than restated here, so this cannot go on enforcing a rule
+    papermill has stopped applying - the same reason `test_every_declared_parameter_
+    reaches_its_notebook` drives this helper instead of copying its predicate.
+    """
+    ipynb = py_path.with_suffix(".ipynb")
+    if not ipynb.exists():
+        return None
+    # Deliberately not guarded with a try/import/return-None. papermill is a declared dependency
+    # (`pyproject.toml`), and every job that runs this installs it. Swallowing its absence would
+    # turn the corpus sweep into a check that passes because it asked nobody, which is the exact
+    # shape of failure this helper exists to catch - `test-unit` did not install papermill when
+    # this was written, and a tolerant import would have hidden that instead of surfacing it.
+    from papermill import inspect_notebook
+
+    try:
+        return set(inspect_notebook(str(ipynb)))
+    except Exception:
+        # An unreadable or unpaired notebook is a different failure with its own guard.
+        return None
+
+
+def parameters_cell_names(py_path: Path) -> set[str]:
+    """Every name a notebook's `parameters`-tagged cells bind at module level.
+
+    A notebook may carry more than one such cell - `15_model_analysis` has three - so this unions
+    them. `unusable_parameters` reads only the last, because papermill injects after the last and
+    that is the span its overwrite analysis is about; a caller asking what the notebook declares
+    wants all of them.
+    """
+    source = py_path.read_text()
+    tree = ast.parse(source, filename=str(py_path))
+    spans = [
+        (lo, hi)
+        for header, lo, hi in _percent_cell_bounds(source)
+        if PARAMETERS_CELL_MARKER in header
+    ]
+    return {
+        name
+        for name, line in _top_level_bindings(tree)
+        if any(lo <= line <= hi for lo, hi in spans)
+    }
+
+
+def unusable_parameters(
+    py_path: Path, names: Iterable[str], *, research_preview: bool = True
+) -> dict[str, str]:
     """Map each declared parameter name that cannot reach the notebook to why.
 
     An empty dict means every name is injectable. Everything turns on where
@@ -586,6 +679,13 @@ def unusable_parameters(py_path: Path, names: Iterable[str]) -> dict[str, str]:
     Args:
         py_path: the notebook's `.py` source
         names: the parameter names `overrides.yaml` declares for it
+        research_preview: which of the two callers this entry is being judged for.
+            `injected_parameters` folds the translated names into PREVIEW_REDUCTIONS
+            only under the preview tier; on the canonical path it passes them through
+            by name, so a notebook that declares the mapping and not the names does
+            not receive them. Defaulting to True keeps the smoke path's answer, and
+            the fixture generator's path is the one that has to be asked for
+            explicitly - see `test_every_declared_parameter_reaches_both_callers`.
 
     Returns:
         {name: reason} for the names that cannot take effect.
@@ -617,6 +717,31 @@ def unusable_parameters(py_path: Path, names: Iterable[str]) -> dict[str, str]:
     def live(line: int) -> bool:
         return line > injected_at and not any(lo <= line <= hi for lo, hi in stale)
 
+    # A notebook declaring PREVIEW_REDUCTIONS receives these by translation rather than by name -
+    # `research_preview_parameters` folds them in - so the source never mentions them and the
+    # "never reads it" test below would report every one of them unreachable. The question is not
+    # dropped, it is redirected: the value lands in PREVIEW_REDUCTIONS, so that is the name whose
+    # reachability decides whether the override reaches anything. Exempting the name outright would
+    # pass a notebook that declares the mapping and never reads it, which is the exact condition
+    # this helper exists to catch.
+    cell_declares = (
+        {name for name, line in _top_level_bindings(tree) if tagged[-1][1] <= line <= injected_at}
+        if tagged
+        else set()
+    )
+    # The translation is a property of the caller, not of the notebook. `injected_parameters`
+    # applies `_collect_preview_reductions` only under `research_preview=True`; on the canonical
+    # path it strips the `PREVIEW_`-prefixed names and passes everything else through by name.
+    # Exempting these unconditionally is what let `us_equities_panel` 06 and 07 declare
+    # MAX_FOLDS and MAX_SYMBOLS that `tests/generate_intermediates.py` - which passes
+    # `research_preview=False` - could never inject: papermill logged "Passed unknown parameter"
+    # for both and the fixture ran unreduced.
+    translated = (
+        set(PREVIEW_TRANSLATED_PARAMETERS)
+        if research_preview and TRANSLATION_TARGET in cell_declares
+        else set()
+    )
+
     events: list[tuple[str, str, int]] = []
     _module_level_events(tree, events)
     branch = _branch_paths(tree)
@@ -636,19 +761,35 @@ def unusable_parameters(py_path: Path, names: Iterable[str]) -> dict[str, str]:
         here, there = branch.get(bind_line, ()), branch.get(read_line, ())
         return here == there[: len(here)]
 
+    visible = _papermill_visible(py_path)
+
     problems = {}
     for name in names:
+        # A translated name is analysed through the mapping it is folded into, and any problem is
+        # reported against that mapping, because that is where the override actually has to land.
+        analysed = TRANSLATION_TARGET if name in translated else name
+        via = f" (it reaches the notebook as {TRANSLATION_TARGET})" if analysed != name else ""
+        if visible is not None and analysed not in visible:
+            # Asked first, because it decides whether the value is injected at all. The reads and
+            # rebinds below all ask what happens to an injected value, and none of them is
+            # meaningful for a name papermill never injects.
+            problems[name] = (
+                f"papermill cannot see it in {where}, so the value is never injected and the "
+                f"notebook keeps its own default; check the declaration for a `|` union "
+                f"annotation or an `=` inside a trailing comment{via}"
+            )
+            continue
         reads = [
             (seq, line)
             for seq, (kind, bound, line) in enumerate(events)
-            if kind == "read" and bound == name and live(line)
+            if kind == "read" and bound == analysed and live(line)
         ]
         binds = [
             (seq, line)
             for seq, (kind, bound, line) in enumerate(events)
-            if kind == "bind" and bound == name and live(line)
+            if kind == "bind" and bound == analysed and live(line)
         ]
-        if name in opaque or name in readers:
+        if analysed in opaque or analysed in readers:
             # A function that reads the name is normally enough to leave the
             # entry alone: it may be called before any binding below, and the
             # tree does not say which happens first. The exception is a binding
@@ -661,11 +802,11 @@ def unusable_parameters(py_path: Path, names: Iterable[str]) -> dict[str, str]:
             reaching = [
                 seq
                 for seq, (kind, bound, line) in enumerate(events)
-                if kind == "call" and bound in readers.get(name, set()) and live(line)
+                if kind == "call" and bound in readers.get(analysed, set()) and live(line)
             ]
             first = min((seq for seq, _ in blocking), default=None)
             reachable = (
-                name in opaque
+                analysed in opaque
                 or first is None
                 or any(seq < first for seq in [*(r for r, _ in reads), *reaching])
             )
@@ -674,15 +815,15 @@ def unusable_parameters(py_path: Path, names: Iterable[str]) -> dict[str, str]:
             problems[name] = (
                 f"the binding on line {min(line for _, line in blocking)} overwrites the "
                 f"injected value before anything below {where} can call a function that "
-                "reads it"
+                f"reads it{via}"
             )
         elif not reads:
-            problems[name] = f"the notebook never reads it below {where}"
+            problems[name] = f"the notebook never reads it below {where}{via}"
         elif all(any(reaches(b, r) for b in binds) for r in reads):
             problems[name] = (
                 f"the binding on line {min(line for _, line in binds)} overwrites the "
                 f"injected value: every read below {where} is on a path that rebinds "
-                "the name first"
+                f"the name first{via}"
             )
     return problems
 
@@ -853,6 +994,30 @@ def register_kernelspec(python_exe: str, launcher: Path | None = None) -> tuple[
     return kernel_name, root
 
 
+def _declares_tier_and_workspace(py_path: Path) -> bool:
+    """Whether a notebook's parameters cell declares both EXECUTION_TIER and WORKSPACE.
+
+    The pair is what makes a notebook addressable by tier and workspace at all. It is read
+    here rather than inside `research_preview_parameters` because both the preview path and
+    the canonical-with-a-workspace path need the same answer.
+    """
+    source = py_path.read_text(encoding="utf-8")
+    bounds = next(
+        (
+            (first_line, last_line)
+            for header, first_line, last_line in _percent_cell_bounds(source)
+            if PARAMETERS_CELL_MARKER in header
+        ),
+        None,
+    )
+    if bounds is None:
+        return False
+    first_line, last_line = bounds
+    tree = ast.parse(source, filename=str(py_path))
+    declared = {name for name, line in _top_level_bindings(tree) if first_line <= line <= last_line}
+    return {"EXECUTION_TIER", "WORKSPACE"} <= declared
+
+
 def research_preview_parameters(
     py_path: Path,
     parameters: dict | None,
@@ -879,7 +1044,190 @@ def research_preview_parameters(
     if {"EXECUTION_TIER", "WORKSPACE"} <= declared:
         resolved["EXECUTION_TIER"] = "preview"
         resolved["WORKSPACE"] = str(output_dir.resolve())
+        if "SUPERSEDES_POPULATION" in declared:
+            # A preview population is discarded with its workspace, so it extends no lineage
+            # and `run_model_population` refuses a non-None `supersedes` outright. The
+            # notebooks now default this to empty, so this clears an explicitly passed value
+            # rather than a default - a caller who names a canonical predecessor and asks for
+            # a preview is asking for two incompatible things, and the tier wins.
+            # Forced for the same reason the tier and the workspace are: the preview routing
+            # is this function's job, and nine notebooks each deciding it is nine chances to
+            # decide it differently.
+            resolved["SUPERSEDES_POPULATION"] = ""
+    if "PREVIEW_REDUCTIONS" in declared:
+        resolved = _collect_preview_reductions(resolved)
     return resolved
+
+
+def resolved_registry_path(
+    py_path: Path,
+    output_dir: Path,
+    case_study: str,
+    *,
+    research_preview: bool,
+) -> Path:
+    """The registry the run this harness is about to launch will actually write to.
+
+    The tier decides the directory, and the tier is decided here rather than by the
+    caller: :func:`research_preview_parameters` binds ``EXECUTION_TIER="preview"`` for a
+    migrated Study notebook, and ``Study.activate`` then relocates the output root to
+    ``<workspace>/.preview``. A caller that names the canonical path itself snapshots and
+    queries a database the run never opens, so every registry assertion reads an absent
+    file as "the notebook registered nothing" - a failure that reads as a broken notebook
+    and is a wrong path. Resolving it through the same call that binds the tier is what
+    keeps the two from drifting apart again.
+    """
+    root = output_dir
+    if research_preview:
+        resolved = research_preview_parameters(py_path, None, output_dir)
+        if resolved.get("EXECUTION_TIER") == "preview":
+            root = output_dir / ".preview"
+    return root / case_study / "run_log" / "registry.db"
+
+
+# The override names `_collect_preview_reductions` folds into PREVIEW_REDUCTIONS, mapped to the
+# reduction key each becomes. `unusable_parameters` reads the same table, so a name that reaches a
+# notebook by translation is not reported unreachable for not appearing in its source.
+#
+# It reaches it **on the preview path only**. `injected_parameters` calls the fold under
+# `research_preview=True` and passes the names through untranslated otherwise, and
+# `tests/generate_intermediates.py:315` is the caller that passes False. An earlier version of
+# this note recorded that `06_linear` and `07_gbm` "do reach them", which was true of the smoke
+# path and false of the fixture path; both notebooks ran unreduced on 2026-09-06 with papermill
+# logging "Passed unknown parameter" for each, and `us_equities_panel/06_linear` then failed on
+# fold 0, whose 223-session training window is shorter than the 756-session burn-in
+# `model_based.regime` declares. So `unusable_parameters` takes the path as an argument.
+TRANSLATION_TARGET = "PREVIEW_REDUCTIONS"
+
+# The third element is every reduction name that states the same quantity. A translated default
+# is dropped when the notebook's own mapping already carries one of them, because two consumers
+# read this mapping and they do not spell the fold count the same way: the model families take
+# `folds`, an explicit list, and the DML resolver takes `n_folds`, a count, and rejects any key
+# outside its four (`case_studies/utils/causal.py:_DML_PREVIEW_FIELDS`). Without the aliases the
+# `MAX_FOLDS` in `_QUICK_PARAMS` reached a complete causal mapping as a fifth key and
+# `resolve_causal_request` refused the request before any fit.
+PREVIEW_TRANSLATED_PARAMETERS: dict[str, tuple[str, Callable[[Any], Any], tuple[str, ...]]] = {
+    "MAX_FOLDS": ("folds", lambda value: list(range(int(value))), ("folds", "n_folds")),
+    "MAX_SYMBOLS": ("max_symbols", int, ("max_symbols",)),
+    "TRAIN_SAMPLE_FRAC": ("train_sample_frac", float, ("train_sample_frac",)),
+}
+
+
+def _collect_preview_reductions(parameters: dict) -> dict:
+    """Fold the per-notebook reduction overrides into the single parameter that carries them.
+
+    A model notebook takes its reductions as one ``PREVIEW_REDUCTIONS`` mapping, because a
+    preview request has to declare every reduction it applies for the recorded identity to
+    describe what was actually fitted. ``overrides.yaml`` still states them one per line, the way
+    it does for every other notebook, so the translation happens here rather than in nine entries
+    that would then have to be kept agreeing with each other.
+    """
+    resolved = dict(parameters)
+    reductions = dict(resolved.get("PREVIEW_REDUCTIONS") or {})
+    for name, (key, cast, aliases) in PREVIEW_TRANSLATED_PARAMETERS.items():
+        value = resolved.pop(name, None)
+        if value is None or any(alias in reductions for alias in aliases):
+            continue
+        reductions[key] = cast(value)
+    # A preview run that reduces nothing is a canonical run wearing the wrong tier, and the
+    # request builder rejects it. Reducing the universe is the reduction that always applies.
+    if not reductions:
+        reductions["max_symbols"] = 5
+    resolved["PREVIEW_REDUCTIONS"] = reductions
+    return resolved
+
+
+def injected_parameters(
+    py_path: Path,
+    parameters: dict | None,
+    output_dir: Path | None,
+    *,
+    research_preview: bool,
+) -> dict | None:
+    """Return what Papermill should inject, given the tier this run declares.
+
+    A ``PREVIEW_*`` parameter only means anything under the preview tier, and the notebooks
+    reject one outright on a canonical run. An override file declares it once and both paths
+    read that file: ``tests/generate_intermediates.py`` passes the same entry with
+    ``research_preview=False``, so leaving it in fails at request construction instead of
+    reducing anything.
+
+    Every ``PREVIEW_``-prefixed key is stripped rather than a named list of them. The list
+    form named ``PREVIEW_REDUCTIONS`` alone while ``tests/overrides.yaml`` had grown to
+    fourteen distinct ``PREVIEW_`` names, so thirteen were reaching the canonical path
+    already - ``PREVIEW_LABELS``, ``PREVIEW_MAX_ALLOCATORS``, ``PREVIEW_MAX_BASELINE_ROWS``,
+    ``PREVIEW_MAX_COST_VALUES``, ``PREVIEW_MAX_DIAGNOSTICS``, ``PREVIEW_MAX_PREDICTIONS``,
+    ``PREVIEW_MAX_RISK_CONTROLS``, ``PREVIEW_MAX_SAMPLES``, ``PREVIEW_MAX_SOURCE_ROWS``,
+    ``PREVIEW_N_EPOCHS``, ``PREVIEW_N_FACTORS``, ``PREVIEW_N_FOLDS`` and
+    ``PREVIEW_N_PLACEBO``. A named list is stale as soon as anyone adds a parameter without
+    editing it, and nobody had for thirteen of them.
+
+    It was latent rather than live because a leaked parameter only matters to a notebook that
+    refuses one: ``cme_futures`` 13 through 17 raise "canonical execution cannot declare
+    preview reductions", which is what makes the gap reachable, and they sit above
+    ``generate_intermediates.py``'s default ``--through-stage 8``. A higher stage bound, or
+    the same guard added to an earlier notebook, reaches it.
+
+    **The prefix narrows the gap; it does not close it.** Preview-only-ness is a property of
+    the notebook, not of the name. ``MAX_SYMBOLS`` carries no prefix and is a preview-only
+    reduction for ``us_equities_panel`` 16 through 19, whose canonical branch refuses it
+    (``16_backtest.py:99``) while ``tests/overrides.yaml`` declares it for all four - so a
+    canonical run of those still fails on its first cell. It cannot be added to the strip
+    either: elsewhere it is a legitimate canonical parameter, which
+    ``test_injected_parameters_keeps_everything_else_on_a_canonical_run`` pins. Deciding this
+    properly means reading which names a notebook's own canonical branch refuses, or marking
+    the entry in the override file; both are design changes that belong with whoever owns the
+    preview contract. What is here covers every ``PREVIEW_``-prefixed name and nothing else.
+    """
+    if research_preview:
+        return research_preview_parameters(py_path, parameters, output_dir)
+    resolved = dict(parameters or {})
+    for name in [key for key in resolved if key.startswith("PREVIEW_")]:
+        resolved.pop(name)
+    # Declining the preview tier must NOT decline the isolated workspace. They are two
+    # decisions and this flag used to collapse them: false left WORKSPACE at the
+    # notebook's declared "", `open_study` took the `workspace=None` branch
+    # (workspace.py:374) into `Study.regenerate`, and that is the in-place production
+    # path - which in a maintainer worktree, where case_studies/*/run_log links to the
+    # shared artifacts, writes to the real registry. It also calls activate(), resetting
+    # ML4T_OUTPUT_DIR for everything after it. Measured 2026-08-24: a test run of
+    # fx_pairs 13-16 wrote 13 official populations, 1 candidate set and 269 backtest runs
+    # into the published fx_pairs registry, and froze one population incomplete.
+    #
+    # Canonical-tier-with-a-workspace is the third combination `open_study`'s own
+    # docstring names: the same computation at full scale against an isolated registry,
+    # unable to damage the published one. That is what a reader under test needs, and the
+    # harness must never be able to reach the in-place path.
+    if output_dir is not None and _declares_tier_and_workspace(py_path):
+        resolved["WORKSPACE"] = str(output_dir.resolve())
+    return resolved or None
+
+
+def _progress_log_path(py_path: Path) -> Path:
+    """Where this run writes its cell-level progress.
+
+    Keyed on the notebook's path relative to the repo root, plus the pid. The stem
+    alone is not unique: `04_model_based_features`, `12_backtest` and `05_evaluation`
+    are shared by all nine case studies and by chapter notebooks, and the file is
+    opened with mode "w" - so one pane truncated another's. Observed on 2026-08-05
+    while `cs-sp500_options` was executing its own `04_model_based_features`: the log
+    held `params={'GARCH_MIN_OBS': 50, 'MAX_SYMBOLS': 5, ...}`, which is the etfs
+    entry from `tests/overrides.yaml`, written by a different pane.
+
+    That matters because `work/2026-08-05-ci-green/PROTOCOL.md` names this file as the
+    way to see which cell a hanging notebook is on, "which is faster than waiting for
+    the traceback". Reporting another job's notebook is worse than reporting nothing:
+    it is wrong and plausible at the same time.
+
+    The pid separates two panes running the same notebook, which the path alone does
+    not. `ML4T_OUTPUT_DIR` would separate them too, but it is not always set and the
+    pid always is.
+    """
+    try:
+        slug = py_path.resolve().relative_to(REPO_ROOT).with_suffix("").as_posix()
+    except ValueError:
+        slug = py_path.stem
+    return Path(f"/tmp/ml4t-pm-{slug.replace('/', '_')}.{os.getpid()}.log")
 
 
 def run_notebook(
@@ -926,8 +1274,9 @@ def run_notebook(
 
     start = time.time()
     nb_name = py_path.stem
-    if research_preview:
-        parameters = research_preview_parameters(py_path, parameters, output_dir)
+    parameters = injected_parameters(
+        py_path, parameters, output_dir, research_preview=research_preview
+    )
 
     def _log(msg: str) -> None:
         if log_path:
@@ -1014,10 +1363,10 @@ def run_notebook(
     for key in remove_vars:
         saved_env[key] = os.environ.pop(key, None)
 
-    # Cell-level progress — always log to /tmp/ml4t-pm-{name}.log for visibility.
-    # Since request_save_on_cell_execute=True, the executed notebook is updated
-    # after each cell. Monitor it with: watch -n5 'python -c "import json; ..."'
-    progress_log = Path(f"/tmp/ml4t-pm-{nb_name}.log")
+    # Cell-level progress — always logged for visibility. Since
+    # request_save_on_cell_execute=True, the executed notebook is updated after each
+    # cell. Monitor it with: watch -n5 'python -c "import json; ..."'
+    progress_log = _progress_log_path(py_path)
     n_cells = 0
     try:
         with open(progress_log, "w") as pf:

@@ -444,21 +444,59 @@ def test_mvo_falls_back_to_equal_weight_on_short_history() -> None:
         assert abs(w - 0.25) < 1e-9
 
 
-def test_mvo_returns_empty_frame_when_fewer_than_3_assets_selected() -> None:
-    """top_k=2 → <3 assets → MVO skips the date and emits an empty frame."""
+def _two_asset_panel(n_dates: int = 200) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """A two-name cross-section with a full return window, rebalancing on every date."""
     rng = np.random.default_rng(0)
-    ts = pl.date_range(pl.date(2023, 1, 1), pl.date(2023, 12, 31), "1d", eager=True)[:200]
+    ts = pl.date_range(pl.date(2023, 1, 1), pl.date(2023, 12, 31), "1d", eager=True)[:n_dates]
     price_rows = []
     for t in ts:
         for s in ["A", "B"]:
             price_rows.append({"timestamp": t, "symbol": s, "close": 100.0 + float(rng.normal())})
     prices = pl.DataFrame(price_rows)
+    rebalances = ts[-20:]
     predictions = pl.DataFrame(
-        {"timestamp": [ts[-1]] * 2, "symbol": ["A", "B"], "y_score": [0.0, 1.0]}
+        {
+            "timestamp": [t for t in rebalances for _ in range(2)],
+            "symbol": ["A", "B"] * len(rebalances),
+            "y_score": [float(rng.normal()) for _ in range(2 * len(rebalances))],
+        }
     )
-    out = compute_mvo_weights(predictions, prices, top_k=2)
-    assert out.height == 0
+    return predictions, prices
+
+
+def test_mvo_allocates_a_two_asset_cross_section() -> None:
+    """`top_k=2` is a solvable mean-variance problem, not a rebalance to skip.
+
+    Ledoit-Wolf shrinks a 2x2 covariance and the SLSQP solve is well posed on two bounded
+    weights that sum to one. The allocator used to require three names and `continue` past
+    every date with fewer, which for a long-only `top_k=2` sweep meant every date: the
+    function returned an empty frame, the engine opened no position, and the run registered
+    as a Sharpe of 0.0 over 2,063 periods (ml4t/agent-workspace#1004).
+    """
+    predictions, prices = _two_asset_panel()
+    out = compute_mvo_weights(predictions, prices, top_k=2, lookback=63)
+
     assert set(out.columns) == {"timestamp", "symbol", "weight"}
+    rebalances = predictions["timestamp"].unique()
+    assert out["timestamp"].n_unique() == rebalances.len(), (
+        "every rebalance must carry a target weight; a skipped one is an unopened position"
+    )
+    _assert_long_only_sums_to_1(out)
+    _assert_non_negative(out)
+
+
+def test_mvo_emits_the_one_feasible_weight_for_a_single_name() -> None:
+    """A one-name selection has nothing to optimize but still has a position to hold."""
+    rng = np.random.default_rng(1)
+    ts = pl.date_range(pl.date(2023, 1, 1), pl.date(2023, 12, 31), "1d", eager=True)[:200]
+    price_rows = [{"timestamp": t, "symbol": "A", "close": 100.0 + float(rng.normal())} for t in ts]
+    prices = pl.DataFrame(price_rows)
+    predictions = pl.DataFrame({"timestamp": [ts[-1]], "symbol": ["A"], "y_score": [1.0]})
+
+    out = compute_mvo_weights(predictions, prices, top_k=2, lookback=63)
+
+    assert out.height == 1
+    assert abs(out["weight"][0] - 1.0) < 1e-9
 
 
 # -----------------------------------------------------------------------------
@@ -503,3 +541,43 @@ def test_long_short_top_k_is_capped_to_disjoint_sides() -> None:
     assert weights.filter(pl.col("weight") > 0).height == 9
     assert weights.filter(pl.col("weight") < 0).height == 9
     assert weights.filter(pl.col("symbol") == "S09").is_empty()
+
+
+def test_a_cap_redistributes_in_equal_shares_and_drops_no_name() -> None:
+    """``_cap_weights`` bumps every uncapped name by the same amount, not proportionally.
+
+    Both halves of this were documented wrongly and the wrong version reached prose in
+    two case-study notebooks before anyone read the loop. The docstring said
+    "redistribute excess proportionally"; the code computes ``excess / n_free`` and adds
+    that one bump to every name still under the cap. And a cap was described as changing
+    which names are held, when it filters no row at all: what a binding cap moves is the
+    relative exposure across an unchanged holding set.
+
+    The fixture is built so the two rules disagree visibly. The three uncapped names
+    carry 0.18, 0.08 and 0.04, so an equal share gives each +0.10 while a proportional
+    share would give +0.18, +0.08 and +0.04. A test with equal starting weights would
+    pass under either rule and pin nothing.
+    """
+    from case_studies.utils.allocation import _cap_weights
+
+    df = pl.DataFrame(
+        {
+            "timestamp": ["2016-01-31"] * 4,
+            "symbol": ["OVER", "BIG", "MID", "SMALL"],
+            "weight": [0.70, 0.18, 0.08, 0.04],
+        }
+    )
+    out = _cap_weights(df, max_weight=0.40)
+
+    assert out.height == df.height, "a cap must drop no name"
+    assert sorted(out["symbol"]) == sorted(df["symbol"]), "the holding set must not change"
+
+    before = dict(zip(df["symbol"], df["weight"], strict=True))
+    after = dict(zip(out["symbol"], out["weight"], strict=True))
+
+    assert after["OVER"] == pytest.approx(0.40), "the over-cap name is clipped to the cap"
+    bumps = [after[s] - before[s] for s in ("BIG", "MID", "SMALL")]
+    assert bumps == pytest.approx([0.10, 0.10, 0.10]), (
+        "each uncapped name takes an equal share of the 0.30 excess, not a proportional one"
+    )
+    assert sum(after.values()) == pytest.approx(sum(before.values())), "the cap conserves gross"

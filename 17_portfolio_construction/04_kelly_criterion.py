@@ -14,23 +14,40 @@
 # ---
 
 # %% [markdown]
-# # The Kelly Criterion for Position Sizing
+# # How much to bet, and why the answer is unusable as given
 #
 # **Docker image**: `ml4t`
 #
-# This notebook demonstrates the Kelly criterion for optimal position sizing, from
-# binary outcomes through continuous returns to multi-asset portfolios. It shows
-# why full Kelly is impractical and how fractional Kelly provides a safer alternative.
+# ## Purpose
+# The previous notebooks ask which assets to hold. This one asks how much of the account to put at
+# risk, which is a separate question with a clean answer: the fraction that maximizes the expected
+# logarithm of terminal wealth. Kelly derived it for a coin toss with known odds, and it extends to
+# continuous returns and to portfolios.
 #
-# **Learning Objectives**:
-# - Derive the Kelly formula for binary bets: $f^* = \text{edge}/\text{odds}$
-# - Extend Kelly to continuous returns: $f^* \approx \mu/\sigma^2$
-# - Apply Kelly to multi-asset portfolios via the precision matrix
-# - Understand why fractional Kelly (25-50%) is practical in production
+# The derivation is exact and the answer, applied to estimated market inputs, is unusable as it
+# comes out. Following it through from the coin toss to a multi-asset portfolio shows why, and the
+# reason is not that the formula is wrong: it optimizes growth and has no term for ruin, no notion
+# of a borrowing limit, and it scales directly with an expected-return estimate that nobody can
+# make accurately.
 #
-# **Book Reference**: Chapter 17, §17.4 (Baseline Allocators)
+# ## Learning objectives
 #
-# **Prerequisites**: `02_mean_variance_optimization`, basic probability theory
+# - Derive the optimal bet fraction for a binary wager, and show by simulation what betting more or
+#   less than it does to the distribution of outcomes.
+# - Extend the result to continuous returns, and say which approximation is being made and when it
+#   holds.
+# - Compute the multi-asset solution, read the leverage it implies, and work out what adverse move
+#   would end the account at that leverage.
+# - Recompute the same fraction on rolling windows and judge whether an estimate that unstable can
+#   be acted on.
+#
+# ## Book reference
+# Chapter 17, Section 17.4 (baseline allocators).
+#
+# ## Prerequisites
+#
+# - `02_mean_variance_optimization`, for covariance estimation and its instability.
+# - Basic probability: expectation, variance, and the log of a product.
 
 # %% [markdown]
 # ## Imports & Settings
@@ -46,7 +63,6 @@ import polars as pl
 import sympy
 
 # Portfolio analysis
-from IPython.display import Markdown, display
 from ml4t.diagnostic.evaluation import PortfolioAnalysis
 from plotly.subplots import make_subplots
 from scipy.optimize import minimize_scalar
@@ -142,7 +158,7 @@ def compute_kelly_fraction(win_prob: float, odds: float = 1.0) -> float:
 
 
 # %% [markdown]
-# #### Growth Function for a Chosen Bet Fraction
+# The expected growth rate at one bet size: what the wager compounds at per bet in the long run.
 
 
 # %%
@@ -238,7 +254,8 @@ def simulate_wealth_paths(
 
 
 # %% [markdown]
-# #### Percentile-Band Plot Helper
+# Each simulation is a thousand independent wealth paths, so what is plotted is their spread:
+# the median path and the bands containing the middle half and the middle 90% of outcomes.
 
 
 # %%
@@ -373,7 +390,7 @@ for mult in [0.5, 1.0, 1.5, 2.0]:
     )
 
 fig.update_layout(
-    title=f"Full Kelly centers terminal log wealth furthest right after {n_trials} bets",
+    title="Full Kelly maximizes the centre and widens the spread",
     xaxis_title="Log(Wealth)",
     yaxis_title="Probability",
     height=450,
@@ -457,7 +474,8 @@ def kelly_fraction_continuous(
 
 
 # %% [markdown]
-# #### Empirical Growth Objective
+# The growth rate to maximize, evaluated on the realized return series rather than on an
+# assumed distribution - so no normality approximation enters this version.
 
 
 # %%
@@ -471,7 +489,8 @@ def empirical_growth_rate(returns: np.ndarray, fraction: float, risk_free: float
 
 
 # %% [markdown]
-# #### Support-Constrained Numerical Kelly Fraction
+# A fraction large enough to make wealth negative on some historical return has no logarithm,
+# so the search is bounded by the worst return in the sample.
 
 
 # %%
@@ -599,10 +618,7 @@ fig.update_yaxes(title_text="Annualized value", tickformat=".0%", row=1, col=1)
 fig.update_yaxes(title_text="Kelly fraction", tickformat=".0%", row=2, col=1)
 fig.update_layout(
     height=600,
-    title=(
-        f"Five-year Kelly estimates range from {np.min(kelly_values):.0%} "
-        f"to {np.max(kelly_values):.0%}"
-    ),
+    title="The same formula on rolling windows gives wildly different answers",
 )
 fig.show()
 
@@ -622,8 +638,10 @@ print(f"  Max:  {np.max(kelly_values):.1%}")
 # where $\Sigma^{-1}$ is the **precision matrix** (inverse covariance) and $\boldsymbol{\mu}$
 # is the vector of expected excess returns.
 #
-# This has the same direction as the **maximum Sharpe ratio portfolio** under aligned assumptions.
-# Tangency optimization normalizes the risky portfolio; Kelly also determines its leverage.
+# The direction of this vector is the same as the maximum-Sharpe portfolio's under aligned
+# assumptions, and the difference is what happens to its length. A mean-variance solution rescales
+# its weights to sum to one, which throws the length away and leaves only the mix. Kelly keeps it:
+# the magnitude of the vector *is* the leverage, and nothing in the formula bounds it.
 
 # %% [markdown]
 # ### Load Multi-Asset Data
@@ -724,7 +742,7 @@ fig.add_hline(
 )
 
 fig.update_layout(
-    title=f"Training estimates imply {np.abs(kelly_allocation).sum():.1f}x gross Kelly exposure",
+    title="Kelly sizes positions without any notion of a budget",
     xaxis_title="Asset",
     yaxis_title="Allocation (Can Exceed 100%)",
     yaxis_tickformat=".0%",
@@ -742,11 +760,13 @@ fig.show()
 #
 # **Half-Kelly** ($f^*/2$) is common in practice, sacrificing some growth for stability.
 
+# %% [markdown]
+# The fractional weights below are the raw Kelly solution scaled, with no normalization applied
+# afterwards, so each multiple carries genuinely different leverage rather than the same book
+# rescaled. Equal weight is included at a gross exposure of exactly one, which is the reference
+# every number in the table should be read against.
+
 # %%
-# Compare different Kelly fractions. Raw fractional weights are used directly,
-# without gross normalization, so different Kelly multiples produce genuinely
-# different leverage levels. The reported gross exposure reveals how
-# aggressive each multiple is relative to equal weight.
 kelly_multiples = [0.25, 0.5, 1.0]
 test_matrix = test_returns.select(assets).to_numpy()
 
@@ -765,22 +785,33 @@ equal_weights = np.full(len(assets), 1 / len(assets))
 portfolio_returns["Equal Weight"] = test_matrix @ equal_weights
 portfolio_gross["Equal Weight"] = float(np.abs(equal_weights).sum())
 
-print("Gross exposure by Kelly multiple (no cap applied):")
-print(
-    pl.DataFrame(
-        {"strategy": list(portfolio_gross), "gross_exposure": list(portfolio_gross.values())}
-    ).with_columns(pl.col("gross_exposure").round(2))
-)
+# %% [markdown]
+# **Gross exposure** is the sum of the absolute position sizes: a book 300% long and 200% short
+# has five times the account at risk and is 100% net long - the same gross as a 250/250 book, which
+# is the one that is flat on net. Its reciprocal is the move that would end
+# the account, and that is a worst case rather than a market move - it needs every long to fall
+# and every short to rise by that percentage on the same day. Net exposure is far smaller than
+# gross, so a uniform market decline of that size does not do it. What the number establishes is
+# that at high leverage the worst case sits inside a single ordinary session.
+
+# %%
+print("Gross exposure, and the simultaneous adverse move on every position that would")
+print("wipe the account out, with no cap applied:")
+for name, gross in portfolio_gross.items():
+    ruin_move = 1.0 / gross
+    print(f"  {name:<14} {gross:6.2f}x gross    wiped out by {ruin_move:.2%} against every leg")
 
 # %% [markdown]
-# ### Performance Comparison with ml4t-diagnostic
+# ### What each Kelly multiple did on the test window
 
 # %%
 dates = test_returns["timestamp"]
 comparison_metrics = []
 
 for name, pf_ret in portfolio_returns.items():
-    minimum_wealth_multiple = float(np.min(1 + pf_ret))
+    # The lowest the cumulative wealth path reaches, not the worst single period: the
+    # section reads the growth chart off this number, and a chart is a path.
+    minimum_wealth_multiple = float(np.min(np.cumprod(1 + pf_ret)))
     if minimum_wealth_multiple <= 0:
         raise ValueError(f"{name} reaches nonpositive wealth in the test window")
     pa = PortfolioAnalysis(
@@ -833,7 +864,7 @@ for name, pf_ret in portfolio_returns.items():
     )
 
 fig.update_layout(
-    title="Frozen Kelly allocations survive the test window but require extreme leverage",
+    title="Growth curves that assume free, unlimited, never-called borrowing",
     xaxis_title="Date",
     yaxis_title="Growth of $1",
     height=500,
@@ -867,24 +898,34 @@ fig.update_layout(
 fig.show()
 
 # %% [markdown]
-# ## Part 4: Practical Considerations
+# ## Part 4: What the derivation assumed
 #
-# ### When Kelly Works Well
-# - **Known edge**: The probability distribution is well-estimated
-# - **Many bets**: Long time horizon allows law of large numbers to work
-# - **Reinvestment**: Profits are continuously reinvested
+# Two different kinds of result sit in this notebook, and only the first is exact. The binary bet's
+# $f^* = (bp - q)/b$ is an exact maximizer of expected log wealth for that gamble. The
+# mean-over-variance form used for assets is not: it comes from expanding $\log(1 + x)$ and keeping
+# terms to the square, so it is an approximation whose accuracy depends on how large the leveraged
+# returns entering that logarithm are - not on whether the returns are close to normal. Each result
+# also assumed something the market does not supply. Naming those in order separates the parts that
+# survive contact with data from the parts that do not.
 #
-# ### Challenges in Finance
-# - **Estimation error**: Returns are not stationary, $\mu$ and $\sigma$ change
-# - **Fat tails**: Real returns have more extreme events than normal
-# - **Correlation changes**: Covariance matrix shifts in crises
-# - **Leverage costs**: Borrowing is not free
+# **The odds are known.** In the binary case $p$ and $b$ are given. In the market case both are
+# estimated, the solution divides by the estimated variance and scales with the estimated mean,
+# and the rolling section above shows how far that estimate moves on one instrument.
 #
-# ### Best Practices
-# 1. **Use fractional Kelly** (half or quarter) to account for uncertainty
-# 2. **Combine with risk constraints** (max position size, VaR limits)
-# 3. **Regularize covariance estimates** (Ledoit-Wolf shrinkage)
-# 4. **Monitor and adjust** as market conditions change
+# **The bet repeats many times, and the stake is a fraction of current wealth.** Kelly is a
+# long-run growth argument: it wins in the limit and says nothing about the horizon a particular
+# investor has. Betting a fraction of *current* wealth is what makes ruin impossible in the coin
+# toss, because a fraction of a positive number stays positive. That property is lost the moment
+# leverage exceeds one, since a position larger than the account can lose more than the account.
+#
+# **The leveraged returns are small enough for the second-order expansion to hold.** The
+# mean-over-variance form drops every term past the square, and what those dropped terms are worth
+# grows with the size of the returns fed into the logarithm - which leverage is precisely what
+# magnifies. Near-normality does not rescue it: fat tails make the discarded terms matter more, but
+# even a well-behaved distribution breaks the approximation once positions are large enough.
+#
+# **Borrowing is free and unlimited.** There is no funding rate in the objective, no cap on gross
+# exposure and no liquidation rule. Part 3 computes what that assumption is worth in this sample.
 
 # %%
 # Example: Shrinkage estimator for more stable Kelly allocation
@@ -917,37 +958,69 @@ results.write_parquet(OUTPUT_DIR / "kelly_allocations.parquet")
 print("Saved Kelly allocations to ch17_kelly/kelly_allocations.parquet")
 
 # %% [markdown]
-# ## Key Takeaways
-#
-# The final takeaways below are rendered from the fitted and evaluated values.
+# ## What the test window actually says
 
 # %%
 full_kelly_row = metrics_df.filter(pl.col("strategy") == "100% Kelly").row(0, named=True)
-display(
-    Markdown(
-        f"""
-1. **Kelly determines direction and leverage.** The train-fitted raw solution requires
-   {np.abs(kelly_allocation).sum():.1f}x gross exposure; the maximum-Sharpe risky portfolio shares
-   its direction under aligned assumptions but normalizes the scale.
-
-2. **Fractional Kelly reduces, but does not remove, estimation risk.** Quarter Kelly still carries
-   {portfolio_gross["25% Kelly"]:.1f}x gross exposure in this example.
-
-3. **Wealth-domain checks are mandatory.** Full Kelly's worst test-period wealth multiple is
-   {full_kelly_row["min_wealth_multiple"]:.2f}; a nonpositive value would make geometric wealth
-   and drawdown invalid.
-
-4. **Treat the result as an upper-bound diagnostic.** The universe is current-vintage, parameters
-   are estimated once on training data, and test results are descriptive rather than a selection rule.
-"""
-    )
+print(f"Gross exposure the training estimates ask for: {np.abs(kelly_allocation).sum():.1f}x")
+print(f"At a quarter of that:                          {portfolio_gross['25% Kelly']:.1f}x")
+print(
+    "Lowest point of the full-Kelly wealth path:    "
+    f"{full_kelly_row['min_wealth_multiple']:.3g}x the starting capital"
 )
 
+# %% [markdown] tags=["results"]
+# The last line is the one that decides how to read the growth chart above it. At its worst point
+# the full-Kelly path is down to about one ten-millionth of the capital it started with, while
+# carrying more than forty times that capital in gross positions - which is the same thing the
+# `max_dd` column says when it reads exactly -1.0. The chart's vertical axis is logarithmic, so a
+# fall of that size still looks like a line on the page; the number is what says the account is
+# gone. No broker holds a position through it, and the arithmetic above says why: at that gross
+# exposure it takes only 2.15% against every leg at once - every long down that much and every
+# short up that much - to empty the account. That is a worst case rather than a market move, since
+# net exposure is a fraction of gross and a uniform decline does not do it; what matters is that
+# 46x leverage puts the worst case within a single ordinary session.
+#
+# Halving the fraction does not rescue it. Half-Kelly bottoms at 0.13x with a 99.2% drawdown, and
+# only at a quarter does the worst point stay above 0.76x. What separates them is not the sign of
+# the estimates but how much leverage is taken on the strength of them.
+#
+# So the curves are not a track record. They are what the formula's answer would have produced given
+# borrowing that is unlimited, free of interest, and never called, and the value of computing them
+# is precisely that the assumption is visible in the leverage number rather than hidden.
+
 # %% [markdown]
-# The test window is a one-time descriptive evaluation of frozen allocations. It does not justify
-# selecting a Kelly multiple after observing these outcomes.
+# ## Key takeaways
 #
-# **Next**: [`05_factor_allocation_evidence`](05_factor_allocation_evidence.ipynb) tests whether
-# factor characteristics explain later returns without using the gated case-study notebooks.
+# 1. **Kelly answers a question about growth, not about survival.** Maximizing the expected log of
+#    terminal wealth is a defensible objective and it says nothing about the path, so the solution
+#    is happy to accept a route through near-total loss on the way to a higher expectation.
+# 2. **The formula has no notion of a budget.** Dividing expected returns by a covariance matrix
+#    produces a number, and nothing in it is bounded by the capital available. Any use of it in
+#    practice is the formula plus a leverage constraint, and the constraint is doing at least as
+#    much work as the formula.
+# 3. **Fractional Kelly is a cap, not a fix.** Taking a quarter of a forty-six-times solution
+#    leaves eleven times. The reason to use a fraction is that the inputs are estimated and the
+#    solution scales with the error in them; the reason it is not sufficient is that a fraction of
+#    an unbounded number is still unbounded.
+# 4. **The single-asset rolling estimate is the honest picture of the input problem.** The same
+#    formula on the same instrument over rolling five-year windows swings across a range no
+#    position sizer could act on. That instability is the estimate, not the market.
+# 5. **Check the wealth path, not only the return series.** A leveraged return series can produce a
+#    respectable annualized figure while passing through a wealth multiple that would have ended
+#    the account. The minimum wealth multiple is one line of code and it is what makes the
+#    difference visible.
 #
-# **Book**: §17.4 covers Kelly sizing among the baseline allocators.
+# ### Known limitations
+#
+# - Borrowing is free, unlimited and never margin-called throughout. Introducing any of a funding
+#   rate, a leverage cap, or a liquidation rule changes every result in Part 3.
+# - Inputs are estimated once on the training window and frozen. A rolling re-estimate would change
+#   the position sizes continuously, and the rolling-Kelly section shows by how much.
+# - Returns are treated as normal, which is what makes the mean-over-variance approximation valid.
+#   Real returns have fat tails, and the tail is exactly where a leveraged position dies.
+# - The universe is a small set of funds selected because they exist today.
+#
+# **Next:** [`05_factor_allocation_evidence`](05_factor_allocation_evidence.ipynb) asks whether
+# asset characteristics explain later returns at all. Section 17.4 covers Kelly sizing among the
+# baseline allocators.

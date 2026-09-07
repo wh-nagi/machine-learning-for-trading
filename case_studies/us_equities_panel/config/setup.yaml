@@ -48,7 +48,7 @@ costs:
   components: [spread, commission, market_impact, borrow_cost]
   per_leg_cost_bps_range: [5, 20]
   # per_share is the commission rate for the exploratory per-share
-  # cost-sensitivity regime (read by Ch18 18_costs.py and the run_sweep
+  # cost-sensitivity regime (read by Ch18 19_costs.py and the run_sweep
   # planner). IBKR Pro Tiered top tier. NOT used in the headline bps
   # regime — bps regime is the production cost model.
   per_share: 0.0035
@@ -167,12 +167,77 @@ labels:
     fwd_ret_5d: 5
     fwd_ret_21d: 21
 
+model_based:
+  regime:
+    # Calm months and falling ones. Two states is the coarsest split that separates the
+    # calm, mildly positive months from the falling, turbulent ones, which is the
+    # distinction the momentum-crash literature works in.
+    n_clusters: 2
+    # Sessions per clustered window, and how many sessions two consecutive windows share.
+    # A month of sessions per window, overlapping by a week, so a shift in the return
+    # distribution is seen by more than one window before it is clustered.
+    window: 21
+    overlap: 5
+    # Sessions of market history spent before the first clustering is fitted. Three years.
+    # At the 16-session step the window and overlap imply, that is 46 windows to cluster,
+    # which is the fewest that separates two centroids from the noise in a single window.
+    # The clustered series is one market-level series rather than a panel, so this is paid
+    # once for the whole notebook. It matches etfs, whose regime model reads a daily
+    # market-level series of the same shape.
+    burnin: 756
+    # How often the centroids are re-estimated. A quarter. Regime parameters are the
+    # slowest-moving thing this notebook fits and each estimate is n_init k-means searches
+    # over the whole history so far.
+    refit_every: 63
+  garch:
+    # Sessions of a stock's own returns before its variance model is fitted. Two years.
+    # Below that a maximum-likelihood fit of three parameters returns estimates whose
+    # standard errors swamp them, and the persistence term - the one the feature is most
+    # sensitive to - is estimated from too few volatility cycles.
+    burnin: 504
+    # How often the variance model is re-estimated. A quarter, which on this panel is
+    # 3,178 series re-estimated about 110 times each. Section 4b measures what the cadence
+    # buys: the fitted persistence of a US equity moves slowly, so a faster cadence would
+    # multiply the fits without moving the emitted volatility.
+    refit_every: 63
+    # The specification the maximum-likelihood fit estimates, declared here rather than
+    # written into the notebook's call, so what "the GARCH feature" names on this panel is
+    # readable without opening the code. These five are the argument names `arch_model` takes
+    # and 04 passes them through unchanged.
+    #
+    # This is the plain GARCH(1,1)-Normal baseline: a constant mean, a symmetric variance
+    # recursion of order (1,1), and Gaussian innovations. No key here differs from that
+    # baseline, so this case study declares no deviation.
+    #
+    # `o: 0` is the symmetric model. Setting it to 1 adds the leverage term - down days
+    # raising next-day variance more than up days of the same size - which is what
+    # sp500_options and sp500_equity_option_analytics fit on their index series. It is not
+    # fitted here because a broad cross-section of single stocks is where the term is least
+    # reliably identified: many names carry too few large down moves in a two-year estimation
+    # window to separate gamma from alpha, and Section 4b's persistence spread is already the
+    # widest thing the schedule has to hold steady.
+    #
+    # `dist: Normal` is the likelihood, not the filter. It changes which coefficients the
+    # optimizer returns and changes no step of the variance recursion those coefficients are
+    # then run through.
+    mean: Constant
+    vol: GARCH
+    p: 1
+    o: 0
+    q: 1
+    dist: Normal
+
 modeling:
   gbm:
     libraries: [lightgbm]
     preset: default
     device: cpu
-    max_bin: 63
+    # LightGBM's own CPU default. 63 is the GPU default and was carried over with the
+    # device when these runs moved off the GPU, so every CPU fit was quantizing the design
+    # matrix into a quarter of the bins the library would have used. Coarser bins are
+    # faster and lose split points; the reader running this on a CPU gets what the
+    # documentation describes.
+    max_bin: 255
   latent_factors:
     persistent_entities: true
     # Down-tune the SDF schedule on this large-N CS so training time stays
@@ -188,13 +253,24 @@ modeling:
         n_epochs_moment: 32
         n_epochs_cond: 512
         burn_in_epochs: 32
-        checkpoint_epochs: [128, 256, 384, 512, 640]
+        checkpoint_epochs: [128, 256, 384, 512]  # conditional-relative; publishes global 128..640
         beta_checkpoint_epochs: [256]
         beta_default_checkpoint: 256
 
 causal:
   treatment: past_ret_12m_skip
-  confounders: [vol_21d, amihud_illiq, volume_ratio]
+  # Bars the treatment's own construction window spans, which is what the placebo block has
+  # to cover: permuting past_ret_12m_skip in blocks shorter than this destroys the serial
+  # dependence the refutation exists to preserve, and the resulting p-value reads like a
+  # refutation without being one. Declared here rather than inferred, because guessing which
+  # element of a window list a column was built from puts a wrong number behind a right-looking
+  # one. Derived from the construction, not chosen:
+  #
+  # `close.shift(MOMENTUM_SKIP) / close.shift(MOMENTUM_LOOKBACK) - 1` in 02_labels, where
+  # those are 21 and 252 trading sessions. 03_financial_features recomputes it as
+  # `ret_12m_skip`; the oldest price either reads is 252 sessions back.
+  treatment_window: 252
+  confounders: [vol_21d, illiq_rank, volume_ratio]
   method: walk_forward_dml
 
 # Read by 20_strategy_analysis.py to gate the headline strategy summary.

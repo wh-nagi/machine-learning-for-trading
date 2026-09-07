@@ -411,7 +411,7 @@ show_with_alt(
 # charged here, which is the conservative end of the assumption.
 #
 # This data carries no bid and no ask, only what traded, so the spread cannot be measured from it.
-# The declared assumption is what gets charged, and `15_costs` re-runs the strategy under harsher
+# The declared assumption is what gets charged, and `16_costs` re-runs the strategy under harsher
 # ones to see how much the answer depends on it. Because the assumption has only the two levels the
 # configuration declares - one for the dollar pairs, one for the crosses - the cost across this
 # universe is two numbers rather than a curve, and they are printed rather than drawn.
@@ -687,10 +687,10 @@ print(
 # from `evaluation.holdout_start`, which is what every later stage does too. It is handed trading
 # days and no prices, so nothing the holdout contains reaches a number computed above.
 #
-# `generate_cv_splits` numbers folds from zero backwards from the most recent, so fold 0 is the last
-# one before the holdout and the highest number is the earliest. The figure draws them earliest-first
-# and labels each with that number, which is why the labels count down; every later stage prints
-# the same ones. The three assertions below establish what the figure cannot: the gap is one trading
+# `generate_cv_splits` numbers folds chronologically, so fold 0 is the earliest and the highest
+# number is the last one before the holdout. The figure draws them earliest-first and labels each
+# with that number, so the labels count up alongside the dates; every later stage prints the same
+# ones. The three assertions below establish what the figure cannot: the gap is one trading
 # day against training blocks measured in years, far too narrow to see, so only counting it off the
 # timeline can confirm it matches the label horizon. The other two check that the number of folds is
 # the number `setup.yaml` declares, and that no validation window reaches into the holdout. The

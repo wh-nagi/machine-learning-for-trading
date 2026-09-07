@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import uuid
@@ -81,8 +80,28 @@ class LabelCatalog:
         self,
         name: str,
         *,
-        execution_tier: str | ExecutionTier = ExecutionTier.CANONICAL,
+        execution_tier: str | ExecutionTier | None = None,
     ) -> LabelRef:
+        # None, not CANONICAL. `Study.activate` reads `self.execution_tier` when it is handed
+        # None, so the default now inherits the tier the study was opened at instead of
+        # overriding it. Defaulting to CANONICAL made a bare `get(name)` RE-ACTIVATE the study
+        # at canonical, silently undoing the preview activation the caller performed at the top
+        # of the notebook - and a canonical activation skips both the `.preview` path segment
+        # and the `_ensure_input_link` calls that link `labels/` and `features/` into the
+        # preview case directory. The label then resolved to
+        # `<workspace>/<case_study>/labels/<name>.parquet`, which nothing writes, and the run
+        # died claiming the label artifact was missing while it sat behind the worktree's
+        # symlink where `open_study` says inputs are read in place.
+        #
+        # `list` and `publish` in this class already call `activate()` bare; `get` was the only
+        # accessor overriding the study's own tier. Five call sites relied on the default and
+        # every one of them had passed EXECUTION_TIER to `open_study` a few lines earlier, so
+        # the default contradicted what the notebook had already declared. Fixing the call
+        # sites instead would leave the trap armed for the next one.
+        #
+        # The sites that pass `ExecutionTier.CANONICAL` explicitly - the holdout hooks in
+        # latent_factors, deep_learning, gbm, linear and tabular_dl - are unaffected: they name
+        # the tier they mean, and a locked holdout read is canonical by definition.
         self.study.activate(execution_tier)
         path = self._path(name)
         metadata_path = sidecar_path(path)
@@ -122,13 +141,18 @@ class LabelCatalog:
         if not path.is_file():
             raise FileNotFoundError(f"label artifact is missing: {path}")
         resolved_metadata_path = sidecar_path(path)
+        digest = value_digest(pl.read_parquet(path))
         if resolved_metadata_path.exists():
             metadata = json.loads(resolved_metadata_path.read_text())
-            digest = value_digest(pl.read_parquet(path))
             if metadata.get("digest") != digest:
                 raise ValueError(f"label artifact digest does not match its sidecar: {path}")
-        else:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        # The sidecar-less branch used to digest the file's bytes, so the same label values
+        # under a different parquet codec or row-group size produced a different label
+        # identity - and an artifact with a sidecar and one without disagreed about the
+        # same data. Every production label carries a sidecar; the CI fixtures, written
+        # before sidecars existed, do not, so that branch was the difference between what
+        # CI computes and what production computes. `value_digest` digests the values and
+        # answers the same either way.
         return LabelRef(definition=definition, path=path, digest=digest)
 
     def publish(self, definition: LabelDefinition, frame: pl.DataFrame) -> LabelRef:

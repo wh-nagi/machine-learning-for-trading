@@ -1,0 +1,473 @@
+# ---
+# jupyter:
+#   jupytext:
+#     cell_metadata_filter: tags,-all
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.3
+#   kernelspec:
+#     display_name: Python 3 (ipykernel)
+#     language: python
+#     name: python3
+# ---
+
+# %% [markdown]
+# # US Firm Characteristics: Holdout Backtest
+#
+# **Chapter 20 - Out-of-sample evaluation**
+#
+# [`15_holdout_predictions`](15_holdout_predictions.ipynb) refitted the selected
+# configuration on the history before the holdout window and wrote its predictions over
+# it. This notebook trades them, with the sizing and the cost assumption the rest of the
+# case study used, and registers the result.
+#
+# Nothing is chosen here. The predictions, the allocator, the concentration, the rebalance
+# cadence and the charge all arrive fixed from earlier notebooks, and the only thing this
+# notebook decides is that they are applied unchanged. That is the whole design: a holdout
+# result is worth something exactly to the extent that no decision was made after seeing
+# it, and every knob left open here would be a decision.
+#
+# The comparison to validation is printed but not interpreted. One year of monthly
+# decisions is twelve observations, and what can be said about a Sharpe estimated from
+# twelve observations is [`17_strategy_analysis`](17_strategy_analysis.ipynb)'s subject,
+# with the intervals to say it.
+#
+# **The window is 2016, declared in `config/setup.yaml` as `holdout_start` 2016-01-01 to
+# `holdout_end` 2016-12-31.** The panel is monthly and `labels.rebalance_step` is 1, so the
+# strategy takes a decision at each month end and the window holds twelve of them. That
+# twelve is not incidental to the reading of this notebook; it is the sample size behind
+# every number section 4 prints, and it is why the language there is about what the figures
+# cannot separate rather than about what they show.
+#
+# Why the holdout is one year rather than five is a consequence of the walk-forward scheme
+# rather than a preference. `evaluation` declares ten splits with a ten-year training window
+# and a one-year validation window each, rolling forward across a panel that begins in 1996.
+# Widening the holdout takes those years away from the ten folds that select the model, and
+# on a monthly panel a fold cannot be shortened much before its validation year stops
+# containing enough cross-sections to rank anything. The cost of the choice is precisely the
+# sampling error this notebook keeps naming.
+#
+# **Prerequisites:** [`15_holdout_predictions`](15_holdout_predictions.ipynb).
+#
+# **Scope:** one backtest. No selection, no comparison beyond a printed pair.
+
+# %%
+"""US Firm Characteristics: Holdout Backtest."""
+
+import json
+import sqlite3
+import warnings
+
+import polars as pl
+
+warnings.filterwarnings("ignore")
+
+from case_studies.research import open_study
+from case_studies.research.holdout import build_holdout_training_spec
+from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
+from case_studies.utils.backtest_presets import (
+    ensure_backtest_spec,
+    serializable_backtest_spec,
+    strategy_view,
+)
+from case_studies.utils.backtest_runner import resolved_allow_short_selling, run_backtest
+from case_studies.utils.conformal import (
+    compute_holdout_conformal_widths,
+    ensure_conformal_calibration_identity,
+    holdout_conformal_embargo_steps,
+)
+from case_studies.utils.registry import backtest_run_status, read_predictions
+from case_studies.utils.strategy_analysis import resolve_solvent_carrier
+from utils.paths import get_case_study_dir
+
+# %% tags=["parameters"]
+CASE_STUDY_ID = "us_firm_characteristics"
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
+MAX_SYMBOLS = 0
+# Whether a holdout backtest of a DIFFERENT strategy may be superseded by this run. Off by
+# default, and the same switch `15_holdout_predictions` uses for the model side.
+REPLACE_HOLDOUT = False
+
+# %%
+study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
+CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
+bt_config = get_backtest_config(CASE_STUDY_ID)
+
+
+def _registered_holdout_backtests(case_dir, prediction_hash):
+    """The backtest hashes already registered against one holdout prediction set."""
+    with sqlite3.connect(str(case_dir / "run_log" / "registry.db")) as conn:
+        rows = conn.execute(
+            "SELECT backtest_hash FROM backtest_runs WHERE prediction_hash = ? "
+            "ORDER BY backtest_hash",
+            (prediction_hash,),
+        ).fetchall()
+    return [{"backtest_hash": backtest_hash} for (backtest_hash,) in rows]
+
+
+def _delete_holdout_backtest(case_dir, backtest_hash):
+    """Remove one registered holdout backtest and the rows derived from it.
+
+    Same rule as `15_holdout_predictions`' replacement of a superseded generation: a
+    holdout result that has been observed and then left readable beside its replacement is
+    still a number someone can quote.
+    """
+    with sqlite3.connect(str(case_dir / "run_log" / "registry.db")) as conn:
+        conn.execute(
+            "DELETE FROM backtest_paired_metrics WHERE challenger_hash = ? OR benchmark_hash = ?",
+            (backtest_hash, backtest_hash),
+        )
+        conn.execute("DELETE FROM backtest_metrics WHERE backtest_hash = ?", (backtest_hash,))
+        conn.execute("DELETE FROM backtest_runs WHERE backtest_hash = ?", (backtest_hash,))
+
+
+# %% [markdown]
+# ## 1. The configuration, and the predictions it produced on the holdout
+#
+# The carrier is resolved the same way [`14_costs`](14_costs.ipynb) and
+# [`15_holdout_predictions`](15_holdout_predictions.ipynb) resolve it, so all three run
+# the same configuration by construction rather than by a hash copied between them.
+#
+# Which holdout prediction set belongs to it is derived rather than searched for. Re-deriving
+# the holdout training specification reproduces the training identity 15 registered - the
+# derivation is deterministic and the identity covers it - so the prediction set is looked up
+# by that identity and the carrier's checkpoint. A search over holdout prediction sets would
+# have to guess which one belonged to this configuration, and this case study's registry holds
+# an older one that does not.
+
+# %%
+carrier = resolve_solvent_carrier(CASE_STUDY_ID)
+LABEL = carrier["label"]
+validation_prediction_record = study.results.open(carrier["val_prediction_hash"]).registry_record()
+
+holdout_spec = build_holdout_training_spec(
+    study,
+    study.results.open(carrier["training_hash"]).spec(),
+    timeline=(
+        pl.read_parquet(study.root / "labels" / f"{LABEL}.parquet")
+        .get_column("timestamp")
+        .unique()
+        .sort()
+        .to_list()
+    ),
+    case_study=CASE_STUDY_ID,
+)
+
+# %%
+from case_studies.utils.registry import training_hash_from_spec
+
+holdout_training_hash = training_hash_from_spec(holdout_spec)
+with sqlite3.connect(str(CASE_DIR / "run_log" / "registry.db")) as conn:
+    match = conn.execute(
+        """
+        SELECT prediction_hash FROM prediction_sets
+        WHERE split = 'holdout' AND training_hash = ?
+          AND checkpoint_kind IS ? AND checkpoint_value IS ?
+        """,
+        (
+            holdout_training_hash,
+            validation_prediction_record["checkpoint_kind"],
+            validation_prediction_record["checkpoint_value"],
+        ),
+    ).fetchone()
+if match is None:
+    raise RuntimeError(
+        f"No holdout prediction set for training {holdout_training_hash}. Run "
+        "15_holdout_predictions first; this notebook does not fit."
+    )
+HOLDOUT_PREDICTION_HASH = match[0]
+
+print(f"Carrier:            {carrier['val_backtest_hash']}  {carrier['config_name']} ({LABEL})")
+print(f"Holdout training:   {holdout_training_hash}")
+print(f"Holdout prediction: {HOLDOUT_PREDICTION_HASH}")
+
+# %% [markdown]
+# ## 2. Calibrating the allocator on validation residuals only
+#
+# This carrier sizes positions by a conformal width, and a width is calibrated from the
+# errors the model has already made. On the holdout there are none to use: an error is
+# only usable once the return it measures has been realised, and every holdout return
+# realises inside the window being evaluated. So the widths come from the validation
+# residuals of the validation prediction set, which is what the allocator would have had
+# standing at the start of the window.
+#
+# A conformal width is an interval around a prediction, sized so that a stated fraction of
+# past errors fell inside an interval built the same way. The `alpha` in the allocator's
+# parameters is the fraction allowed to fall outside, so a smaller alpha buys a wider
+# interval. The width is therefore a statement about how wrong this model has been on
+# this name, and nothing about how large the return is expected to be.
+#
+# That distinction is what makes `conformal_weighted` a different strategy from
+# `score_weighted` rather than a rescaling of it. `score_weighted` puts more capital where
+# the predicted return is larger. `conformal_weighted` puts more capital where the
+# prediction has been more reliable. The two agree only when the model's confidence happens
+# to track its predictions, and on this panel there is no reason it should: a firm's
+# characteristics can imply a large expected return while that firm's own residual history
+# is short or dispersed.
+#
+# A width is not purely firm-specific, and the exception matters on a panel with a firm
+# axis this wide. `min_calibration_n` is the number of validation residuals a name needs
+# before it gets a width of its own, and `compute_holdout_conformal_widths` does drop such
+# a name from its per-symbol table. It is **not left without a width**: the symbols that
+# fall out are recovered by an anti-join against the holdout's own symbol set and given one
+# quantile taken over all the embargoed validation residuals together, recorded in the
+# artifact as `calibration_scope = "pooled"` rather than `"symbol"`. So a thinly covered
+# firm is sized on the family's typical reliability rather than excluded, and every
+# selected name carries a width. `compute_conformal_weights` depends on that: it raises
+# rather than proceeding if any selected asset has no width.
+#
+# What reaches the portfolio is narrower still. `compute_conformal_weights` normalizes
+# `1 / width` within each leg at each timestamp, so only the cross-sectional dispersion of
+# the widths inside that month's long and short sides changes any weight. A month in which
+# every selected name carries a similar width, including one where most of them carry the
+# pooled fallback, allocates close to equally, and the level of the widths never reaches
+# the weights at all.
+#
+# No validation observation is dropped at the boundary, and the reason is the label rather
+# than a choice. The embargo exists because a residual observed at `t` measures a return
+# realising over `(t, t+h]`, so with `h > 0` the last residuals of the validation span
+# reach into the holdout window and would size holdout positions with holdout price
+# information. This panel declares `h = 0D` - each row is dated by the month the return
+# was earned - so the outcome is already realised at the observation and nothing reaches
+# forward. The step count comes from the reviewed table in `conformal.py`, which records
+# the label horizon; it carried 1 for these labels, which discarded the last month of
+# calibration against a leak the label cannot have.
+#
+# The embargo is derived here because the backtest identity below is built from it. The
+# widths themselves are NOT written here: writing them replaces the artifact the already
+# registered run was sized by, and the replacement guard in section 3 can still refuse this
+# run afterwards. That order left the registered holdout pointing at a calibration that no
+# longer existed, so the write moved below the guard and nothing is overwritten until this
+# run is cleared to register.
+
+# %% tags=["results"]
+allocation = strategy_view(json.loads(carrier["spec_json"])).get("allocation") or {}
+NEEDS_CALIBRATION = allocation.get("method") == "conformal_weighted"
+embargo_steps = holdout_conformal_embargo_steps(CASE_STUDY_ID, LABEL) if NEEDS_CALIBRATION else 0
+if NEEDS_CALIBRATION:
+    print(f"Conformal carrier: embargo {embargo_steps} observation(s), widths written below.")
+else:
+    print(f"Allocator {allocation.get('method', 'equal_weight')!r} needs no calibration.")
+
+# %% [markdown]
+# ## 3. The backtest
+#
+# The strategy specification is the carrier's own, re-pointed at the holdout prediction
+# set and the holdout price window. Nothing else about it changes - the commission and
+# slippage are the levels `setup.yaml` declares, the same ones every validation number in
+# this case study was net of, and the same ones sitting inside the swept grid in
+# [`14_costs`](14_costs.ipynb).
+#
+# What that specification does to a prediction, in order, since this notebook is where a
+# reader arrives wanting the whole strategy in one place rather than assembled from four
+# earlier ones. At each month end the model scores every firm in the cross-section.
+# `setup.yaml` declares `entry_logic: rank_top_k_long_bottom_k_short`, so the strategy goes
+# **long the top `k` and short the bottom `k`**, drawn from the grid
+# `backtest.sweep.top_k_grid` declares as 5, 10, 20 and 50. The book therefore holds up to
+# `2k` names, not `k`, and the two sides are kept disjoint: `build_target_weights` caps the
+# effective `k` at half the cross-section, leaving the median firm unselected on an odd
+# universe. The allocator sets the weights within each leg, by score or by conformal width,
+# and normalizes the legs separately. The result is one weight vector for the month, and
+# the backtest earns each name's realised forward return over that month.
+#
+# **`min_weight_change` and `min_trade_value` do not act here**, and the reason is worth
+# stating because `setup.yaml` declares both under `backtest.rebalance.default`. They are
+# engine-path settings: a threshold below which a change in target weight is not turned
+# into an order. This case study runs `_run_vectorized`, which is handed the target weights
+# and computes return and turnover from them directly, and is never handed either
+# threshold. So no trade here is suppressed for being small, and the turnover the cost
+# sweep in [`14_costs`](14_costs.ipynb) charges is the full month-to-month weight change.
+# The declarations stay because the same file drives the engine-path case studies where
+# they do act, which is the same reason `MAX_SYMBOLS` survives in
+# [`13_risk_management`](13_risk_management.ipynb).
+#
+# The run registers under `stage='holdout'`, which the registry derives from the
+# prediction set's split rather than from anything asserted here.
+#
+# One thing the hash does not cover: a conformal carrier reads its widths from an artifact
+# beside the prediction set, and the backtest identity covers the allocator's declared
+# parameters but not the calibration those widths were built from. Change the embargo and
+# the hash does not move, so a registered run would be served back against inputs that no
+# longer exist - and the registry refuses the overwrite rather than accepting either, which
+# is how that state announces itself. Re-calibrating this case study's holdout therefore
+# means deleting the registered run first, the same rule section 3 of
+# [`15_holdout_predictions`](15_holdout_predictions.ipynb) applies to a superseded
+# generation.
+
+# %% tags=["results"]
+prices = load_backtest_prices_for(CASE_STUDY_ID, LABEL, split="holdout", max_symbols=MAX_SYMBOLS)
+predictions = read_predictions(CASE_STUDY_ID, HOLDOUT_PREDICTION_HASH)
+print(f"Prices: {len(prices):,} rows, {prices['symbol'].n_unique():,} assets")
+print(f"Predictions: {predictions.height:,} rows, {predictions['timestamp'].n_unique()} dates")
+
+spec = ensure_backtest_spec(
+    CASE_STUDY_ID,
+    bt_config,
+    json.loads(carrier["spec_json"]),
+    prices=prices,
+    prediction_hash=HOLDOUT_PREDICTION_HASH,
+    initial_cash=bt_config.initial_cash,
+)
+spec["chapter"] = "ch20"
+# The embargo goes into the specification here, before anything hashes it. The widths are
+# an input to this backtest and the embargo decides them, so two embargoes are two results
+# and must not share an identity - which they did: changing it left the hash where it was
+# and the registry refused to overwrite the registered run rather than accept either.
+# Recorded by the notebook rather than inside `run_backtest`, because callers elsewhere
+# construct and hash their own resolved specifications and compare the runner's answer to
+# them; a runner that added a key after that would make those comparisons fail.
+if NEEDS_CALIBRATION:
+    spec = ensure_conformal_calibration_identity(spec, holdout_embargo_steps=embargo_steps)
+
+# The window carries one backtest at a time, for the same reason `15` lets it carry one
+# prediction generation at a time. `15`'s guard is on the model - the training identity and
+# the checkpoint - and it cannot see this one: a changed allocator, overlay, cost level or
+# calibration produces the same holdout predictions and a different result from them.
+#
+# The test is the backtest hash, not a field-by-field comparison. Every input that changes
+# the result is in that hash by construction, and a guard naming fields instead has to be
+# right about all of them - it was written first as a `strategy` comparison and missed the
+# cost configuration and the calibration identity, both of which sit outside that block.
+#
+# The hash is resolved before anything runs, so nothing is evaluated on the holdout before
+# the question is answered. It comes from `backtest_run_status`, which is the call the
+# runner itself makes to decide whether a spec is already registered - asking it is the
+# only way to be sure the guard and the runner agree about identity, and reconstructing the
+# hash from parts here did not: it predicted f23ff90cf518 against the runner's b2acfd5420c8.
+# The run asserts the two still agree afterwards, because a guard that had quietly stopped
+# predicting the hash would let everything through while looking correct.
+spec["backtest_config"]["account"]["allow_short_selling"] = resolved_allow_short_selling(spec, None)
+prospective_hash = backtest_run_status(CASE_STUDY_ID, HOLDOUT_PREDICTION_HASH, spec).backtest_hash
+superseded_backtests = sorted(
+    {
+        row["backtest_hash"]
+        for row in _registered_holdout_backtests(CASE_DIR, HOLDOUT_PREDICTION_HASH)
+    }
+    - {prospective_hash}
+)
+if superseded_backtests and not REPLACE_HOLDOUT:
+    raise RuntimeError(
+        "the holdout window already carries a backtest of a different configuration: "
+        + ", ".join(superseded_backtests)
+        + f". This run would register {prospective_hash} and has not run. Set "
+        "REPLACE_HOLDOUT=True to discard the earlier one, or leave the selection where it was."
+    )
+for backtest_hash in superseded_backtests:
+    print(f"REPLACING holdout backtest {backtest_hash}")
+    _delete_holdout_backtest(CASE_DIR, backtest_hash)
+
+# The guard has passed, so this run will register and the widths it is sized by are the
+# ones that belong beside this prediction set.
+if NEEDS_CALIBRATION:
+    widths = compute_holdout_conformal_widths(
+        CASE_STUDY_ID,
+        carrier["val_prediction_hash"],
+        HOLDOUT_PREDICTION_HASH,
+        alpha=float(allocation.get("alpha", 0.2)),
+        min_calibration_n=int(allocation["min_calibration_n"]),
+        embargo_steps=embargo_steps,
+        write=True,
+    )
+    print(
+        f"Conformal widths: {widths.height:,} rows over "
+        f"{widths['symbol'].n_unique():,} names, embargo {embargo_steps} observation(s)"
+    )
+    print(f"  calibration_n: median {widths['calibration_n'].median():.0f}")
+
+result = run_backtest(
+    CASE_STUDY_ID,
+    HOLDOUT_PREDICTION_HASH,
+    spec,
+    prices=prices,
+    predictions=predictions,
+    label=LABEL,
+    register=True,
+    initial_cash=bt_config.initial_cash,
+    calendar=bt_config.calendar,
+)
+if result.backtest_hash != prospective_hash:
+    raise RuntimeError(
+        f"the guard predicted {prospective_hash} and the runner registered "
+        f"{result.backtest_hash}. The guard decides what may run on the holdout, so a guard "
+        "that no longer reproduces the runner's identity is not a smaller problem than the "
+        "one it was written for."
+    )
+print(f"Holdout backtest: {result.backtest_hash}")
+
+# %% [markdown]
+# ## 4. What it came out at
+#
+# The two numbers below are one strategy measured on two disjoint periods, and the gap
+# between them is not an estimate of decay. The validation figure is the maximum of a
+# ranking over more than a thousand backtests, so it carries the selection; the holdout
+# figure is one measurement of twelve monthly returns, so it carries the sampling error of
+# twelve observations. Both facts push the pair apart on their own, before any real change
+# in the strategy's edge. [`17_strategy_analysis`](17_strategy_analysis.ipynb) is where
+# they are given intervals and a paired comparison.
+#
+# Four statistics are printed and they do not all mean the same amount here. CAGR is the
+# constant annual growth rate that would have produced the window's total return, and over
+# a window that is exactly one year it is just that return, so it adds no information the
+# return does not already carry and is reported for comparability with the other case
+# studies. Sharpe is the mean monthly return divided by its standard deviation, annualised
+# at the `periods_per_year` of 12 that `setup.yaml` declares; estimated from twelve
+# observations its standard error is large enough that the interval around it will cover a
+# wide range of values, which is the whole reason it is not interpreted here.
+#
+# Maximum drawdown and win rate are the two that behave differently, in opposite
+# directions. Maximum drawdown is the largest peak-to-trough fall in the equity curve, and
+# it is a single realised extreme rather than an average, so it is the one figure here a
+# short window does not shrink the meaning of: the strategy either did or did not give that
+# much back. Win rate is the fraction of the twelve months that were positive, so it moves
+# in steps of one twelfth and cannot distinguish a strategy that wins narrowly from one
+# that wins by a wide margin. Read it as a count, not as a probability.
+
+# %% tags=["results"]
+metrics = result.metrics
+# The carrier's own registered Sharpe, not the resolver's. `resolve_solvent_carrier` reports
+# the common-support figure, which re-ranks the conformal field on the timestamps every
+# candidate covers; that is the right number for choosing between candidates and the wrong
+# one to set beside a holdout measured over its own full window. Both are printed, so
+# neither has to be inferred from the other.
+with sqlite3.connect(str(CASE_DIR / "run_log" / "registry.db")) as conn:
+    carrier_sharpe, carrier_periods = conn.execute(
+        "SELECT sharpe, n_periods FROM backtest_metrics WHERE backtest_hash = ?",
+        (carrier["val_backtest_hash"],),
+    ).fetchone()
+
+print(f"Validation Sharpe over its {int(carrier_periods)} months:  {carrier_sharpe:.3f}")
+print(f"  the same run re-ranked on common support: {carrier['val_sharpe']:.3f}")
+print(
+    f"Holdout Sharpe over {int(metrics['n_periods'])} months:        "
+    f"{metrics.get('sharpe', float('nan')):.3f}"
+)
+print(
+    f"Holdout: CAGR {metrics.get('cagr', float('nan')):.1%}, "
+    f"max drawdown {metrics.get('max_drawdown', float('nan')):.2%}, "
+    f"win rate {metrics.get('win_rate', float('nan')):.0%}"
+)
+# No trade or turnover figure is reported. The vectorized rebalance path this case study
+# runs does not record one - `num_trades` is NULL for every backtest in this registry,
+# holdout and validation alike - and a zero standing in for an unrecorded count reads as a
+# strategy that never traded.
+
+# %% [markdown]
+# ## What this notebook establishes, and what it does not
+#
+# It establishes a return series for the selected configuration over a period no choice in
+# this case study was made on. That is the only thing a holdout can give, and it is worth
+# less than it looks: one year of monthly rebalances is twelve observations, which is too
+# few to separate a strategy that decayed from one that had an ordinary year.
+#
+# It does not establish that this configuration was the right one to carry here. The
+# selection that brought it was made on validation, over a pool large enough that its
+# maximum is optimistic by construction, and this notebook inherits that pool without
+# correcting for it. The deflation is [`17_strategy_analysis`](17_strategy_analysis.ipynb)'s.
+#
+# The holdout stays re-runnable. If the selection changes, this generation is deleted and
+# another is produced; it is not a resource that has been spent.
+#
+# **Next:** [`17_strategy_analysis`](17_strategy_analysis.ipynb).

@@ -18,20 +18,40 @@ Usage:
     pytest tests/test_case_studies.py -v -k "03_features"
 """
 
-import re
 from pathlib import Path
 
 import pytest
 
+from tests.awaiting_rebuild import unmet_reason
 from tests.pm_helpers import (
+    STAGE_RE,
     current_test_tier,
     get_overrides,
     get_tier,
     missing_required_env,
     run_notebook,
+    stage_sort_key,
 )
 
 REPO_ROOT = Path(__file__).parent.parent
+
+# Stages that completed in THIS pytest session, as `(case_study, stage)`. Module level
+# because it describes the workspace, which the session shares; an xdist worker has its own
+# and will therefore skip what it did not run rather than read another worker's registry.
+_STAGES_RUN_HERE: set[tuple[str, str]] = set()
+
+
+def _required_stages(overrides: dict) -> list[str]:
+    """Stages this notebook needs to have run in the same workspace, from `requires_stage`.
+
+    Accepts one name or a list, so a notebook that reads two upstream tiers does not need a
+    second key.
+    """
+    declared = overrides.get("requires_stage")
+    if not declared:
+        return []
+    return [declared] if isinstance(declared, str) else list(declared)
+
 
 # All case studies
 CASE_STUDIES = [
@@ -46,10 +66,6 @@ CASE_STUDIES = [
     "us_equities_panel",
 ]
 
-# Pattern for numbered pipeline stages — allows optional single-letter suffix
-# (e.g., 10a_pca, 11b_ipca) for per-estimator notebook splits.
-_STAGE_RE = re.compile(r"^\d{2}[a-z]?_")
-
 
 def _collect_case_study_tests():
     """Collect all case study pipeline notebooks as (case_study, stage, path) tuples.
@@ -63,10 +79,10 @@ def _collect_case_study_tests():
         if not cs_dir.exists():
             continue
 
-        for notebook in sorted(cs_dir.glob("[0-9][0-9]*.py")):
+        for notebook in sorted(cs_dir.glob("[0-9][0-9]*.py"), key=stage_sort_key):
             if notebook.name.startswith("_"):
                 continue
-            if not _STAGE_RE.match(notebook.name):
+            if not STAGE_RE.match(notebook.name):
                 continue
             stage = notebook.stem  # e.g., "06_linear" or "11a_pca"
             tests.append((cs, stage, notebook))
@@ -91,6 +107,13 @@ def test_case_study_pipeline(
 
     Each notebook runs independently — intermediates (labels, features,
     predictions, registries) are pre-generated in the test-data repo.
+
+    With one declared exception. A preview downstream stage selects its inputs by execution
+    tier, and the seeded registry holds no preview rows: `tests/conftest.py` records why the
+    preview root is deliberately left empty, having measured that seeding it makes
+    `14_backtest` refuse to rank anything. So those stages read only what an earlier
+    notebook registered in the same workspace, and a notebook that declares
+    `requires_stage` is skipped rather than failed when that stage has not run here.
     """
     # Check case-study-level skip (e.g., "case_studies/nasdaq100_microstructure")
     cs_key = f"case_studies/{case_study}"
@@ -111,6 +134,27 @@ def test_case_study_pipeline(
     if overrides.get("skip"):
         reason = overrides.get("skip_reason", "marked skip in overrides")
         pytest.skip(f"Skipped: {reason}")
+
+    # Inputs the rebuild has not produced yet. Unlike `skip`, this is checked against the
+    # registry every run and stops applying the moment the input exists, so it cannot outlive
+    # its reason; tests/test_awaiting_rebuild.py fails the build on a declaration that has.
+    if declaration := overrides.get("awaiting_rebuild"):
+        if reason := unmet_reason(declaration):
+            pytest.skip(f"{reason} (#{declaration['issue']})")
+
+    # A stage whose inputs exist only in this workspace. See the docstring: seeding the
+    # preview root was measured to do more harm than the gap it fills, so the dependency is
+    # declared instead of removed. A full in-order run satisfies it and is unaffected; a
+    # focused run or one distributed across workers with separate workspaces skips here,
+    # with the prerequisite named, rather than failing several cells in on a refusal that
+    # reads like a broken pipeline.
+    for prerequisite in _required_stages(overrides):
+        if (case_study, prerequisite) not in _STAGES_RUN_HERE:
+            pytest.skip(
+                f"Requires {case_study}::{prerequisite} in the same workspace, which has "
+                f"not run in this session. It registers the preview-tier rows this stage "
+                f"selects, and the seeded registry holds none by design."
+            )
 
     # Credentials the notebook cannot run without.
     if absent := missing_required_env(overrides):
@@ -144,8 +188,11 @@ def test_case_study_pipeline(
         timeout=timeout,
         output_dir=seeded_output_dir,
         data_dir=populated_data_dir,
-        research_preview=True,
+        research_preview=overrides.get("research_preview", True),
     )
+
+    if result["status"] != "error":
+        _STAGES_RUN_HERE.add((case_study, stage))
 
     if result["status"] == "error":
         pytest.fail(

@@ -4,8 +4,12 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import polars as pl
 
 from case_studies.utils.registry import register_prediction_set, register_training_run
 from case_studies.utils.registry.specs import (
@@ -14,6 +18,26 @@ from case_studies.utils.registry.specs import (
 )
 
 from .contracts import ExecutionTier
+
+# Digest verification reads the artifact off disk, and `complete` is evaluated in loops
+# over whole populations - CandidateSet.members and OfficialPopulation both re-check
+# every member, and members is a property, so an unmemoized check re-reads two parquet
+# files per member on every access. Published artifacts are immutable, and the key
+# carries size and nanosecond mtime, so a file that is replaced misses the cache.
+_VERIFIED_ARTIFACT_DIGESTS: dict[tuple[str, int, int], str] = {}
+
+
+def _verified_digest(path: Path, load) -> str:
+    from case_studies.utils.artifact_digest import value_digest
+
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    digest = _VERIFIED_ARTIFACT_DIGESTS.get(key)
+    if digest is None:
+        digest = value_digest(load())
+        _VERIFIED_ARTIFACT_DIGESTS[key] = digest
+    return digest
+
 
 if TYPE_CHECKING:
     from .workspace import Study
@@ -64,6 +88,19 @@ def _stored_source(
         (result_hash, result_kind),
     ).fetchone()
     return ("released", Path(row[0]).resolve()) if row is not None else (default, None)
+
+
+# The fields of :meth:`Result.protocol` that a return horizon is entitled to change. Its
+# complement - `split` and `execution_tier` - must match across any set of results being
+# compared, and a candidate set refuses a member that disagrees on either. This list is a
+# property of what `protocol` returns rather than of any one case study, so it lives beside
+# it; a case study comparing across horizons declares these as `comparable_fields` instead
+# of keeping its own copy.
+HORIZON_DEPENDENT_PROTOCOL_FIELDS: tuple[str, ...] = (
+    "cv",
+    "feature_artifacts",
+    "label_artifact",
+)
 
 
 @dataclass(frozen=True)
@@ -190,7 +227,17 @@ class Result:
 
     @property
     def complete(self) -> bool:
-        return False
+        """Whether this result is whole: registry rows, spec, and artifacts all agree.
+
+        The one predicate. `completeness` answers the same question and says why not,
+        which is what a caller needs in order to report which member failed and in what
+        sense. Every subclass overrides `completeness`, never this.
+        """
+        return self.completeness() is None
+
+    def completeness(self) -> str | None:
+        """None when complete, otherwise one line naming what is missing or disagrees."""
+        return f"{self.kind} {self.hash} has no completeness rule"
 
     def registry_record(self) -> dict[str, Any]:
         table, key = {
@@ -280,10 +327,40 @@ class Result:
 
 @dataclass(frozen=True)
 class TrainingResult(Result):
-    @property
-    def complete(self) -> bool:
-        if self.identity_version not in SUPPORTED_IDENTITY_VERSIONS or not self.spec():
-            return False
+    def fitted_states(self) -> list[Any]:
+        """The per-fold fitted state this run stored, in fold order.
+
+        A run writes what its family needs to reproduce a prediction without refitting, and the
+        shape is the family's own: the linear runner stores a mapping with `model`,
+        `preprocessor` and `feature_names`. This returns those objects unchanged rather than
+        interpreting them, because a caller that asks for fitted state already knows which family
+        it asked about. It is the supported way to read them - the layout under
+        `run_log/training/<hash>/models/` is an implementation detail, and a notebook that opens
+        those files itself is asserting something the registry has not been asked to confirm.
+        """
+        import joblib
+
+        models = self.root / "run_log" / "training" / self.hash / "models"
+        # Fold order, not filename order: a lexicographic sort puts fold_10 before fold_2, and
+        # `us_equities_panel` declares sixteen splits.
+        paths = sorted(models.glob("fold_*.joblib"), key=lambda path: int(path.stem.split("_")[1]))
+        if not paths:
+            raise FileNotFoundError(
+                f"training run {self.hash} stored no fitted state under {models}"
+            )
+        return [joblib.load(path) for path in paths]
+
+    def completeness(self) -> str | None:
+        if self.identity_version not in SUPPORTED_IDENTITY_VERSIONS:
+            return f"identity_version {self.identity_version} is not supported"
+        if not self.spec():
+            return "the registry holds no spec for this training run"
+        spec_path = self.root / "run_log" / "training" / self.hash / "spec.json"
+        try:
+            if json.loads(spec_path.read_text()) != self.spec():
+                return f"{spec_path} disagrees with the registry spec"
+        except (OSError, json.JSONDecodeError):
+            return f"{spec_path} is missing or unreadable"
         with closing(sqlite3.connect(self.root / "run_log" / "registry.db")) as db:
             tables = {
                 row[0]
@@ -312,8 +389,8 @@ class TrainingResult(Result):
                 else []
             )
         if completed_attempt is not None:
-            return True
-        return any(
+            return None
+        if any(
             isinstance(
                 result := Result.open(
                     self.study,
@@ -324,6 +401,11 @@ class TrainingResult(Result):
             )
             and result.complete
             for prediction_hash in prediction_hashes
+        ):
+            return None
+        return (
+            "no completed execution attempt, and none of its "
+            f"{len(prediction_hashes)} prediction sets is complete"
         )
 
 
@@ -342,17 +424,31 @@ class PredictionResult(Result):
                 (self.hash,),
             )
 
-    @property
-    def complete(self) -> bool:
+    def completeness(self) -> str | None:
         coverage = self.coverage()
         prediction_file = self.root / "run_log" / "predictions" / self.hash / "predictions.parquet"
-        if (
-            self.identity_version not in SUPPORTED_IDENTITY_VERSIONS
-            or not coverage
-            or coverage["status"] != "complete"
-            or not prediction_file.is_file()
-        ):
-            return False
+        if self.identity_version not in SUPPORTED_IDENTITY_VERSIONS:
+            return f"identity_version {self.identity_version} is not supported"
+        if not coverage:
+            return "no prediction_coverage row"
+        if coverage["status"] != "complete":
+            return f"prediction_coverage.status is {coverage['status']!r}, not 'complete'"
+        if not prediction_file.is_file():
+            return f"{prediction_file} is missing"
+        # artifact_digest arrived as a nullable column on an existing table, so rows
+        # registered before it exists carry NULL and there is nothing to compare
+        # against. register_prediction_set reads that NULL as "legacy, backfill it"
+        # rather than as a conflict; completeness has to agree, or every prediction in
+        # a pre-existing registry reports incomplete and Lifecycle.lock refuses a
+        # backtest whose artifacts are all present. Rows written since always carry a
+        # digest and are held to it.
+        recorded_digest = coverage.get("artifact_digest")
+        if recorded_digest:
+            try:
+                if _verified_digest(prediction_file, self.load) != recorded_digest:
+                    return f"{prediction_file} does not match its recorded digest"
+            except (OSError, ValueError, pl.exceptions.PolarsError):
+                return f"{prediction_file} could not be read to verify its digest"
         with closing(sqlite3.connect(self.root / "run_log" / "registry.db")) as db:
             headline = db.execute(
                 "SELECT 1 FROM prediction_metrics WHERE prediction_hash = ?", (self.hash,)
@@ -360,7 +456,14 @@ class PredictionResult(Result):
             fold_count = db.execute(
                 "SELECT COUNT(*) FROM fold_metrics WHERE prediction_hash = ?", (self.hash,)
             ).fetchone()[0]
-        return headline is not None and fold_count == coverage["n_folds_expected"]
+        if headline is None:
+            return "no prediction_metrics row"
+        if fold_count != coverage["n_folds_expected"]:
+            return (
+                f"{fold_count} fold_metrics rows against "
+                f"{coverage['n_folds_expected']} folds expected"
+            )
+        return None
 
     def load(self):
         import polars as pl
@@ -368,25 +471,85 @@ class PredictionResult(Result):
         path = self.root / "run_log" / "predictions" / self.hash / "predictions.parquet"
         return pl.read_parquet(path)
 
+    def folds(self):
+        """Return the per-fold metrics registered for this prediction set.
+
+        The headline `ic_mean` is an average over these, so a notebook arguing from the
+        spread across folds - how often the sign changes, how far the folds sit from their
+        own mean, whether the cross-section narrows as the window rolls forward - needs the
+        rows the average was taken over. Reading them back is what keeps such an argument
+        checkable from the published artifact rather than remembered from the output of a
+        fit that a later run reuses instead of repeating.
+        """
+        import polars as pl
+
+        with closing(sqlite3.connect(self.root / "run_log" / "registry.db")) as db:
+            rows = db.execute(
+                "SELECT fold_id, ic, ic_std, n_entities FROM fold_metrics "
+                "WHERE prediction_hash = ? ORDER BY fold_id",
+                (self.hash,),
+            ).fetchall()
+        return pl.DataFrame(rows, schema=["fold_id", "ic", "ic_std", "n_entities"], orient="row")
+
 
 @dataclass(frozen=True)
 class BacktestResult(Result):
-    @property
-    def complete(self) -> bool:
+    def completeness(self) -> str | None:
         record = self.registry_record()
+        spec_path = self.root / "run_log" / "backtest" / self.hash / "spec.json"
+        try:
+            stored_spec = json.loads(spec_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return f"{spec_path} is missing or unreadable"
+        stored_spec.pop("_runtime_backtest_config", None)
+        if stored_spec != self.spec():
+            return f"{spec_path} disagrees with the registry spec"
         prediction = Result.open(
             self.study,
             record["prediction_hash"],
             include_preview=self.execution_tier == ExecutionTier.PREVIEW.value,
         )
-        if not isinstance(prediction, PredictionResult) or not prediction.complete:
-            return False
+        if not isinstance(prediction, PredictionResult):
+            return f"prediction {record['prediction_hash']} is not a registered prediction set"
+        prediction_reason = prediction.completeness()
+        if prediction_reason is not None:
+            return f"its prediction {prediction.hash} is partial: {prediction_reason}"
         returns = self.root / "run_log" / "backtest" / self.hash / "daily_returns.parquet"
         with closing(sqlite3.connect(self.root / "run_log" / "registry.db")) as db:
             metrics = db.execute(
                 "SELECT 1 FROM backtest_metrics WHERE backtest_hash = ?", (self.hash,)
             ).fetchone()
-        return returns.is_file() and metrics is not None
+        # As with prediction_coverage.artifact_digest, artifact_digests_json is NULL on
+        # every backtest_runs row that predates the column. Treat that as "nothing
+        # recorded to verify" and fall back to requiring the returns file, rather than
+        # reporting every pre-existing backtest incomplete.
+        recorded_digests = record.get("artifact_digests_json")
+        if not recorded_digests:
+            if metrics is None:
+                return "no backtest_metrics row"
+            if not returns.is_file():
+                return f"{returns} is missing"
+            return None
+        try:
+            artifact_digests = json.loads(recorded_digests)
+        except (json.JSONDecodeError, TypeError):
+            return "backtest_runs.artifact_digests_json is not readable JSON"
+        if not isinstance(artifact_digests, dict):
+            return "backtest_runs.artifact_digests_json is not an object"
+        if "daily_returns.parquet" not in artifact_digests:
+            return "backtest_runs.artifact_digests_json records no daily_returns.parquet"
+        for filename, expected_digest in artifact_digests.items():
+            path = returns.parent / filename
+            try:
+                if not path.is_file():
+                    return f"{path} is missing"
+                if _verified_digest(path, partial(pl.read_parquet, path)) != expected_digest:
+                    return f"{path} does not match its recorded digest"
+            except (OSError, ValueError, pl.exceptions.PolarsError):
+                return f"{path} could not be read to verify its digest"
+        if metrics is None:
+            return "no backtest_metrics row"
+        return None
 
 
 class ResultsCatalog:
@@ -399,7 +562,25 @@ class ResultsCatalog:
         *,
         execution_tier: str | ExecutionTier = ExecutionTier.CANONICAL,
         runtime_provenance: dict[str, Any] | None = None,
+        started_at: str | None = None,
     ) -> TrainingResult:
+        """Register a training identity. ``started_at`` records when work on it began.
+
+        A training run is registered before it is fitted, because the identity has to exist
+        before anything can be written under it, and ``elapsed_s`` is filled in afterwards by
+        :func:`record_training_cost`. Between those two moments - which for one nasdaq
+        configuration has now been more than seven hours - the row says nothing about
+        whether the fit is running, finished or wedged.
+
+        ``started_at`` closes that. With it, a row whose ``elapsed_s`` is still NULL is
+        legible: a wall clock says how long this configuration has been going, and how that
+        compares to its siblings. Without it the only recoverable timing is
+        ``created_at - started_at`` after the fact, which is what
+        ml4t/agent-workspace#1026 found the whole corpus reduced to.
+
+        Like ``entry_point``, it is a **table column and not part of ``spec``**, so recording
+        it moves no training hash. Nothing here may touch ``computation``.
+        """
         self.study.require_writable()
         tier = ExecutionTier(execution_tier)
         resolved = dict(spec)
@@ -426,7 +607,15 @@ class ResultsCatalog:
             self.study.case_study,
             resolved,
             case_dir=case_dir,
+            # A table column, not part of `resolved`, so recording it moves no training hash.
+            # `spec_json.provenance.entry_point` is a different field naming the runner module
+            # (`case_studies.utils.linear`); this one names the notebook.
+            entry_point=self.study.entry_point,
             runtime_provenance=runtime_provenance,
+            # Defaulted here rather than at every call site: a caller that forgets it should
+            # still leave a legible row, and "when the identity was registered" is within
+            # seconds of "when work on it began" on every path that registers before fitting.
+            started_at=started_at or datetime.now(UTC).isoformat(),
         )
         result = Result.open(
             self.study,
@@ -484,6 +673,33 @@ class ResultsCatalog:
         )
         assert isinstance(result, PredictionResult)
         return result
+
+    def partial_members(
+        self, result_hashes, *, include_preview: bool = False
+    ) -> list[tuple[str, str]]:
+        """The hashes among `result_hashes` that are not whole, each with its reason.
+
+        Guard a freeze with this, not with the `complete` column that `table()` carries.
+        The column is derived from the registry alone: it asserts that the identity is
+        current, that coverage says complete, that the metric rows are there and the fold
+        count matches, and that the artifact file exists. `Result.complete` asserts all of
+        that and then reads disk - spec.json against the registry spec, every recorded
+        artifact digest against the file, and, for a backtest, the same of the prediction
+        it ran on. The column is therefore necessary and not sufficient, and a notebook
+        guarding on it can pass and still have `CandidateSet.create` refuse the same rows
+        several cells later.
+
+        Reading disk here costs nothing extra: the freeze reads the same files moments
+        later, and `_VERIFIED_ARTIFACT_DIGESTS` memoizes each one. What it buys is the
+        refusal arriving in the cell that can name the rows.
+        """
+        partial = []
+        for result_hash in result_hashes:
+            result = self.open(result_hash, include_preview=include_preview)
+            reason = result.completeness()
+            if reason is not None:
+                partial.append((result_hash, reason))
+        return partial
 
     def open(self, result_hash: str, *, include_preview: bool = False) -> Result:
         return Result.open(self.study, result_hash, include_preview=include_preview)

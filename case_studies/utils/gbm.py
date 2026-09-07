@@ -52,27 +52,32 @@ import yaml
 from ml4t.diagnostic.metrics import cross_sectional_ic
 
 from case_studies.research.contracts import ExecutionTier
-from case_studies.research.cv import require_fold_scoped_temporal_compatibility
+from case_studies.research.cv import (
+    require_fold_scoped_temporal_compatibility,
+    require_fold_scoped_temporal_holdout_coverage,
+)
 from case_studies.research.identity import ResolvedSpec
 from case_studies.research.models import ModelRun
 from case_studies.research.recovery import ExecutionAttempt, ExecutionLedger
 from case_studies.research.results import PredictionResult, Result, TrainingResult
 from case_studies.utils.artifact_digest import value_digest
+from case_studies.utils.derived_params import quantize_derived
+from case_studies.utils.folds import (
+    FOLD_PREPARATION_VERSION,
+    prepare_gbm_folds_from_mds,
+    training_labels_for_split,
+)
 from case_studies.utils.registry import prediction_hash_from_parts, training_hash_from_spec
 from case_studies.utils.registry.specs import canonical_json
+from case_studies.utils.runtime import cpu_seconds, resource_measurement
 from utils.modeling import RANDOM_SEED, seed_everything
 
 if TYPE_CHECKING:
     from case_studies.research.workspace import Study
 
 
-_GBM_PREVIEW_FIELDS = {
-    "checkpoint_interval",
-    "folds",
-    "max_iterations",
-    "max_symbols",
-    "train_sample_frac",
-}
+from case_studies.utils.preview_fields import GBM_PREVIEW_FIELDS as _GBM_PREVIEW_FIELDS
+
 _GBM_REQUEST_FIELDS = {
     "checkpoint_interval",
     "device",
@@ -96,6 +101,10 @@ class GBMContext:
     class_values: tuple[Any, ...]
     expected_keys: pl.DataFrame
     runtime_provenance: dict[str, Any]
+    device: str
+    num_threads: int
+    prediction_split: str = "validation"
+    published_checkpoints: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -117,6 +126,7 @@ class _GBMBatchCandidate:
     fitted_folds: list[int] = field(default_factory=list)
     fit_elapsed_s: float = 0.0
     started_at_s: float = 0.0
+    started_cpu_s: float = 0.0
     result: ModelRun | None = None
     error: Exception | None = None
 
@@ -231,7 +241,21 @@ _SKIP_PARAMS: dict[str, set[str]] = {
 _BEST_GPU: dict[str, str | None] = {}
 
 DEFAULT_GBM_CPU_THREADS = 8
-GBM_DEFAULT_MAX_BIN = 63
+# What every case study's setup.yaml declares under modeling.gbm.max_bin. It is LightGBM's own
+# default; the 63 that preceded it was inherited from a device branch rather than declared, and
+# the populations fitted under it are superseded.
+GBM_DEFAULT_MAX_BIN = 255
+
+# Declared behaviour of this runner. Bump when a change here would change a fitted result: the
+# libraries it dispatches to, how a parameter is derived, the fitting procedure, the checkpoint
+# schedule, or what is predicted. Do not bump for logging, comments, refactoring or anything a run
+# merely records.
+GBM_RUNNER_VERSION = 1
+
+# What a fold is cast to before it reaches the booster. No imputation and no scaling: a tree splits
+# on the ordering of a feature and routes a missing value down its own branch, so both would only
+# fabricate observations. Bump when that casting changes.
+GBM_PREPROCESSING_ID = "lightgbm-native-float32/v1"
 
 
 def _best_gpu_device(library: str) -> str | None:
@@ -1432,12 +1456,25 @@ def _gbm_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _gbm_source_identity() -> dict[str, str]:
-    from utils import modeling
+def _gbm_source_identity() -> dict[str, int | str]:
+    """The behaviour of this runner, declared rather than fingerprinted.
 
-    assert modeling.__file__ is not None
-    paths = (Path(__file__), Path(modeling.__file__))
-    return {path.name: _gbm_sha256(path) for path in paths}
+    This used to be the SHA-256 of ``gbm.py`` and ``utils/modeling.py``. ``gbm.py`` is nearly three
+    thousand lines, so every edit to any part of it - a comment, a log line, a fix to a function no
+    boosted tree ever calls - invalidated every GBM result ever registered. That is unworkable
+    against the rule that a fix which does not change a result must not force a refit.
+
+    What replaces it is a declaration. ``GBM_RUNNER_VERSION`` is bumped when a change to this module
+    would change a fitted result, ``FOLD_PREPARATION_VERSION`` covers the shared fold preparation
+    the same way, and ``GBM_PREPROCESSING_ID`` names the cast applied to a fold.
+    ``tests/test_gbm_identity.py`` pins the predictions these versions claim to describe and fails
+    when they move without a bump, so the declaration is checked rather than trusted.
+    """
+    return {
+        "gbm_runner": GBM_RUNNER_VERSION,
+        "fold_preparation": FOLD_PREPARATION_VERSION,
+        "preprocessing": GBM_PREPROCESSING_ID,
+    }
 
 
 def _gbm_runtime_identity() -> dict[str, str]:
@@ -1447,7 +1484,9 @@ def _gbm_runtime_identity() -> dict[str, str]:
     }
 
 
-def _gbm_runtime_provenance(study: Study, device: str) -> dict[str, Any]:
+def _gbm_runtime_provenance(
+    study: Study, device: str, *, notebook: str | None = None
+) -> dict[str, Any]:
     try:
         commit = subprocess.check_output(
             ["git", "-C", str(study.release_root), "rev-parse", "HEAD"],
@@ -1470,6 +1509,14 @@ def _gbm_runtime_provenance(study: Study, device: str) -> dict[str, Any]:
     if device == "cuda":
         record["cuda_runtime"] = torch.version.cuda
         record["gpu"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    # `notebook_path` says which notebook produced a row; `entry_point` says which module ran.
+    # Different questions, and the module is legitimately shared - several notebooks call this one,
+    # so `entry_point` cannot name a notebook and should not try. Both sit in
+    # `registry/specs.py:_V2_PROVENANCE_FIELDS`, so neither reaches the training identity. Absent
+    # when the caller names no notebook: a holdout reconstruction is not a notebook run, and a
+    # wrong notebook name would be worse than none.
+    if notebook:
+        record["notebook_path"] = notebook
     return record
 
 
@@ -1544,8 +1591,14 @@ def _validate_lightgbm_params(params: dict[str, Any]) -> None:
 
 
 def _scaled_huber_alpha(scale: float, labels: np.ndarray) -> float:
-    """Resolve LightGBM's residual-unit Huber delta from one training fold."""
-    return max(scale * float(np.nanstd(labels)), float(np.finfo(np.float32).eps))
+    """Resolve LightGBM's residual-unit Huber delta from one training fold.
+
+    Quantized for the reason in :mod:`case_studies.utils.derived_params`: the delta is computed
+    from the training labels, so its last digits carry the reduction order rather than
+    information, and an unrounded value gives one declared configuration two training identities.
+    """
+    delta = max(scale * float(np.nanstd(labels)), float(np.finfo(np.float32).eps))
+    return quantize_derived(delta)
 
 
 def _gbm_effective_params_by_fold(
@@ -1588,7 +1641,7 @@ def _load_gbm_request_config(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     from utils.modeling import load_configs
 
-    configs = load_configs(study.case_study, label, family="gbm")
+    configs = load_configs(study.case_study, label, family="gbm", case_dir=study.root)
     matches = [config for config in configs if config["config_name"] == config_name]
     if len(matches) != 1:
         raise ValueError(f"unknown GBM config {config_name!r}")
@@ -1759,7 +1812,7 @@ def _build_gbm_resolved_request(
     }
     if tier is ExecutionTier.PREVIEW:
         computation["preview_reductions"] = reductions
-    runtime_provenance = _gbm_runtime_provenance(study, device)
+    runtime_provenance = _gbm_runtime_provenance(study, device, notebook=request.get("notebook"))
     spec = ResolvedSpec.create(
         family="gbm",
         label=label_ref.name,
@@ -1781,6 +1834,8 @@ def _build_gbm_resolved_request(
         class_values=tuple(mds.class_values),
         expected_keys=expected,
         runtime_provenance=runtime_provenance,
+        device=device,
+        num_threads=int(next(iter(effective.values()))["num_threads"]),
     )
     return spec, context
 
@@ -1824,7 +1879,7 @@ def _gbm_compatibility_key(study: Study, request: dict[str, Any]) -> str:
             "device": device,
             "max_bin": max_bin,
             "num_threads": num_threads,
-            "preprocessing": "lightgbm-native-float32/v1",
+            "preprocessing": GBM_PREPROCESSING_ID,
         }
     )
 
@@ -1832,21 +1887,8 @@ def _gbm_compatibility_key(study: Study, request: dict[str, Any]) -> str:
 def resolve_model_request(study: Study, request: dict[str, Any]):
     base = _load_gbm_batch_base(study, request)
     mds = base["mds"]
-    folds = prepare_gbm_folds(
-        base["dataset_pd"],
-        base["splits"],
-        mds.feature_names,
-        mds.label_col,
-        mds.date_col,
-        mds.entity_cols[0],
-        task_type=mds.task_type,
-        class_values=mds.class_values,
-        temporal_by_fold=mds.temporal_by_fold,
-        temporal_keys=mds.temporal_keys,
-        temporal_feature_names=mds.temporal_feature_names,
-        train_sample_frac=base["train_sample_frac"],
-        eval_label_col=mds.eval_label_col,
-        seed=RANDOM_SEED,
+    folds = prepare_gbm_folds_from_mds(
+        mds, base["splits"], train_sample_frac=base["train_sample_frac"]
     )
     if len(folds) != len(base["splits"]) or any(
         not fold["n_train"] or not fold["n_val"] for fold in folds
@@ -1879,6 +1921,305 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
         folds=tuple(folds),
         device=device,
     )
+
+
+def _gbm_fold_invariant_params(
+    recorded: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
+    """The parameters every recorded fold agreed on, and whether the Huber delta varied.
+
+    Almost every LightGBM parameter comes from the preset and is the same on every fold.
+    The one exception is ``alpha`` under a ``huber`` objective without a declared alpha:
+    :func:`_scaled_huber_alpha` resolves it from the fold's own training labels, so it is a
+    different number on every fold and cannot be carried across one.
+
+    Anything else differing between folds means the recorded parameters were not produced by
+    the rule this understands, and re-keying them would invent a configuration nobody ran. So
+    it refuses and names the parameters, rather than picking one fold's values.
+    """
+    if not isinstance(recorded, dict) or not recorded:
+        raise ValueError("GBM training spec records no effective parameters to re-key")
+    witness = dict(recorded[sorted(recorded)[0]])
+    divergent = {
+        name
+        for fold_params in recorded.values()
+        for name in set(witness) | set(fold_params)
+        if witness.get(name) != fold_params.get(name)
+    }
+    unexpected = divergent - {"alpha"}
+    if unexpected:
+        raise ValueError(
+            f"GBM parameters differ across the recorded folds in {sorted(unexpected)}. Only the "
+            "Huber delta is derived per fold, so there is no rule here that reproduces these on "
+            "the holdout fold, and carrying one fold's values forward would evaluate a "
+            "configuration that was never ranked."
+        )
+    return witness, "alpha" in divergent
+
+
+def rekey_holdout_spec(
+    study: Study,
+    spec: dict[str, Any],
+    *,
+    validation_spec: dict[str, Any],
+) -> None:
+    """Recompute the fold-derived fields against the holdout fold, in place.
+
+    ``spec`` arrives with its CV already replaced by the single derived holdout fold, and with
+    ``expected_prediction_keys`` and ``effective_params_by_fold`` still describing the
+    VALIDATION folds. :func:`reconstruct_locked_request` checks both against the holdout fold
+    before it will build a request, so carrying them forward produces a spec that fails at
+    execution. They have to be recomputed.
+
+    The eligibility manifest is recomputed from the dataset over the holdout window, by the
+    same call the validation request used.
+
+    The parameters are re-keyed rather than re-derived from the preset, which is the same
+    choice :func:`reconstruct_locked_request` makes and for the same reason: a request can
+    carry overrides the spec does not record separately, so a preset reloaded by name is not
+    guaranteed to be the configuration that ran. What the spec does record is every fold's
+    resolved parameters, and those are enough - see :func:`_gbm_fold_invariant_params` for
+    what varies across folds and what refuses.
+    """
+    from case_studies.research.models import locked_holdout_split
+    from utils.modeling import load_modeling_dataset
+
+    computation = spec["computation"]
+    label_ref = study.labels.get(spec["label"], execution_tier=ExecutionTier.CANONICAL)
+    mds = load_modeling_dataset(study.case_study, label_ref.name, max_symbols=0)
+    if mds.date_col != "timestamp" or not mds.entity_cols:
+        raise ValueError("GBM holdout re-keying requires timestamp and an entity key")
+
+    split = locked_holdout_split(spec, mds.dataset, mds.date_col, study.case_study)
+    expected = _gbm_expected_keys_from_dataset(mds, [split])
+    computation["expected_prediction_keys"] = {
+        "digest": value_digest(expected, ("symbol", "timestamp", "fold")),
+        "n_rows": expected.height,
+        "n_folds": expected.get_column("fold").n_unique(),
+    }
+
+    model = computation.get("model")
+    if not isinstance(model, dict) or "effective_params_by_fold" not in model:
+        return
+    recorded = model["effective_params_by_fold"]
+    if isinstance(recorded, dict):
+        declared = {
+            str(int(fold["fold"]))
+            for fold in validation_spec["computation"]["cv"]["folds"]
+            if isinstance(fold, dict)
+        }
+        stray = set(recorded) - declared
+        if stray:
+            raise ValueError(
+                f"GBM spec records parameters for folds {sorted(stray)}, which the validation CV "
+                "does not declare. These are not the validation folds this re-keys from."
+            )
+    params, alpha_is_fold_derived = _gbm_fold_invariant_params(recorded)
+
+    if alpha_is_fold_derived:
+        scale = model.get("huber_alpha_scale")
+        if params.get("objective") != "huber" or scale is None:
+            raise ValueError(
+                "GBM alpha varies across the recorded folds but the spec declares no "
+                "huber_alpha_scale to re-derive it from, so the holdout delta cannot be "
+                "computed by the rule that produced the validation ones"
+            )
+        # The same selection the request planner derives its own thresholds from
+        # (`_gbm_sampled_training_labels`), and for the reason recorded there: reading the
+        # labels through fold preparation casts them to LightGBM's float32, which quantizes
+        # to a different delta than the float64 labels validation resolved its alpha from,
+        # and one declared configuration would then carry two identities. It also reads the
+        # labels without materializing the fold's feature matrix.
+        labels = training_labels_for_split(mds, split, train_sample_frac=1.0, seed=RANDOM_SEED)
+        if not len(labels):
+            raise ValueError("GBM holdout fold has no training labels to re-derive the Huber delta")
+        params["alpha"] = _scaled_huber_alpha(float(scale), labels)
+
+    _validate_lightgbm_params(params)
+    model["effective_params_by_fold"] = {str(int(split["fold"])): params}
+
+
+def reconstruct_locked_request(
+    study: Study,
+    spec: dict[str, Any],
+    *,
+    checkpoint_kind: str,
+    checkpoint_value: int | None,
+):
+    """Reconstruct a GBM holdout fit without loading the named preset."""
+    from case_studies.research.models import (
+        ResolvedModelRequest,
+        locked_holdout_split,
+        validate_locked_expected_keys,
+    )
+    from utils.modeling import load_modeling_dataset
+
+    if checkpoint_kind != "iteration" or checkpoint_value is None:
+        raise ValueError("GBM holdout requires one locked iteration checkpoint")
+    study.require_writable()
+    study.activate(ExecutionTier.CANONICAL)
+    if spec.get("seed") != RANDOM_SEED:
+        raise ValueError("locked GBM seed cannot be reproduced")
+    computation = spec["computation"]
+    if computation.get("sampling") != {"train_sample_frac": 1.0, "max_symbols": 0}:
+        raise ValueError("locked GBM holdout requires an unreduced canonical dataset")
+    label_ref = study.labels.get(spec["label"], execution_tier=ExecutionTier.CANONICAL)
+    mds = load_modeling_dataset(study.case_study, label_ref.name, max_symbols=0)
+    if mds.date_col != "timestamp" or not mds.entity_cols:
+        raise ValueError("locked GBM runner requires timestamp and an entity key")
+    entity_col = mds.entity_cols[0]
+    if entity_col not in {"product", "symbol"}:
+        raise ValueError(f"locked GBM runner does not support entity key {entity_col!r}")
+    expected_inputs = {
+        "label_artifact": {"digest": label_ref.digest, "name": label_ref.name},
+        "feature_artifacts": mds.input_lineage["artifacts"],
+        "feature_names": list(mds.feature_names),
+        "input_data_spec": mds.input_lineage,
+        "source_identity": _gbm_source_identity(),
+        "runtime_identity": _gbm_runtime_identity(),
+        "task": {
+            "type": mds.task_type,
+            "class_values": list(mds.class_values),
+            "continuous_eval_label": label_ref.definition.continuous_eval_label,
+        },
+    }
+    for name, expected_value in expected_inputs.items():
+        if computation.get(name) != expected_value:
+            raise ValueError(f"locked GBM {name} does not match the available computation")
+    schedule = computation.get("checkpoint_schedule")
+    if not isinstance(schedule, list) or not schedule:
+        raise ValueError("locked GBM checkpoint schedule is missing")
+    declared = tuple(
+        int(item["value"])
+        for item in schedule
+        if item.get("kind") == "iteration" and item.get("value") is not None
+    )
+    model = computation.get("model")
+    reproduced_schedule = (
+        gbm_checkpoint_iterations(
+            {
+                "max_iterations": int(model["max_iterations"]),
+                "checkpoint_interval": declared[0],
+            }
+        )
+        if declared and isinstance(model, dict) and model.get("max_iterations") is not None
+        else ()
+    )
+    if (
+        len(declared) != len(schedule)
+        or checkpoint_value not in declared
+        or declared != reproduced_schedule
+    ):
+        raise ValueError("locked GBM checkpoint is absent from its exact schedule")
+
+    split = locked_holdout_split(spec, mds.dataset, mds.date_col, study.case_study)
+    if mds.temporal_by_fold is not None and mds.temporal_keys and mds.temporal_feature_names:
+        # Coverage, not fold-boundary compatibility - the same branch
+        # `latent_factors/adapter.py` takes on this path, and for the same reason.
+        # Compatibility asks whether the stage-04 artifact declares a fold with this geometry.
+        # For a holdout that question has no good answer: the holdout fold is derived after
+        # stage 04 ran, so the artifact never declares it, and it cannot be rebuilt to declare
+        # it without changing the sha256 the selection was made under. Asking it here refused
+        # every holdout refit on a gbm-carried case study with fold-scoped model-based
+        # features - measured on etfs, whose carrier is `gbm/default_mae`, with
+        # "custom CV is incompatible with fold-scoped temporal features".
+        #
+        # The features are joined by (entity, date), so what the run needs is rows spanning
+        # the dates it trains and evaluates on, not a fold labelled for it. That is what
+        # `require_fold_scoped_temporal_holdout_coverage` asks, and its docstring already said
+        # this was the question to ask - it just had no caller on this family.
+        #
+        # What coverage cannot check, and where the guarantee actually comes from. A producer
+        # declares its rolling folds 0..N-1 in `temporal_artifact_splits` and appends the
+        # holdout rows as fold N without declaring that fold's geometry, so the boundary its
+        # holdout rows were fitted under is not in the artifact for anything here to verify.
+        # It is enforced upstream instead: `case_studies/etfs/04_model_based_features.py:345`
+        # asserts `train_end <= HOLDOUT_START` over `all_folds`, the holdout fold included, with
+        # the message "fold N estimates parameters from sessions inside the holdout". That
+        # source is inside the sha256 the artifact is pinned by, so the property is pinned even
+        # though the declaration is missing. Filed as a gap in what the artifact can attest.
+        #
+        # One difference that is not a leak and is easy to read as one: the model's training
+        # window ends a label buffer earlier than the feature estimator's, because the buffer
+        # pulls the label cutoff back. So features on the model's training rows embed sessions
+        # after its label cutoff and before the holdout opens - fresher than the labels beside
+        # them, and drawn entirely from outside the evaluated window, so they cannot move the
+        # holdout number.
+        require_fold_scoped_temporal_holdout_coverage(
+            split,
+            mds.temporal_by_fold,
+            source_timeline=mds.dataset.get_column(mds.date_col),
+            date_col=mds.date_col,
+        )
+    expected = _gbm_expected_keys_from_dataset(mds, [split])
+    validate_locked_expected_keys(spec, expected)
+    folds = prepare_gbm_folds(
+        mds.dataset.to_pandas(),
+        [split],
+        mds.feature_names,
+        mds.label_col,
+        mds.date_col,
+        entity_col,
+        task_type=mds.task_type,
+        class_values=mds.class_values,
+        temporal_by_fold=mds.temporal_by_fold,
+        temporal_keys=mds.temporal_keys,
+        temporal_feature_names=mds.temporal_feature_names,
+        train_sample_frac=1.0,
+        eval_label_col=mds.eval_label_col,
+        seed=RANDOM_SEED,
+    )
+    if len(folds) != 1 or not folds[0]["n_train"] or not folds[0]["n_val"]:
+        raise ValueError("locked GBM holdout fold could not be prepared")
+    if not isinstance(model, dict):
+        raise ValueError("locked GBM model specification is missing")
+    fold_id = str(split["fold"])
+    effective = model.get("effective_params_by_fold")
+    if not isinstance(effective, dict) or set(effective) != {fold_id}:
+        raise ValueError("locked GBM model must declare parameters for the holdout fold")
+    _validate_lightgbm_params(effective[fold_id])
+    locked_runtime = effective[fold_id]
+    device = "cpu" if locked_runtime.get("device_type") == "cpu" else "cuda"
+    num_threads = int(locked_runtime.get("num_threads", 0))
+    reproduced_runtime = lightgbm_runtime_params(
+        device,
+        num_threads=num_threads,
+        seed=int(spec["seed"]),
+    )
+    if any(locked_runtime.get(name) != value for name, value in reproduced_runtime.items()):
+        raise ValueError("locked GBM runtime parameters cannot be reproduced")
+    if (
+        model.get("class") != "lightgbm.Booster"
+        or model.get("implementation") != "lightgbm"
+        or set(model)
+        != {
+            "class",
+            "implementation",
+            "effective_params_by_fold",
+            "huber_alpha_scale",
+            "max_iterations",
+        }
+        or int(model["max_iterations"]) < int(checkpoint_value)
+    ):
+        raise ValueError("locked GBM model specification is unsupported")
+    context = GBMContext(
+        folds=(folds[0],),
+        fold_ids=(int(split["fold"]),),
+        feature_names=tuple(mds.feature_names),
+        label_col=mds.label_col,
+        eval_label_col=mds.eval_label_col,
+        date_col=mds.date_col,
+        entity_col=entity_col,
+        task_type=mds.task_type,
+        class_values=tuple(mds.class_values),
+        expected_keys=expected,
+        runtime_provenance=_gbm_runtime_provenance(study, device),
+        device=device,
+        num_threads=num_threads,
+        prediction_split="holdout",
+        published_checkpoints=(int(checkpoint_value),),
+    )
+    return ResolvedModelRequest(study, "gbm", spec, context)
 
 
 def _gbm_manifest_files(model_dir: Path) -> dict[str, str]:
@@ -1919,6 +2260,9 @@ def _cached_model_run(study: Study, spec: dict[str, Any], context: GBMContext):
 
     include_preview = spec["execution_tier"] == "preview"
     training_hash = training_hash_from_spec(spec)
+    published = context.published_checkpoints or tuple(
+        int(item["value"]) for item in spec["computation"]["checkpoint_schedule"]
+    )
     try:
         training = Result.open(study, training_hash, include_preview=include_preview)
         predictions = tuple(
@@ -1926,14 +2270,14 @@ def _cached_model_run(study: Study, spec: dict[str, Any], context: GBMContext):
                 study,
                 prediction_hash_from_parts(
                     training_hash,
-                    checkpoint["value"],
-                    "validation",
+                    checkpoint,
+                    context.prediction_split,
                     checkpoint_kind="iteration",
                     identity_version=spec["identity_version"],
                 ),
                 include_preview=include_preview,
             )
-            for checkpoint in spec["computation"]["checkpoint_schedule"]
+            for checkpoint in published
         )
     except KeyError:
         return None
@@ -2033,7 +2377,7 @@ def _predict_from_gbm_models(
     ]
     return {
         "learning_curves": _learning_curves_from_predictions(
-            spec["config_name"],
+            str(spec.get("config_name") or f"locked-{training_hash_from_spec(spec)}"),
             predictions,
             checkpoints,
         ),
@@ -2051,19 +2395,16 @@ def _write_learning_curves(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _gbm_sampled_training_labels(base: dict[str, Any], split: dict[str, Any]) -> np.ndarray:
-    mds = base["mds"]
-    dataset = base["dataset_pd"]
-    dates = dataset[mds.date_col]
-    mask = (dates >= split["train_start"]) & (dates <= split["train_end"])
-    labels = dataset.loc[mask, mds.label_col].values.astype(np.float32)
-    labels = labels[~np.isnan(labels)]
-    train_sample_frac = base["train_sample_frac"]
-    if 0.0 < train_sample_frac < 1.0 and len(labels) > 0:
-        n_keep = max(1, int(len(labels) * train_sample_frac))
-        rng = np.random.default_rng(RANDOM_SEED + int(split["fold"]))
-        keep_idx = rng.choice(len(labels), size=n_keep, replace=False)
-        keep_idx.sort()
-        labels = labels[keep_idx]
+    """The training labels Huber's threshold is derived from, as the fold will actually see them.
+
+    This used to re-select the rows itself, in pandas, casting to float32. It agreed with fold
+    preparation until preparation stopped casting labels, and then the planner and the resolver
+    derived two different thresholds for one declared configuration and gave it two identities.
+    Both now come from the one selection, so they cannot drift apart again.
+    """
+    labels = training_labels_for_split(
+        base["mds"], split, train_sample_frac=base["train_sample_frac"], seed=RANDOM_SEED
+    )
     if not len(labels):
         raise ValueError(f"GBM request has no training labels for fold {split['fold']}")
     return labels
@@ -2105,25 +2446,13 @@ def _gbm_effective_params_for_splits(
 
 
 def _prepare_gbm_batch_fold(base: dict[str, Any], split: dict[str, Any]) -> dict[str, Any]:
-    mds = base["mds"]
-    folds = prepare_gbm_folds(
-        base["dataset_pd"],
-        [split],
-        mds.feature_names,
-        mds.label_col,
-        mds.date_col,
-        mds.entity_cols[0],
-        task_type=mds.task_type,
-        class_values=mds.class_values,
-        temporal_by_fold=mds.temporal_by_fold,
-        temporal_keys=mds.temporal_keys,
-        temporal_feature_names=mds.temporal_feature_names,
-        train_sample_frac=base["train_sample_frac"],
-        eval_label_col=mds.eval_label_col,
-        seed=RANDOM_SEED,
+    folds = prepare_gbm_folds_from_mds(
+        base["mds"], [split], train_sample_frac=base["train_sample_frac"]
     )
-    if len(folds) != 1 or not folds[0]["n_train"] or not folds[0]["n_val"]:
+    if len(folds) != 1 or int(folds[0]["fold"]) != int(split["fold"]):
         raise ValueError(f"GBM request could not prepare fold {split['fold']}")
+    if not folds[0]["n_train"] or not folds[0]["n_val"]:
+        raise ValueError(f"GBM request prepared fold {split['fold']} empty")
     return folds[0]
 
 
@@ -2315,6 +2644,7 @@ def _resolve_gbm_batch_candidate(
         candidate.result = cached
         return
     candidate.started_at_s = time.perf_counter()
+    candidate.started_cpu_s = cpu_seconds()
     candidate.training = study.results.register_training(
         spec,
         execution_tier=spec["execution_tier"],
@@ -2379,6 +2709,31 @@ def _run_gbm_batch_fold(candidate: _GBMBatchCandidate, fold: dict[str, Any]) -> 
     (candidate.reused_folds if reused else candidate.fitted_folds).append(fold_id)
 
 
+def _record_gbm_runtime(
+    study: Study,
+    training: TrainingResult,
+    *,
+    elapsed_s: float,
+    cpu_s: float | None = None,
+    fit_s: float | None = None,
+) -> None:
+    """Record what this training run cost, against its registry row.
+
+    Wall time on its own cannot tell a run that saturated the machine from one that spent the
+    time waiting, so CPU seconds and the ratio between them go with it, and peak resident memory
+    decides whether two notebooks can share the machine. Every GBM row had these NULL, which is
+    what made the boosting families unschedulable from recorded cost.
+    """
+    from case_studies.utils.registry.registration import record_training_runtime
+
+    record_training_runtime(
+        study.case_study,
+        training.hash,
+        case_dir=training.root,
+        measured=resource_measurement(elapsed_s=elapsed_s, cpu_s=cpu_s, fit_s=fit_s),
+    )
+
+
 def _finish_gbm_batch_candidate(study: Study, candidate: _GBMBatchCandidate) -> None:
     if candidate.result is not None or candidate.error is not None:
         return
@@ -2431,9 +2786,14 @@ def _finish_gbm_batch_candidate(study: Study, candidate: _GBMBatchCandidate) -> 
         candidate.attempt.finish("completed", diagnostics)
         candidate.attempt = None
         runtime_path = curves_path.with_name("runtime.json")
-        _write_gbm_runtime_fields(
-            runtime_path,
-            elapsed_s=time.perf_counter() - candidate.started_at_s,
+        elapsed_s = time.perf_counter() - candidate.started_at_s
+        _write_gbm_runtime_fields(runtime_path, elapsed_s=elapsed_s)
+        _record_gbm_runtime(
+            study,
+            candidate.training,
+            elapsed_s=elapsed_s,
+            cpu_s=cpu_seconds() - candidate.started_cpu_s,
+            fit_s=candidate.fit_elapsed_s,
         )
         candidate.result = ModelRun(
             candidate.training,
@@ -2685,6 +3045,7 @@ def run_resolved_request(study: Study, spec: dict[str, Any], context: GBMContext
     if cached is not None:
         return cached
     started = time.perf_counter()
+    started_cpu = cpu_seconds()
     computation = spec["computation"]
     training = study.results.register_training(
         spec,
@@ -2697,20 +3058,25 @@ def run_resolved_request(study: Study, spec: dict[str, Any], context: GBMContext
         if not _valid_gbm_model_dir(model_dir, context):
             raise ValueError(f"partial fitted-state directory requires inspection: {model_dir}")
         result = _predict_from_gbm_models(model_dir, spec, context)
+        reused_folds = sorted(context.fold_ids)
+        fitted_folds: list[int] = []
     else:
         staging = train_dir / f".models.{uuid.uuid4().hex}.tmp"
         staging.mkdir(parents=True)
         try:
             result = train_gbm_config(
                 {
-                    "config_name": spec["config_name"],
+                    "config_name": str(
+                        spec.get("config_name") or f"locked-{training_hash_from_spec(spec)}"
+                    ),
                     "max_iterations": computation["model"]["max_iterations"],
                     "checkpoint_interval": computation["checkpoint_schedule"][0]["value"],
                     "params": {},
                 },
                 list(context.folds),
                 feature_names=list(context.feature_names),
-                device="cpu",
+                device=context.device,
+                num_threads=context.num_threads,
                 entity_col=context.entity_col,
                 date_col=context.date_col,
                 task_type=context.task_type,
@@ -2723,16 +3089,20 @@ def run_resolved_request(study: Study, spec: dict[str, Any], context: GBMContext
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
+        reused_folds = []
+        fitted_folds = sorted(context.fold_ids)
     prediction_results = []
-    for checkpoint in computation["checkpoint_schedule"]:
-        value = int(checkpoint["value"])
+    published = context.published_checkpoints or tuple(
+        int(item["value"]) for item in computation["checkpoint_schedule"]
+    )
+    for value in published:
         frame = _gbm_prediction_frame(result["predictions"], value, context)
         prediction_results.append(
             study.results.publish_predictions(
                 training,
                 checkpoint_kind="iteration",
                 checkpoint_value=value,
-                split="validation",
+                split=context.prediction_split,
                 predictions=frame,
                 expected_keys=context.expected_keys,
                 task_type=context.task_type,
@@ -2744,11 +3114,77 @@ def run_resolved_request(study: Study, spec: dict[str, Any], context: GBMContext
     curves_path = train_dir / "learning_curves.parquet"
     if not curves_path.exists() and result["learning_curves"]:
         _write_learning_curves(curves_path, result["learning_curves"])
+    elapsed_s = time.perf_counter() - started
     runtime_path = train_dir / "runtime.json"
     if runtime_path.exists():
         runtime = json.loads(runtime_path.read_text())
-        runtime["elapsed_s"] = time.perf_counter() - started
+        runtime["elapsed_s"] = elapsed_s
         temporary = runtime_path.with_name(f".{runtime_path.name}.{uuid.uuid4().hex}.tmp")
         temporary.write_text(json.dumps(runtime, indent=2, sort_keys=True) + "\n")
         os.replace(temporary, runtime_path)
-    return ModelRun(training=training, predictions=tuple(prediction_results))
+    # The artifact above is not queryable, and the schedule reads the column. Both are written:
+    # a resolved request runs through here rather than through the batch path, so recording it
+    # only there left every row this path produced with a NULL elapsed_s.
+    _record_gbm_runtime(study, training, elapsed_s=elapsed_s, cpu_s=cpu_seconds() - started_cpu)
+    # Every other GBM path reports which folds it fitted and which it reused, and so does the
+    # linear runner's single-request path (linear.py:1498-1502). This one returned no diagnostics
+    # at all, so `execution.diagnostics` came back as {"status", "training_hash"} and a notebook
+    # reading `item["fitted_folds"]` raised KeyError rather than reporting the run.
+    return ModelRun(
+        training=training,
+        predictions=tuple(prediction_results),
+        diagnostics={
+            "cache_hit": False,
+            "reused_folds": reused_folds,
+            "fitted_folds": fitted_folds,
+        },
+    )
+
+
+def validate_locked_run(
+    study: Study,
+    spec: dict[str, Any],
+    context: GBMContext,
+    run: ModelRun,
+) -> str:
+    """Validate the selected prediction and every persisted GBM booster digest."""
+    if run.training.hash != training_hash_from_spec(spec) or len(run.predictions) != 1:
+        raise ValueError("locked GBM run has the wrong training or prediction identity")
+    prediction = run.predictions[0]
+    record = prediction.registry_record()
+    selected = context.published_checkpoints
+    if selected is None or len(selected) != 1:
+        raise ValueError("locked GBM context must select exactly one checkpoint")
+    if (
+        record["split"],
+        record["checkpoint_kind"],
+        record["checkpoint_value"],
+    ) != (context.prediction_split, "iteration", selected[0]):
+        raise ValueError("locked GBM run published the wrong checkpoint")
+    published = prediction.load().sort("symbol", "timestamp", "fold")
+    model_dir = run.training.root / "run_log" / "training" / run.training.hash / "models"
+    if not _valid_gbm_model_dir(model_dir, context):
+        raise ValueError("locked GBM fitted-state manifest does not validate")
+    reconstructed = _gbm_prediction_frame(
+        _predict_from_gbm_models(model_dir, spec, context)["predictions"],
+        selected[0],
+        context,
+    )
+    key_columns = ["symbol", "timestamp", "fold"]
+    value_columns = ["prediction", "actual"]
+    if "eval_actual" in published.columns or "eval_actual" in reconstructed.columns:
+        if "eval_actual" not in published.columns or "eval_actual" not in reconstructed.columns:
+            raise ValueError("locked GBM fitted state changed the prediction schema")
+        value_columns.append("eval_actual")
+    if not reconstructed.select(key_columns).equals(
+        published.select(key_columns)
+    ) or not np.allclose(
+        reconstructed.select(value_columns).to_numpy(),
+        published.select(value_columns).to_numpy(),
+        rtol=1e-12,
+        atol=1e-12,
+        equal_nan=False,
+    ):
+        raise ValueError("locked GBM fitted state does not reproduce published predictions")
+    manifest = json.loads((model_dir / "manifest.json").read_text())
+    return hashlib.sha256(canonical_json(manifest).encode()).hexdigest()

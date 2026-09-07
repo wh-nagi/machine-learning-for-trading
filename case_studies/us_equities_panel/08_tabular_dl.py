@@ -14,285 +14,458 @@
 # ---
 
 # %% [markdown]
-# # Tabular Deep Learning — US Equities Panel
+# # US equities panel: a neural network on the same flat table, and what an ensemble of them costs
 #
-# TabM applies attention-style ensembling over the same 71-feature matrix used by
-# linear models and GBMs. On the US equities panel, where both linear and GBM
-# produce nearly identical daily predictions, the question is
-# whether neural network expressiveness discovers interactions that tree-based
-# methods miss. With 3,199 stocks and 9.2 million training rows, the dataset is
-# large enough for deep learning to train properly --- but whether the
-# cross-sectional signal has sufficient structure to reward the additional
-# complexity remains to be seen.
+# [`06_linear`](06_linear.ipynb) and [`07_gbm`](07_gbm.ipynb) read the same design matrix: one row
+# per stock per session, one column per feature, nothing in the representation saying the rows are
+# ordered in time. They differ in what they can express. A penalized linear model gives each
+# feature one coefficient, and where several columns carry nearly the same information it can
+# spread weight across all of them. A tree ensemble can express an interaction - a condition on one
+# feature evaluated inside a region another feature defines - but it gets there by picking one
+# column at each split, and among near-duplicate columns which one gets picked is close to
+# arbitrary.
 #
-# **Learning Objectives**:
-# - Test whether attention-based tabular models improve on GBMs for broad panels
-# - Compare TabM sizes (small/medium/large) on a 71-feature daily equity dataset
-# - Evaluate whether model complexity helps when per-stock signal is weak (IC~0.02)
-# - Generate backtesting-ready predictions from the best configuration
+# A neural network on that same table is a third answer. Its first layer is a weighted sum of every
+# feature, so like the linear model it never has to choose between correlated columns; the
+# nonlinearity after it lets those sums combine into interactions the linear model cannot write
+# down. That is the reason to fit one here, rather than a general preference for neural networks:
+# the two properties that pulled against each other in the previous two notebooks are not obviously
+# in conflict in this architecture.
 #
-# **Book Reference**: Chapter 12, Section 12.3 (Deep Learning Alternatives)
+# **TabM is an ensemble, and the ensemble is the point.** Averaging several independently
+# initialized networks is a standard way to make a neural fit less erratic, and the ordinary cost
+# is training that many networks. TabM trains most of one. A two-layer network - the **backbone** -
+# is shared by every member. Each member owns two small things of its own: a vector carrying one
+# number per hidden unit, which scales the backbone's output element by element, and its own final
+# linear layer turning that scaled output into a prediction. The members' predictions are averaged.
+# What differs between members is therefore one vector and one output layer each, set against a
+# backbone as wide as the hidden size - which is why adding members grows the model far more slowly
+# than training that many separate networks would.
 #
-# **Prerequisites**: `03_financial_features.py`, `04_temporal.py`, [`05_evaluation`](05_evaluation.ipynb)
+# **The three declared configurations move both dials at once.** `tabm_s`, `tabm_m` and `tabm_l`
+# pair a hidden width of 64, 128 and 256 with 4, 8 and 16 members. So this grid is a capacity
+# ladder rather than an experiment separating width from ensemble size: a difference between two
+# rungs cannot be attributed to either dial on its own.
+#
+# **A neural fit has a meaningful state at every epoch**, the way a boosted model has one at every
+# iteration and a linear fit does not. An **epoch** is one pass over the training rows. Each
+# configuration here trains for 200 of them and saves its weights every 25, so it produces eight
+# scoreable models rather than one, and each is registered with its own identity. The count that
+# matters downstream is configurations times checkpoints - three times eight - not three.
+#
+# **Learning objectives.** By the end of this notebook you will be able to:
+#
+# - Describe what a weight-sharing ensemble holds in common between its members and what it keeps
+#   separate, and say why *k* members cost far less than *k* networks.
+# - Read the epoch schedule out of a declared configuration and say how many scoreable models the
+#   run publishes for it.
+# - Say why a grid that moves width and member count together cannot attribute a difference to
+#   either one, and what a grid that separated them would have to hold fixed.
+# - Recognise that a model can predict nearly the same value for every stock on a date, why that
+#   date then contributes nothing to a ranking measure, and why a run can be registered complete
+#   and still have scored no dates at all.
+# - Locate where a configuration and a stopping point are actually chosen in this case study, and
+#   say why that is not here.
+#
+# **Book reference**: Chapter 12, Section 12.3 (Deep Learning Alternatives). Chapter 6, Section 6.7
+# (Search accounting and run logging) introduces the run log this notebook writes to.
+#
+# **Prerequisites**: [`03_financial_features`](03_financial_features.ipynb) and
+# [`04_model_based_features`](04_model_based_features.ipynb) have written the feature matrices,
+# [`05_evaluation`](05_evaluation.ipynb) has established the walk-forward folds, and
+# [`06_linear`](06_linear.ipynb) and [`07_gbm`](07_gbm.ipynb) fitted the two populations this one
+# sits beside.
+#
+# **What it writes**: one training run per configuration and one complete validation prediction set
+# per configuration and epoch checkpoint, in `run_log/registry.db` and under `run_log/training/`
+# and `run_log/predictions/`, grouped under a named population.
+# [`15_model_analysis`](15_model_analysis.ipynb) compares that population against the other
+# families and [`16_backtest`](16_backtest.ipynb) backtests every member and selects on validation
+# backtest Sharpe. **Selection happens there, not here.**
 
 # %%
-"""Tabular DL Grid Search — TabM / TabPFN via walk-forward CV."""
+"""Generate TabM validation predictions through the shared research interface."""
 
-import warnings
+import os
+from pathlib import Path
 
 import polars as pl
-import torch
 import yaml
 
-from case_studies.utils.tabular_dl import run_tabm_cv
-from utils.modeling import load_configs, load_modeling_dataset
+from case_studies.research import open_study, plan_models
+from utils.modeling import load_configs
 from utils.paths import get_case_study_dir
-
-warnings.filterwarnings("ignore")
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "us_equities_panel"
-PRIMARY_LABEL = ""  # Read from setup.yaml if empty
+PRIMARY_LABEL = ""
+CONFIG_NAMES = []
+COMMON_OVERRIDES = {}
+CONFIG_OVERRIDES = {}
+DIAGNOSTIC_CONFIG_NAMES = ["tabm_s"]
+DEVICE = "cuda"
+EXECUTION_TIER = "canonical"
+WORKSPACE = "experiments"
 MAX_SYMBOLS = 0
-FORCE_RETRAIN = False  # Set True to retrain configs that already have complete hashes
-PREDICTION_SPLIT = "validation"
-N_EPOCHS = 100
-BATCH_SIZE = 4096
 MAX_FOLDS = 0
-
-# %%
-# Resolve config from setup.yaml
-CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
-setup = yaml.safe_load((CASE_DIR / "config" / "setup.yaml").read_text())
-
-if not PRIMARY_LABEL:
-    PRIMARY_LABEL = setup["labels"]["primary"]
-    print(f"Label from setup.yaml: {PRIMARY_LABEL}")
-else:
-    print(f"Label override: {PRIMARY_LABEL}")
-
-tdl_config = setup.get("modeling", {}).get("tabular_dl", {})
-MODELS = tdl_config.get("models", ["tabm"])
-DEVICE = tdl_config.get("device", "gpu")
-
-include_tabpfn = "tabpfn" in MODELS
-
-device_str = "cuda" if DEVICE == "gpu" and torch.cuda.is_available() else "cpu"
-print(f"Case study: {CASE_STUDY_ID}")
-print(f"Device: {device_str} | Models: {MODELS}")
-print(f"Epochs: {N_EPOCHS} | Batch: {BATCH_SIZE}")
+PREVIEW_N_EPOCHS = 0
+PREVIEW_CHECKPOINT_INTERVAL = 0
 
 # %% [markdown]
-# ## 1. Load Artifacts
+# ## 1. Which configurations, and on which label
 #
-# Same 71-feature dataset as linear and GBM. The 16 walk-forward folds (10-year
-# train, 1-year test) provide stable estimates --- though TabM's epoch-based
-# training means runtime scales with the number of epochs rather than tree count.
+# The menu at `config/training/{label}.yaml` lists the TabM configurations declared for a label,
+# and each name resolves to a preset in `case_studies/config/tabm/` holding the full parameter set.
+# The table below shows the whole menu with a column marking which entries this run selected.
+#
+# What each setting a run may pass decides:
+#
+# - **`CONFIG_NAMES`** empty fits the whole declared menu. A list such as `['tabm_s']` fits that
+#   subset, which is what to do first: at panel scale the full menu is hours, and the point of a
+#   first pass is to find out whether the plumbing works.
+# - **`COMMON_OVERRIDES`** changes a model or runner parameter for every selected configuration and
+#   **`CONFIG_OVERRIDES`** changes one named configuration, taking precedence. An override moves a
+#   training identity, so an overridden run registers beside the published one rather than
+#   replacing it.
+# - **`DIAGNOSTIC_CONFIG_NAMES`** names the small subset [`15_model_analysis`](15_model_analysis.ipynb)
+#   compares predictions across. It is bounded on purpose: that comparison holds every member's
+#   prediction frame in memory at once and correlates them pairwise, so its cost grows with the
+#   square of the membership.
+# - **`EXECUTION_TIER`** is `canonical` or `preview`. A canonical run fits the whole panel on every
+#   fold at the published epoch schedule. A preview run has to declare at least one reduction, and
+#   its results carry that reduction in their identity so they can never be compared against
+#   canonical ones or reach a holdout decision.
 
 # %%
-mds = load_modeling_dataset(CASE_STUDY_ID, PRIMARY_LABEL, max_symbols=MAX_SYMBOLS)
+case_dir = get_case_study_dir(CASE_STUDY_ID)
+setup = yaml.safe_load((case_dir / "config" / "setup.yaml").read_text())
+label = PRIMARY_LABEL or setup["labels"]["primary"]
 
-dataset = mds.dataset
-feature_names = mds.feature_names
-label_col = mds.label_col
-date_col = mds.date_col
-entity_col = mds.entity_cols[0] if mds.entity_cols else "symbol"
-splits = mds.splits
+published_configs = load_configs(CASE_STUDY_ID, label, family="tabular_dl")
+published_names = [str(config["config_name"]) for config in published_configs]
+selected_names = list(CONFIG_NAMES) if CONFIG_NAMES else published_names
+unknown_names = sorted(set(selected_names) - set(published_names))
+unknown_overrides = sorted(set(CONFIG_OVERRIDES) - set(selected_names))
+if unknown_names:
+    raise ValueError(f"Unknown TabM configurations: {unknown_names}")
+if unknown_overrides:
+    raise ValueError(f"Overrides supplied for unselected configurations: {unknown_overrides}")
+if len(selected_names) != len(set(selected_names)):
+    raise ValueError("CONFIG_NAMES contains duplicates")
+unknown_diagnostics = sorted(set(DIAGNOSTIC_CONFIG_NAMES) - set(selected_names))
+if not DIAGNOSTIC_CONFIG_NAMES or unknown_diagnostics:
+    raise ValueError(f"Invalid diagnostic configurations: {unknown_diagnostics}")
+
+menu = pl.DataFrame(
+    {
+        "config_name": [config["config_name"] for config in published_configs],
+        "library": [config["library"] for config in published_configs],
+        "published_params": [str(config.get("params") or {}) for config in published_configs],
+        "n_epochs": [config.get("n_epochs") for config in published_configs],
+        "checkpoint_interval": [config.get("checkpoint_interval") for config in published_configs],
+        "selected": [config["config_name"] in selected_names for config in published_configs],
+    }
+)
+menu
+
+# %%
+preview_reductions = {}
+if MAX_SYMBOLS:
+    preview_reductions["max_symbols"] = int(MAX_SYMBOLS)
 if MAX_FOLDS:
-    splits = splits[:MAX_FOLDS]
-n_features = len(feature_names)
+    preview_reductions["folds"] = list(range(int(MAX_FOLDS)))
+if PREVIEW_N_EPOCHS:
+    preview_reductions["n_epochs"] = int(PREVIEW_N_EPOCHS)
+if PREVIEW_CHECKPOINT_INTERVAL:
+    preview_reductions["checkpoint_interval"] = int(PREVIEW_CHECKPOINT_INTERVAL)
 
-print(f"Dataset: {len(dataset):,} rows × {n_features} features")
-print(f"Label: {label_col} | Date: {date_col} | Entity: {entity_col}")
-for s in splits:
-    print(
-        f"  Fold {s['fold']}: train {str(s['train_start'])[:10]}\u2192{str(s['train_end'])[:10]}  "
-        f"val {str(s['val_start'])[:10]}\u2192{str(s['val_end'])[:10]}"
+# Both tiers resolve the study through `open_study`. It reads the labels and features in place and
+# redirects only writes, so a preview run scores the same inputs a canonical one does and cannot
+# publish over it.
+if EXECUTION_TIER == "canonical":
+    if preview_reductions:
+        raise ValueError("Canonical execution cannot declare preview reductions")
+    study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER)
+elif EXECUTION_TIER == "preview":
+    if not preview_reductions:
+        raise ValueError("Preview execution requires at least one declared reduction")
+    study = open_study(
+        CASE_STUDY_ID,
+        execution_tier=EXECUTION_TIER,
+        workspace=Path(os.environ.get("ML4T_OUTPUT_DIR") or WORKSPACE),
+    )
+else:
+    raise ValueError("EXECUTION_TIER must be 'canonical' or 'preview'")
+
+# %% [markdown]
+# ## 2. Binding the declarations to the data
+#
+# A **request** is one configuration bound to one label and one execution tier, with its overrides
+# resolved. It is what the planner reads, and it holds no data - so the table below can be
+# inspected before anything is loaded.
+
+# %%
+requests = []
+for config_name in selected_names:
+    overrides = {
+        "device": DEVICE,
+        **COMMON_OVERRIDES,
+        **dict(CONFIG_OVERRIDES.get(config_name, {})),
+    }
+    requests.append(
+        study.model(
+            family="tabular_dl",
+            label=label,
+            config_name=config_name,
+            overrides=overrides,
+            execution_tier=EXECUTION_TIER,
+            preview_reductions=preview_reductions,
+            notebook="08_tabular_dl",
+        )
+    )
+requests = tuple(requests)
+
+request_table = pl.DataFrame(
+    {
+        "family": [request.family for request in requests],
+        "label": [request.label for request in requests],
+        "config_name": [request.config_name for request in requests],
+        "overrides": [str(request.overrides) for request in requests],
+        "execution_tier": [request.execution_tier.value for request in requests],
+        "preview_reductions": [str(request.preview_reductions) for request in requests],
+    }
+)
+request_table
+
+# %% [markdown]
+# ## 3. Planning, then fitting
+#
+# **Planning works out every identity before any fitting starts.** Each configuration-and-epoch
+# pair gets its training and prediction hash from the declarations and the fold boundaries alone,
+# and the list of them is written down as a **population**: a named, immutable membership that the
+# run then has to fill completely. Declaring the membership first is what makes the downstream
+# comparison well defined, because a population that came out short would otherwise look like a
+# smaller experiment rather than a failed one.
+#
+# The plan walks folds on the outside and configurations on the inside, so one prepared fold is
+# resident at a time however many configurations were declared - which on a three-thousand-name
+# panel across sixteen ten-year training windows is the difference between fitting and running out
+# of memory. Every declared epoch saves its preprocessing, its weights and its predictions before
+# the fold is released, so an interrupted run resumes from the last completed fold instead of
+# starting over.
+
+# %%
+plan = plan_models(study, requests=requests)
+official_population = None
+if EXECUTION_TIER == "canonical":
+    official_population = plan.create_population(
+        name="us-equities-tabular-dl-checkpoints-v1",
     )
 
-# %% [markdown]
-# ## 1b. Data Diagnostics
+planned_population = pl.DataFrame(
+    {
+        "family": [member.family for member in plan.members],
+        "config_name": [member.config_name for member in plan.members],
+        "checkpoint_kind": [member.checkpoint_kind for member in plan.members],
+        "checkpoint_value": [member.checkpoint_value for member in plan.members],
+        "training_hash": [member.training_hash for member in plan.members],
+        "prediction_hash": [member.prediction_hash for member in plan.members],
+    }
+)
+planned_population
 
 # %%
-dataset_pd = dataset.to_pandas()
-
-label_nans = dataset_pd[label_col].isna().sum()
-feat_nan_rate = dataset_pd[feature_names].isna().mean().mean()
-n_entities = dataset_pd[entity_col].nunique()
-
-print(f"Entities: {n_entities}")
-print(f"Label NaN: {label_nans:,} / {len(dataset_pd):,} ({label_nans / len(dataset_pd):.1%})")
-print(f"Feature NaN rate: {feat_nan_rate:.1%}")
+execution = plan.run()
 
 # %% [markdown]
-# ## 2. Build Grid
+# ## 4. What was actually fitted
 #
-# TabM configurations: small (64h×4m), medium (128h×8m), large (256h×16m).
-# Optionally includes TabPFN (foundation model, subsampled to 2K training rows).
+# A configuration names a preset, and a preset leaves most settings to a default. The table below
+# is the fully resolved specification the runner used - every feature count, fold count, device,
+# epoch schedule and batch size, including the defaults nothing above restated. This is the record
+# a reader checks a result against, and it is what the training hash is computed from.
 
 # %%
-tabdl_configs = load_configs(CASE_STUDY_ID, PRIMARY_LABEL, "tabular_dl")
+resolved_rows = []
+for run in execution.runs:
+    spec = run.training.spec()
+    computation = spec["computation"]
+    model = computation["model"]
+    resolved_rows.append(
+        {
+            "config_name": spec["config_name"],
+            "task": computation["task"]["type"],
+            "features": len(computation["feature_names"]),
+            "folds": computation["expected_prediction_keys"]["n_folds"],
+            "device": computation["numerics"]["device"],
+            "n_epochs": model["params"]["n_epochs"],
+            "batch_size": model["params"]["batch_size"],
+            "checkpoints": [item["value"] for item in computation["checkpoint_schedule"]],
+            "training_hash": run.training.hash,
+        }
+    )
 
-# Apply Papermill overrides to configs (test mode: fewer epochs)
-for cfg in tabdl_configs:
-    if cfg.get("n_epochs", 100) != N_EPOCHS:
-        cfg["n_epochs"] = N_EPOCHS
-    if cfg.get("batch_size", 4096) != BATCH_SIZE:
-        cfg["batch_size"] = BATCH_SIZE
+resolved_table = pl.DataFrame(resolved_rows).sort("config_name")
+resolved_table
 
-print(f"Grid: {len(tabdl_configs)} configs × {N_EPOCHS} epochs × {len(splits)} folds")
-for cfg in tabdl_configs:
-    name = cfg["config_name"]
-    params = cfg.get("params", {})
-    if name.startswith("tabpfn"):
-        print(f"  {name:15s}  max_samples={params.get('max_samples', 2000)}")
-    else:
-        print(
-            f"  {name:15s}  hidden={params['hidden_dim']}  "
-            f"members={params['n_members']}  dropout={params['dropout']}"
+# %% [markdown]
+# ## 5. What came out
+#
+# One row per configuration and epoch checkpoint. Each is one complete set of validation
+# predictions, with the hash of the training run that produced it and the hash of the predictions
+# themselves, so any row can be traced back to the exact fitted state behind it.
+#
+# `ic_mean` is the **information coefficient**: on each validation date, rank the stocks by the
+# model's prediction, rank them by the return they went on to earn, correlate the two rankings, and
+# average that daily correlation over the validation period. It measures whether predictions order
+# the cross-section correctly, and nothing about what a strategy trading them would earn.
+
+# %% tags=["results"]
+catalog_columns = [
+    "family",
+    "config_name",
+    "label",
+    "split",
+    "checkpoint_kind",
+    "checkpoint_value",
+    "execution_tier",
+    "complete",
+    "ic_mean",
+    "training_hash",
+    "prediction_hash",
+]
+catalog_rows = execution.catalog_rows.select(
+    column for column in catalog_columns if column in execution.catalog_rows.columns
+).sort("config_name", "checkpoint_value", "prediction_hash")
+catalog_rows
+
+# %% [markdown]
+# A prediction set can be registered complete and still have scored no dates. Cross-sectional
+# information coefficient needs a minimum number of names quoted on a date before the ranking on
+# that date means anything, so a universe whose stocks do not overlap in time yields no scorable
+# dates and a null IC at every checkpoint while every coverage check passes. That is a run which
+# reports nothing and looks successful, so it is asserted on rather than left to be noticed.
+
+# %% tags=["results"]
+scored = execution.catalog_rows.select("config_name", "checkpoint_value", "ic_mean", "ic_n_days")
+unscored = scored.filter(pl.col("ic_n_days").is_null() | (pl.col("ic_n_days") <= 0))
+if not unscored.is_empty():
+    raise RuntimeError(f"prediction sets scored no dates: {unscored.to_dicts()}")
+scored
+
+# %%
+coverage_rows = []
+for run in execution.runs:
+    if not run.training.complete:
+        raise RuntimeError(f"Incomplete training result: {run.training.hash}")
+    for prediction in run.predictions:
+        record = prediction.registry_record()
+        coverage = prediction.coverage()
+        if not prediction.complete or coverage is None or coverage["status"] != "complete":
+            raise RuntimeError(f"Incomplete prediction result: {prediction.hash}")
+        coverage_rows.append(
+            {
+                "config_name": run.training.spec()["config_name"],
+                "checkpoint": record["checkpoint_value"],
+                "training_hash": run.training.hash,
+                "prediction_hash": prediction.hash,
+                "coverage_status": coverage["status"],
+                "expected_rows": coverage["n_expected"],
+                "actual_rows": coverage["n_actual"],
+                "training_artifacts": len(run.training.artifacts()),
+                "prediction_artifacts": len(prediction.artifacts()),
+            }
         )
 
-# %% [markdown]
-# ## 3. Run Tabular DL CV
-#
-# Walk-forward training with IC evaluation at epoch checkpoints.
+coverage_table = pl.DataFrame(coverage_rows).sort("config_name", "checkpoint")
+if official_population is not None:
+    official_population.require_complete()
+coverage_table
 
 # %%
-result = run_tabm_cv(
-    dataset_pd,
-    splits,
-    feature_names=feature_names,
-    label_col=label_col,
-    date_col=date_col,
-    entity_col=entity_col,
-    configs=tabdl_configs,
-    n_features=n_features,
-    device=device_str,
-    save_dir=CASE_DIR / "run_log" / "training" / "tabular_dl",
-    register=True,
-    force_retrain=FORCE_RETRAIN,
-    prediction_split=PREDICTION_SPLIT,
-    case_study=CASE_STUDY_ID,
-    notebook="08_tabular_dl",
-    temporal_by_fold=mds.temporal_by_fold,
-    temporal_keys=mds.temporal_keys,
-    temporal_feature_names=mds.temporal_feature_names,
+execution_diagnostics = pl.DataFrame(execution.diagnostics)
+execution_diagnostics
+
+# %% [markdown]
+# ## 6. Naming the sets the later notebooks open
+#
+# `16_backtest` never opens the population. It opens **named prediction sets**, one per label and
+# family, because a comparison is only meaningful within one label's protocol.
+# `15_model_analysis` opens both - the population, to confirm the run filled every member it
+# promised, and the named sets, to make the comparison. Freezing is what creates those names.
+#
+# Only an unnarrowed canonical run publishes them, and for the same reason a narrowed run may not
+# publish the canonical population: a name must not mean two different member sets at two different
+# times. A run that overrides a parameter, selects a subset, or runs on a device other than the
+# declared one keeps its rows and publishes no name.
+
+# %% tags=["results"]
+set_rows = []
+is_published_population = (
+    EXECUTION_TIER == "canonical"
+    and selected_names == published_names
+    and not COMMON_OVERRIDES
+    and not CONFIG_OVERRIDES
+    and DEVICE == "cuda"
 )
-
-# %% [markdown]
-# ## 4. Grid Results
-
-# %%
-grid_results = result["grid_results"]
-best_name = result["best_config_name"]
-best_epoch = result["best_epoch"]
-best_ic = result["best_ic"]
-
-print(f"{'Config':15s} {'Best Epoch':>10s} {'Peak IC':>10s} {'Time':>8s}")
-print(f"{'-' * 48}")
-for r in grid_results:
-    marker = " *" if r["config_name"] == best_name else ""
-    print(
-        f"{r['config_name']:15s} {r['best_epoch']:10d} {r['best_ic']:+10.4f} "
-        f"{r['elapsed_s']:7.1f}s{marker}"
+if is_published_population:
+    label_name = label.replace("_", "-")
+    full_set = study.predictions.freeze(
+        execution.catalog_rows,
+        name=f"us-equities-{label_name}-tabular-dl-v1",
     )
-print(f"{'-' * 48}")
-print(f"Best: {best_name} @ epoch {best_epoch} (IC={best_ic:+.4f})")
+    diagnostic_set = study.predictions.freeze(
+        execution.catalog_rows.filter(pl.col("config_name").is_in(DIAGNOSTIC_CONFIG_NAMES)),
+        name=f"us-equities-{label_name}-tabular-dl-diagnostics-v1",
+    )
+    set_rows = [
+        {
+            "role": "backtest population",
+            "set_name": full_set.name,
+            "members": len(full_set.members),
+        },
+        {
+            "role": "bounded diagnostics",
+            "set_name": diagnostic_set.name,
+            "members": len(diagnostic_set.members),
+        },
+    ]
+compatible_sets = pl.DataFrame(
+    set_rows,
+    schema={"role": pl.String, "set_name": pl.String, "members": pl.Int64},
+)
+compatible_sets
 
 # %% [markdown]
-# ## 5. Learning Curves
-
-# %%
-curves = result["all_learning_curves"]
-if curves.height > 0:
-    checkpoints = sorted(curves["epoch"].unique().to_list())
-    display_cps = [cp for cp in checkpoints if cp % 50 == 0 or cp == checkpoints[-1]]
-
-    print(f"\n{'Config':15s}", end="")
-    for cp in display_cps:
-        print(f" {cp:>7d}", end="")
-    print()
-    print("-" * (15 + 8 * len(display_cps)))
-
-    for r in grid_results:
-        cfg_data = curves.filter(pl.col("config") == r["config_name"])
-        print(f"{r['config_name']:15s}", end="")
-        for cp in display_cps:
-            row = cfg_data.filter(pl.col("epoch") == cp)
-            if row.height > 0:
-                ic_val = row["ic_mean"][0]
-                print(f" {ic_val:+7.4f}", end="")
-            else:
-                print(f" {'N/A':>7s}", end="")
-        print()
+# `15_model_analysis.py` reopens the named compatible and diagnostic sets. `16_backtest.py` passes
+# every full-set catalog row directly to the shared backtest runner. Model metrics do not choose a
+# configuration or checkpoint.
 
 # %% [markdown]
-# ## 6. Fold Metrics
-
-# %%
-fold_metrics = result["fold_metrics"]
-if fold_metrics.height > 0:
-    print(f"\nPer-fold IC ({best_name}):")
-    for row in fold_metrics.iter_rows(named=True):
-        print(f"  Fold {row['fold_id']}: IC={row['ic_mean']:+.4f}  n_test={row['n_test']:,}")
-    mean_ic = fold_metrics["ic_mean"].mean()
-    print(f"\n  Mean IC: {mean_ic:+.4f}")
-
-# %% [markdown]
-# ## 7. Save Results
+# ## What to notice
 #
-# Predictions and fold metrics are registered by `run_tabm_cv()`
-# during training. Here we record the pipeline results JSON.
-
-# %%
-predictions = result["predictions"]
-all_predictions = result["all_predictions"]
-
-print(f"predictions.parquet: {predictions.height:,} rows")
-print(f"all_predictions.parquet: {all_predictions.height:,} rows")
-if curves.height > 0:
-    print(f"learning_curves.parquet: {curves.height:,} rows")
-if fold_metrics.height > 0:
-    print(f"fold_metrics.parquet: {fold_metrics.height} rows")
-
-# %%
-# Pipeline results JSON
-grid_summary = {
-    r["config_name"]: {
-        "best_epoch": r["best_epoch"],
-        "best_ic": round(r["best_ic"], 6),
-        "elapsed_s": round(r["elapsed_s"], 1),
-    }
-    for r in grid_results
-}
-
-val_ic_mean = float(fold_metrics["ic_mean"].mean()) if fold_metrics.height > 0 else None
-
-# %% [markdown]
-# ## 8. Key Takeaways
+# **A checkpoint is part of a configuration, not a detail of how it was fitted.** Saving weights
+# every 25 epochs turns three configurations into twenty-four scoreable models. Treating that as
+# three candidates while quietly keeping each one's best epoch would report the maximum of eight
+# numbers as though it were one, which is why every checkpoint is registered separately and
+# compared as its own candidate.
 #
-# On the broadest equity panel, tabular DL faces the same challenge as GBMs:
-# the cross-sectional signal in daily returns is predominantly linear, leaving
-# limited room for non-linear models to add value. Attention over 71 features
-# × 3,199 stocks creates a high-dimensional interaction space, but the marginal
-# IC per stock (~0.02) may not contain enough structure to reward the additional
-# parameters. The consistent theme: breadth --- not model sophistication ---
-# drives the tradable edge in this dataset.
+# **A complete run is not the same as a scored one.** Cross-sectional information coefficient needs
+# a minimum number of names on a date before that date can be ranked at all. A universe whose
+# stocks do not overlap in time can satisfy every coverage check and still score zero dates,
+# leaving a null IC under a status that reads complete. The assertion above refuses that rather
+# than reporting it.
 #
-# **Next**: [`09_dl_nlinear`](09_dl_nlinear.ipynb) tests whether a minimal
-# temporal baseline can improve on flat-feature tabular modeling before the
-# broader sequence-model block.
-# extract signal that flat-feature models miss.
-
-# %%
-print(f"\n{'=' * 60}")
-print(f"Tabular DL Grid Search: {CASE_STUDY_ID}")
-print(f"{'=' * 60}")
-print(f"Features: {n_features}  |  Folds: {len(splits)}  |  Label: {label_col}")
-print(f"Device: {device_str}  |  Epochs: {N_EPOCHS}")
-print(f"Grid: {len(tabdl_configs)} configs ({', '.join(MODELS)})")
-print(f"{'-' * 60}")
-print(f"Best config: {best_name} @ epoch {best_epoch}")
-print(f"Validation IC (cross-sectional): {best_ic:+.4f}")
-if val_ic_mean is not None:
-    print(f"Mean fold IC: {val_ic_mean:+.4f}")
+# **This grid measures capacity and nothing finer.** Width and member count move together across
+# the three rungs, so a difference between them is a difference in capacity as a whole. Separating
+# the two would need a grid holding one fixed while the other varies, which this case study does
+# not declare.
+#
+# **Known limitations.** The features are the same point-in-time columns the previous two
+# notebooks read, so anything absent from them is absent here too; the architecture finds
+# interactions among the columns it is given and does not create information. Validation results
+# say how the fits ranked on folds that have been read many times over by the time a case study
+# reaches this notebook, and say nothing about behaviour under a changed feature distribution.
+#
+# **Next**: [`09_dl_nlinear`](09_dl_nlinear.ipynb) drops the flat-table representation and gives a
+# model the ordered window instead.

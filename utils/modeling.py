@@ -6,9 +6,11 @@ Provides:
 - prepare_cv_folds(): Preprocess data into train/val folds (impute, scale)
 - ModelingDataset: Container for joined data with detected schema
 
-Cross-sectional IC computation lives in the library — call
-``ml4t.diagnostic.metrics.cross_sectional_ic`` against a polars frame
-of (date, symbol, y_true, y_pred) directly.
+The cross-sectional IC itself is the library's: call
+``ml4t.diagnostic.metrics.cross_sectional_ic`` against a polars frame of
+(date, symbol, y_true, y_pred) directly. ``cross_sectional_ic_mean()`` below is
+the adapter for callers holding aligned numpy arrays instead, which is what a
+scikit-learn or Optuna objective has in hand inside a fold.
 
 Usage:
     from utils.modeling import load_modeling_dataset, load_configs, prepare_cv_folds
@@ -22,10 +24,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -39,6 +42,7 @@ from utils.artifact_specs import (
     load_feature_spec,
     load_label_spec,
     resolve_label_buffer,
+    resolve_label_buffer_unit,
     resolve_label_horizon,
     resolve_market_semantics,
     resolve_storage_path,
@@ -53,6 +57,109 @@ MIN_TEMPORAL_DATE_COVERAGE = 0.95  # Allow short calendar-edge gaps, not missing
 # (6.1%) for fold 1. A stale artifact whose fold IDs have shifted presents as a
 # leading gap of roughly half the window, so this bound still rejects it.
 MAX_TEMPORAL_WARMUP_FRACTION = 0.10
+
+
+def file_sha256(path: Path) -> str:
+    """The SHA-256 digest of an input artifact, for a cache key that names its inputs."""
+    with Path(path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def array_sha256(array: np.ndarray) -> str:
+    """Hash an array's shape, dtype and contiguous values.
+
+    Covers what a file digest cannot: filtering, symbol limits, row order, feature
+    order and cleaning semantics, all applied after the source files were read.
+    """
+    contiguous = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(str(contiguous.dtype).encode())
+    digest.update(repr(contiguous.shape).encode())
+    digest.update(contiguous.tobytes())
+    return digest.hexdigest()
+
+
+def canonical_sha256(payload: Mapping) -> str:
+    """Hash a nested contract with stable key ordering and date serialization."""
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def notebook_cache_signature(
+    notebook_py: Path,
+    *,
+    inputs: Mapping[str, str],
+    settings: Mapping[str, object],
+) -> dict:
+    """The signature a notebook stores beside cached fit results, so a stale one is caught.
+
+    A cache keyed on nothing but the file's existence is a correctness hazard, not a
+    convenience: change the code that produced it and the notebook silently republishes
+    the previous run's numbers under the new source. The published page then claims
+    results its own code did not compute, and nothing in the provenance stamp catches
+    it - that stamp binds the .py to the .ipynb, and both are the new ones.
+
+    So the signature carries the notebook's own source digest alongside the input
+    digests and the settings that change a fit. Any edit to the notebook invalidates
+    it, which is deliberately coarser than tracking the functions that matter: a
+    needless re-run costs time, and a missed one costs a wrong number in the book.
+    """
+    return {
+        "notebook_source_sha256": file_sha256(notebook_py),
+        "inputs": dict(inputs),
+        "settings": dict(settings),
+    }
+
+
+def conformal_quantile(scores: np.ndarray, coverage: float) -> float:
+    """The split-conformal interval half-width for ``coverage``, from calibration scores.
+
+    Split conformal prediction earns its finite-sample coverage guarantee by taking
+    the ``ceil((n + 1) * coverage)``-th smallest calibration score, and the ceiling
+    has to be taken literally. The value must be a score that is actually in the
+    calibration set, at that rank.
+
+    ``np.quantile`` cannot express this, at either of its two obvious spellings.
+    Its default interpolates between the two neighbouring scores, returning
+    something narrower than the rank by exactly the finite-sample margin the
+    ceiling exists to supply. ``method="higher"`` rounds up to a real score but
+    still maps the level onto ``n - 1`` intervals rather than ``n`` ranks, so
+    passing ``k / n`` selects rank ``k + 1`` for every ``k < n`` - measured on
+    n=100 (rank 92 for k=91) and n=1000 (rank 902 for k=901). That errs wide
+    rather than narrow, so it does not break the guarantee, but it is not the
+    interval the method defines and it is not what the surrounding prose claims.
+
+    When ``k > n`` no calibration score attains the requested coverage - a
+    calibration set of 5 cannot certify 90% - and the interval is unbounded.
+    ``method="higher"`` silently returns the largest score there, which asserts a
+    guarantee the data cannot support.
+
+    Returns ``inf`` in that case, so the interval it produces is unbounded and
+    obviously so.
+
+    An infinite score is kept and ranked, not filtered: it is a real
+    nonconformity score, it orders above every finite one, and dropping it would
+    shrink ``n`` and hand back a *narrower* interval than the calibration set
+    supports. A NaN score has no rank at all, so it is refused rather than
+    dropped, for the same reason: silently removing it changes the denominator
+    the guarantee is computed from.
+    """
+    if not 0 < coverage < 1:
+        raise ValueError(f"coverage must lie strictly between 0 and 1, got {coverage}")
+    ranked = np.asarray(scores, dtype=float)
+    n_nan = int(np.isnan(ranked).sum())
+    if n_nan:
+        raise ValueError(
+            f"{n_nan} of {ranked.size} calibration scores are NaN and cannot be ranked. "
+            "A conformal quantile is a rank in the calibration set, so dropping them would "
+            "change the sample size the coverage guarantee is computed from."
+        )
+    n = ranked.size
+    if n == 0:
+        return float("inf")
+    rank = math.ceil((n + 1) * coverage)
+    if rank > n:
+        return float("inf")
+    return float(np.partition(ranked, rank - 1)[rank - 1])
 
 
 def seed_everything(seed: int = RANDOM_SEED) -> None:
@@ -116,14 +223,24 @@ class ModelingDataset:
     join_cols: list[str]
     splits: list[dict[str, Any]]
     label_buffer: str
+    # Which case study this was loaded from. Callers that persist or cache anything derived from
+    # the dataset need it, and it is not otherwise recoverable from the frame.
+    case_study_id: str = ""
     cv_config: Any = None  # WalkForwardConfig (optional, avoids hard import dep)
     task_type: str = "regression"  # "regression" or "classification"
     num_classes: int = 0  # 0 for regression, 2+ for classification
     class_values: list = field(default_factory=list)  # sorted unique values for classification
-    temporal_by_fold: pd.DataFrame | None = None  # Per-fold temporal features (has 'fold' column)
+    # Per-fold temporal features, carrying a 'fold' column. Held lazily where the loader
+    # can: on us_equities_panel this artifact is 68.7M rows, and materialising it cost
+    # 8.7 GB for the whole run when every consumer wants one fold. Reach it through
+    # ``fold_temporal_frame``, never by indexing it directly.
+    temporal_by_fold: pl.LazyFrame | pl.DataFrame | pd.DataFrame | None = None
     temporal_keys: list[str] = field(default_factory=list)  # Join keys for temporal features
     temporal_feature_names: list[str] = field(default_factory=list)  # Temporal feature column names
     temporal_artifact_splits: list[dict[str, Any]] = field(default_factory=list)
+    # The float type the design matrices are built in. Read from the case study's
+    # ``features.storage_dtype``; fold preparation honours it rather than pinning float64.
+    feature_dtype: str = "float64"
     # Continuous-return label that classification predictions are scored against.
     # None for regression labels. When set, the column lives in ``dataset`` and
     # downstream IC computation must use it instead of the binary ``label_col``.
@@ -159,12 +276,30 @@ class ModelingDataset:
                 eval_label_col=self.eval_label_col,
                 max_symbols=self.lineage_inputs["max_symbols"],
                 symbols=self.lineage_inputs["symbols"],
+                feature_dtype=self.feature_dtype,
             )
         return self._input_lineage
 
 
 def _sha256_file(path: Path) -> str:
-    """Return a stable digest for an identity-defining input artifact."""
+    """Digest an identity-defining input artifact's bytes.
+
+    Stable across repeated writes, not across encodings. Two parquet files holding
+    identical data hash differently if they were written with a different compression
+    codec or row-group size, and this digest is inside `computation.feature_artifacts` and
+    `computation.input_data_spec.artifacts`, which are inside the hashed `computation`
+    block - so a codec change forks the `training_hash` of every run reading that artifact.
+
+    Two things hold that shut. `artifact_digest._PARQUET_WRITE_SETTINGS` states the
+    encoding these artifacts are written under rather than inheriting a library default,
+    and `tests/test_artifact_digest_encoding.py` records the bytes a fixed frame produces
+    under it, so a change arrives as a failing test rather than as a registry that has
+    grown two identities for one piece of work.
+
+    `artifact_digest.value_digest` digests column *values* and is what a new identity
+    version should use here; changing it now would re-key all 1,305 registered training
+    runs across the nine live registries, which is a re-derivation rather than a fix.
+    """
     digest = hashlib.sha256()
     with path.open("rb") as src:
         for chunk in iter(lambda: src.read(1024 * 1024), b""):
@@ -182,8 +317,21 @@ def build_modeling_input_lineage(
     eval_label_col: str | None,
     max_symbols: int,
     symbols: list[str] | None,
+    feature_dtype: str = "float64",
 ) -> dict[str, Any]:
-    """Build the portable input identity carried by persisted training runs."""
+    """Build the portable input identity carried by persisted training runs.
+
+    ``feature_dtype`` is part of the identity because the artifacts are not. The parquet files
+    a case study reads are unchanged by a precision declaration, so without this a result fitted
+    in double precision and one fitted in single resolve to the same training identity, and the
+    registry serves the older one for a spec that asked for the other.
+
+    It is written into the payload only when it is not ``float64``. A key added unconditionally
+    changes the fingerprint of every case study, including the eight that declared nothing, and
+    would invalidate every training run already registered against them. Omitting the default
+    keeps those fingerprints exactly as they were and gives only the declaring case study a new
+    one. Any future default must be added the same way, for the same reason.
+    """
     split_fields = ("fold", "train_start", "train_end", "val_start", "val_end")
 
     def _normalize(key: str, value: Any) -> str:
@@ -212,6 +360,8 @@ def build_modeling_input_lineage(
         "max_symbols": int(max_symbols),
         "symbols": sorted(symbols) if symbols else None,
     }
+    if feature_dtype != "float64":
+        payload["feature_dtype"] = feature_dtype
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["fingerprint"] = hashlib.sha256(canonical.encode()).hexdigest()
     return payload
@@ -418,6 +568,25 @@ def get_classification_eval_label(case_study_id: str, label: str) -> str:
     return str(mapping[label])
 
 
+def get_direction_labels(case_study_id: str, label: str) -> tuple[str, ...]:
+    """Return the classification labels cut from a given continuous-return label.
+
+    ``labels.classification_eval_label`` read backwards. It declares which continuous return
+    each classification label was derived from; inverting it says which direction labels exist
+    for a return, which is what scoring a regression model by AUC needs. No separate
+    declaration is added for the inverse - one mapping cannot disagree with itself.
+
+    Returns an empty tuple when the case study declares no classification label for this
+    return, which is the case for five of the nine.
+    """
+    from utils import CASE_STUDIES_DIR
+
+    setup_path = CASE_STUDIES_DIR / case_study_id / "config" / "setup.yaml"
+    setup = yaml.safe_load(setup_path.read_text())
+    mapping = (setup.get("labels") or {}).get("classification_eval_label") or {}
+    return tuple(sorted(k for k, v in mapping.items() if v == label))
+
+
 def verify_artifact_sidecars(
     artifacts: Mapping[str, Path],
     *,
@@ -537,6 +706,33 @@ def verify_artifact_sidecars(
     return verified
 
 
+def feature_storage_dtype(case_study_id: str) -> pl.DataType:
+    """The float type a case study stores and fits its feature matrices in.
+
+    ``float64`` unless ``features.storage_dtype`` in the case study's ``setup.yaml`` says
+    otherwise. Declared per case study because only the large panels need the narrower type:
+    ``nasdaq100_microstructure`` is 16,098,877 rows x 88 features, which is 10.9 GB of modeling
+    dataset in double precision against 5.6 GB in single, while the small case studies fit
+    comfortably either way and narrowing them would move their numbers for no gain.
+    """
+    # Read from the repository, not through ``get_case_study_dir``, which redirects to
+    # ``ML4T_OUTPUT_DIR``. Every CI job points that at a scratch directory holding no
+    # ``config/``, so going through the redirect would resolve every case study to the default
+    # and silently answer a question about what a case study declares with "nothing".
+    from utils import CASE_STUDIES_DIR
+
+    setup_path = CASE_STUDIES_DIR / case_study_id / "config" / "setup.yaml"
+    if not setup_path.exists():
+        return pl.Float64
+    declared = (yaml.safe_load(setup_path.read_text()) or {}).get("features", {})
+    name = (declared or {}).get("storage_dtype", "float64")
+    if name not in {"float32", "float64"}:
+        raise ValueError(
+            f"{case_study_id}: features.storage_dtype must be float32 or float64, got {name!r}"
+        )
+    return pl.Float32 if name == "float32" else pl.Float64
+
+
 def load_modeling_dataset(
     case_study_id: str,
     primary_label: str,
@@ -605,45 +801,140 @@ def load_modeling_dataset(
             f"Missing prerequisites for '{case_study_id}': " + ", ".join(p for p, _ in missing)
         )
 
-    # Load artifacts
-    features = pl.read_parquet(features_path)
+    # Load artifacts. The declared storage type is applied in the scan, so a case study that
+    # fits in single precision never materialises the double-precision form on the way.
+    storage_dtype = feature_storage_dtype(case_study_id)
+
+    def _narrow(frame: pl.LazyFrame) -> pl.LazyFrame:
+        if storage_dtype != pl.Float64:
+            narrow = [n for n, t in frame.collect_schema().items() if t == pl.Float64]
+            if narrow:
+                frame = frame.with_columns([pl.col(c).cast(storage_dtype) for c in narrow])
+        return frame
+
+    # Scanned, not read. A reduced run has to narrow the entity axis *before* the panel is
+    # materialised, and it cannot choose which entities to keep until the join keys are known,
+    # so the collect waits until both are settled - see "Universe reduction" below.
+    features_lazy = _narrow(pl.scan_parquet(features_path))
 
     temporal_path = resolve_storage_path(
         case_study_id, temporal_spec, "features/model_based.parquet"
     )
-    temporal = pl.read_parquet(temporal_path) if temporal_path.exists() else None
+    # Scanned, not read. This artifact is per-fold, so it is a multiple of the feature table:
+    # 68.7M rows on us_equities_panel against the panel's 9.9M. Every consumer wants one fold,
+    # so the fold predicate is pushed into the scan instead of the whole thing being held.
+    temporal = pl.scan_parquet(temporal_path) if temporal_path.exists() else None
+    if temporal is not None and storage_dtype != pl.Float64:
+        narrow = [n for n, t in temporal.collect_schema().items() if t == pl.Float64]
+        if narrow:
+            temporal = temporal.with_columns([pl.col(c).cast(storage_dtype) for c in narrow])
+    temporal_columns = temporal.collect_schema().names() if temporal is not None else []
 
-    labels = pl.read_parquet(label_path)
+    # Labels are deliberately not narrowed. ``features.storage_dtype`` covers the design
+    # matrix; the label is the target IC and every metric are measured against, and
+    # ``gbm_fold`` states that it stays float64 whatever the design matrix is cast to.
+    labels_lazy = pl.scan_parquet(label_path)
+
+    label_columns = labels_lazy.collect_schema().names()
+    feature_columns = features_lazy.collect_schema().names()
 
     # Auto-detect label column (the non-ID column in the label file)
-    label_col = [c for c in labels.columns if c not in ID_COLS][0]
+    label_col = [c for c in label_columns if c not in ID_COLS][0]
 
     # Detect date column from features
-    feature_keys = sorted(set(features.columns) & ID_COLS)
+    feature_keys = sorted(set(feature_columns) & ID_COLS)
     date_col = "timestamp" if "timestamp" in feature_keys else "date"
     alt_date = "timestamp" if date_col == "date" else "date"
 
     # Normalize date column names across DataFrames
-    if alt_date in labels.columns and date_col not in labels.columns:
-        labels = labels.rename({alt_date: date_col})
-    if temporal is not None and alt_date in temporal.columns and date_col not in temporal.columns:
+    if alt_date in label_columns and date_col not in label_columns:
+        labels_lazy = labels_lazy.rename({alt_date: date_col})
+        label_columns = [date_col if c == alt_date else c for c in label_columns]
+    if temporal is not None and alt_date in temporal_columns and date_col not in temporal_columns:
         temporal = temporal.rename({alt_date: date_col})
+        temporal_columns = [date_col if c == alt_date else c for c in temporal_columns]
 
     # Detect join columns
-    label_keys = sorted(set(labels.columns) & ID_COLS)
+    label_keys = sorted(set(label_columns) & ID_COLS)
     join_cols = sorted(set(feature_keys) & set(label_keys))
     entity_cols = [c for c in join_cols if c != date_col]
+
+    # One pass for both uses below. The sort used to call ``n_unique`` from its key function,
+    # which re-counts the column on every comparison.
+    cardinality: dict[str, int] = {}
+    if entity_cols:
+        cardinality = (
+            features_lazy.select([pl.col(c).n_unique().alias(c) for c in entity_cols])
+            .collect()
+            .row(0, named=True)
+        )
 
     # Filter out constant entity columns (e.g. instrument_id='straddle_30d_atm')
     # that break cross-sectional IC computation by collapsing all entities into one group.
     # NOTE: join_cols retains ALL shared ID columns for data integrity during joins;
     # entity_cols is filtered separately for IC computation only.
-    entity_cols = [c for c in entity_cols if features[c].n_unique() > 1]
+    entity_cols = [c for c in entity_cols if cardinality[c] > 1]
 
     # Sort by cardinality descending so the primary entity (most unique values)
     # comes first. Important when downstream code uses entity_cols[0] for IC
     # (e.g., CME futures: 'product' has 30 values vs 'position' has 3).
-    entity_cols = sorted(entity_cols, key=lambda c: features[c].n_unique(), reverse=True)
+    entity_cols = sorted(entity_cols, key=lambda c: cardinality[c], reverse=True)
+
+    # Universe reduction, pushed into the SCANS instead of applied to the finished panel.
+    #
+    # It used to run at the bottom of this function, after features and labels had both been
+    # read whole and joined, which left a reduction with almost nothing to save: five of
+    # nasdaq100_microstructure's 115 symbols - 4.3% of the universe - still peaked at 39.98 GB
+    # against the full run's 51.5 GB. A preview that costs 78% of production is not a preview,
+    # and it is what stopped the smoke-then-full loop from running on the two largest case
+    # studies at all.
+    #
+    # The universe it selects is unchanged. ``top_entities`` ranks entities by their row count
+    # in the finished panel, so the count is taken here on the key-only inner join of the two
+    # scans, which carries exactly the rows the panel carries: the temporal join is a left join
+    # against a frame made unique on its keys, and neither it nor the META_LEAK drop moves a row.
+    #
+    # Production runs pass ``max_symbols=0`` and no ``symbols``, so neither branch fires.
+    #
+    # Bound before the filter because the fold geometry below is derived from the label frame,
+    # and a reduced universe is a different timeline: ``generate_cv_splits`` reads the unique
+    # timestamps of whatever frame it is handed, so dropping 25 of cme_futures' 30 products
+    # removes four sessions and moves every fold boundary two sessions earlier. Measured
+    # 2026-09-06: the same call over the full universe puts fold 0's validation window at
+    # 2019-01-03..2020-01-02 and over a five-product preview at 2018-12-31..2019-12-30. Nothing
+    # downstream follows that shift - ``canonical_window`` always reads the whole label parquet -
+    # so the backtest loads prices for the canonical window, the preview's predictions carry two
+    # sessions that window does not, and ``Strategy._decision_weights`` refuses the decision
+    # artifact for keys outside the price grid. Before #780 the reduction ran after both frames
+    # were read whole, so this call already saw the full timeline; pushing it into the scans is
+    # what put a reduced frame here.
+    unreduced_labels_lazy = labels_lazy
+    if entity_cols:
+        primary_entity = entity_cols[0]
+        keep: list | None = None
+        if symbols:
+            keep = list(symbols)
+        elif max_symbols > 0:
+            from utils.data_quality import top_entities
+
+            keep = top_entities(
+                features_lazy.select(join_cols).join(
+                    labels_lazy.select(join_cols), on=join_cols, how="inner"
+                ),
+                max_symbols,
+                primary_entity,
+            )
+        if keep is not None:
+            # implode: is_in against a bare Series of the same dtype is deprecated in polars
+            # as ambiguous, and membership in the value set is what is meant.
+            keep_values = pl.Series(primary_entity, keep).implode()
+            features_lazy = features_lazy.filter(pl.col(primary_entity).is_in(keep_values))
+            labels_lazy = labels_lazy.filter(pl.col(primary_entity).is_in(keep_values))
+            if temporal is not None and primary_entity in temporal_columns:
+                temporal = temporal.filter(pl.col(primary_entity).is_in(keep_values))
+
+    features = features_lazy.collect()
+    labels = labels_lazy.collect()
 
     # Join features + temporal (left join to keep all feature rows)
     temporal_by_fold_pd = None
@@ -651,33 +942,48 @@ def load_modeling_dataset(
     _temporal_feature_names = []
 
     if temporal is not None:
-        _temporal_keys = sorted(set(temporal.columns) & set(feature_keys))
+        temporal_schema = temporal.collect_schema()
+        _temporal_keys = sorted(set(temporal_columns) & set(feature_keys))
         casts = {
             k: features.schema[k]
             for k in _temporal_keys
-            if temporal.schema[k] != features.schema[k]
+            if temporal_schema[k] != features.schema[k]
         }
         if casts:
             temporal = temporal.cast(casts)
 
-        if "fold" in temporal.columns:
-            # Per-fold temporal features — join fold 0 as placeholder for schema,
-            # store full per-fold data for fold-aware preparation functions.
+        if "fold" in temporal_columns:
+            # Per-fold temporal features. The dataset carries one fold as a placeholder so the
+            # schema is complete; the per-fold values are substituted at fold preparation time
+            # by ``fold_temporal_frame``, which reads the fold it is asked for and no more.
             _temporal_feature_names = [
-                c for c in temporal.columns if c not in set(_temporal_keys) | {"fold"}
+                c for c in temporal_columns if c not in set(_temporal_keys) | {"fold"}
             ]
-            fold_ids = sorted(temporal["fold"].unique().to_list())
-            placeholder_fold = fold_ids[0]
-            placeholder = temporal.filter(pl.col("fold") == placeholder_fold).drop("fold")
-            placeholder_dedup = placeholder.unique(subset=_temporal_keys, keep="last")
+            fold_ids = sorted(temporal.select(pl.col("fold").unique()).collect()["fold"].to_list())
+            placeholder_dedup = (
+                temporal.filter(pl.col("fold") == fold_ids[0])
+                .drop("fold")
+                .unique(subset=_temporal_keys, keep="last")
+                .collect()
+            )
             dataset = features.join(placeholder_dedup, on=_temporal_keys, how="left", suffix="_t")
-            del placeholder, placeholder_dedup
+            del placeholder_dedup
 
-            # Convert to pandas for fold-preparation functions
-            temporal_by_fold_pd = temporal.to_pandas()
+            # Kept lazy. Materialising it here is what made a run hold every fold at once.
+            temporal_by_fold_pd = temporal
         else:
-            # Legacy: single feature set, join directly
-            temporal_dedup = temporal.unique(subset=_temporal_keys, keep="last")
+            # Fold-free: one value per key, joined straight on. A refit schedule produces this
+            # shape, and so does any stage that fits nothing per fold.
+            #
+            # The names are recorded here for the same reason the fold branch records them:
+            # they say which of the panel's columns came from the model-based artifact. They
+            # were not recorded before, so a fold-free artifact reported no model-based
+            # features at all while its columns sat in `dataset` regardless - the features
+            # were used, and nothing that asks which ones they are could answer. Every
+            # consumer of this list also requires `temporal_by_fold`, which stays None here,
+            # so filling it in changes no fold substitution.
+            _temporal_feature_names = [c for c in temporal_columns if c not in set(_temporal_keys)]
+            temporal_dedup = temporal.unique(subset=_temporal_keys, keep="last").collect()
             dataset = features.join(temporal_dedup, on=_temporal_keys, how="left", suffix="_t")
             del temporal_dedup
     else:
@@ -691,19 +997,16 @@ def load_modeling_dataset(
     if drop_cols:
         dataset = dataset.drop(drop_cols)
 
-    # Optional universe reduction
-    if symbols and entity_cols:
-        primary_entity = entity_cols[0]
-        dataset = dataset.filter(pl.col(primary_entity).is_in(list(symbols)))
-    elif max_symbols > 0 and entity_cols:
-        dataset = reduce_to_top_entities(dataset, entity_cols[0], max_symbols)
-
     # Feature columns = everything except IDs and label
     feature_names = [c for c in dataset.columns if c not in ID_COLS and c != label_col]
 
     # CV splits — read buffer from setup.yaml (explicit, handles non-standard labels)
     setup = yaml.safe_load((case_dir / "config" / "setup.yaml").read_text())
     label_buffer = resolve_label_buffer(case_study_id, primary_label, setup)
+    # Whether that duration counts sessions or calendar time is the label's to declare,
+    # not each consumer's to guess: `35D` to option expiry is calendar, `21D` on a daily
+    # equity panel is 21 sessions, and the duration alone cannot tell them apart.
+    buffer_unit = resolve_label_buffer_unit(case_study_id, primary_label, setup)
     if not label_buffer:
         raise ValueError(
             f"No explicit label buffer found for '{primary_label}' in "
@@ -714,11 +1017,12 @@ def load_modeling_dataset(
     # feature-joined frame lets warm-up nulls or feature availability shift the
     # calendar and makes model selection disagree with canonical_window().
     splits = generate_cv_splits(
-        labels,
+        unreduced_labels_lazy.select(date_col).unique().collect(),
         case_study_id=case_study_id,
         label_buffer=label_buffer,
         outcome_horizon=resolve_label_horizon(case_study_id, primary_label, setup),
         date_col=date_col,
+        buffer_unit=buffer_unit,
     )
     temporal_artifact_splits: list[dict[str, Any]] = []
     if temporal_by_fold_pd is not None:
@@ -762,7 +1066,12 @@ def load_modeling_dataset(
     if wf_horizon and wf_horizon.endswith("M") and wf_horizon[:-1].isdigit():
         wf_horizon = f"{int(wf_horizon[:-1]) * 30}D"
     try:
-        cv_config = make_wf_config(case_study_id, label_horizon=wf_horizon, date_col=date_col)
+        cv_config = make_wf_config(
+            case_study_id,
+            label_horizon=wf_horizon,
+            date_col=date_col,
+            buffer_unit=buffer_unit,
+        )
     except Exception as exc:
         warnings.warn(f"WalkForwardConfig creation failed for {case_study_id}: {exc}", stacklevel=2)
         cv_config = None
@@ -832,6 +1141,7 @@ def load_modeling_dataset(
         join_cols=join_cols,
         splits=splits,
         label_buffer=label_buffer,
+        case_study_id=case_study_id,
         cv_config=cv_config,
         task_type=task_type,
         num_classes=num_classes,
@@ -840,6 +1150,7 @@ def load_modeling_dataset(
         temporal_keys=_temporal_keys,
         temporal_feature_names=_temporal_feature_names,
         temporal_artifact_splits=temporal_artifact_splits,
+        feature_dtype="float32" if storage_dtype == pl.Float32 else "float64",
         eval_label_col=eval_label_col,
         lineage_inputs={
             "artifacts": input_artifacts,
@@ -856,25 +1167,22 @@ def reduce_to_top_entities(
 ) -> pl.DataFrame:
     """Keep the ``max_symbols`` entities with the most rows, ties broken by name.
 
-    Row counts tie readily on these panels, and a tie broken by frame order is
-    not stable across runs or across callers. The entity name is the secondary
-    key so that every caller reducing the same dataset to the same size gets the
-    same universe. Without it a reduced stage-04 run and the reduced model
-    notebooks downstream of it can choose different equal-history symbols, and
-    the ones only a single side chose carry null temporal features - a wrong
-    answer that runs clean rather than a failure.
+    The modelling-side entry point to :func:`utils.data_quality.top_entities`, which
+    is the one rule; the loaders reach the same one through ``apply_max_symbols``.
+    Two callers reducing the same dataset to the same size have to get the same
+    universe, or the ones only a single side chose carry null temporal features - a
+    wrong answer that runs clean rather than a failure.
 
     Production runs set ``max_symbols=0`` and never reach this.
     """
-    top = (
-        dataset.group_by(primary_entity)
-        .len()
-        .sort(["len", primary_entity], descending=[True, False])
-        .head(max_symbols)
-    )
+    from utils.data_quality import top_entities
+
+    selected = top_entities(dataset, max_symbols, primary_entity)
     # implode: is_in against a bare Series of the same dtype is deprecated in
     # polars as ambiguous, and membership in the value set is what is meant.
-    return dataset.filter(pl.col(primary_entity).is_in(top[primary_entity].implode()))
+    return dataset.filter(
+        pl.col(primary_entity).is_in(pl.Series(primary_entity, selected).implode())
+    )
 
 
 def _inclusive_end_of(boundary: str) -> pd.Timestamp:
@@ -908,19 +1216,25 @@ def append_holdout_fold_if_needed(
 ) -> None:
     """Append a holdout fold to ``mds.splits`` when ``prediction_split=='holdout'``.
 
-    The holdout fold trains on everything available before ``holdout_start`` and
-    validates on ``[holdout_start, holdout_end]``. It becomes fold N+1, so downstream
-    code iterating ``mds.splits`` produces one holdout prediction set per
-    (training run, config) pair without any other change to the training loop.
+    The boundaries come from :func:`case_studies.research.holdout.build_holdout_cv`, which is
+    the one derivation of them. This function used to compute its own, and computed them
+    wrongly: it set ``train_end = val_start = holdout_start``, where ``build_holdout_cv`` stops
+    one label buffer short. Two things were wrong with that. The last training label's outcome
+    window reached into the holdout, which is the leak the buffer exists to prevent; and the
+    training mask in this module is inclusive at both ends, so the boundary session sat in the
+    training set *and* the evaluation set of the same fold - a holdout model fitted on a session
+    it is scored on, independent of any label horizon.
 
-    "Everything available" is ``min(train_start)`` across the CV folds, not
-    ``splits[0]["train_start"]``. ``generate_cv_splits`` steps backward from the holdout
-    boundary, so fold 0 is the most *recent* fold and carries the *latest* training start.
-    Measured on etfs: ``splits[0]`` starts 2008-01-02 where the earliest fold starts
-    2005-01-03, so indexing the list built a holdout retrain that silently discarded three
-    years. ``case_studies/etfs/04_model_based_features.py`` says so in its CV Fold Setup
-    prose - "Indexing the list hands it the shortest window of the set, silently" - and
-    this function cited that notebook while doing the thing it warns against.
+    The fold becomes fold N+1, so downstream code iterating ``mds.splits`` produces one holdout
+    prediction set per (training run, config) pair without any other change to the training loop.
+
+    "Everything available" is ``min(train_start)`` across the CV folds, which
+    :func:`utils.cv_splits.earliest_train_start` reads from the windows. Indexing the
+    list is what this function used to do, and it silently discarded three years on
+    etfs - 2008-01-02 against an earliest fold start of 2005-01-03 - because fold 0
+    was then the most recent fold. Under ml4t-diagnostic 0.1.4 fold 0 is the earliest
+    and ``splits[0]["train_start"]`` happens to agree, which is exactly why the read
+    stays on the boundaries: it was right before the order changed and is right after.
 
     Idempotent — if the trailing fold already covers the holdout window
     (val_end matches setup.yaml's holdout_end), no fold is appended.
@@ -939,6 +1253,8 @@ def append_holdout_fold_if_needed(
             "at least one CV fold for this case study."
         )
         raise RuntimeError(msg)
+    from case_studies.research.holdout import build_holdout_cv
+
     path = get_case_study_dir(case_study_id) / "config" / "setup.yaml"
     with open(path) as f:
         setup = yaml.safe_load(f)
@@ -957,9 +1273,9 @@ def append_holdout_fold_if_needed(
     # string) and risked a tz-naive/aware comparison on the pandas filter path.
     ho_start_ts = pd.Timestamp(holdout_start)
     ho_end_ts = _inclusive_end_of(holdout_end)
-    # Any fold covering the holdout window, not just the trailing one: the CV
-    # folds run newest first and only the appended holdout fold lands at the end,
-    # so reading one position is a second place the ordering has to be right.
+    # Any fold covering the holdout window, not just the trailing one: reading a
+    # single position is a second place the ordering would have to be right, and
+    # the appended holdout fold is not the only thing that can land at the end.
     already_covered = any(
         s.get("val_end") is not None
         and pd.Timestamp(s["val_end"]) == ho_end_ts
@@ -968,10 +1284,18 @@ def append_holdout_fold_if_needed(
     )
     if already_covered:
         return
+    # The label is only read for the outcome-horizon check: `build_holdout_cv` takes the gap
+    # from the case study's widest declared buffer, because one fold serves every label.
+    derived = build_holdout_cv(
+        {"label": str(setup["labels"]["primary"]), "computation": {"cv": {"folds": mds.splits}}},
+        case_study=case_study_id,
+        timeline=mds.dataset.get_column(mds.date_col).unique().sort().to_list(),
+    )
+    fold = dict(derived["folds"][0])
     holdout_fold = {
         "fold": len(mds.splits),
-        "train_start": earliest_train_start(mds.splits),
-        "train_end": ho_start_ts,
+        "train_start": pd.Timestamp(fold["train_start"]),
+        "train_end": pd.Timestamp(fold["train_end"]),
         "val_start": ho_start_ts,
         "val_end": ho_end_ts,
     }
@@ -1071,6 +1395,8 @@ def load_configs(
     case_study_id: str,
     label: str,
     family: str,
+    *,
+    case_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Load model configurations for a label and family.
 
@@ -1087,6 +1413,14 @@ def load_configs(
         ``config/training/``.
     family : str
         Model family (e.g., "linear", "gbm", "deep_learning").
+    case_dir : Path, optional
+        The case study directory to read the menu and presets from. Callers
+        holding a ``Study`` pass ``study.root``, which the study resolved when it
+        was opened. Without it the directory comes from ``ML4T_OUTPUT_DIR``, which
+        is process-global and can be changed after the study was opened - a
+        read-only release study clears the variable on activation, so anything
+        that re-installs it afterwards silently redirects these reads to a
+        different, possibly reduced, set of menus.
 
     Returns
     -------
@@ -1098,7 +1432,7 @@ def load_configs(
     ConfigError
         If the training menu file or a referenced preset is missing.
     """
-    case_dir = get_case_study_dir(case_study_id)
+    case_dir = Path(case_dir) if case_dir is not None else get_case_study_dir(case_study_id)
     label_config_path = case_dir / "config" / "training" / f"{label}.yaml"
 
     if not label_config_path.exists():
@@ -1217,10 +1551,7 @@ def validate_temporal_fold_coverage(
         dataset_dates = dataset.select(date_col).unique()[date_col].to_pandas()
     else:
         dataset_dates = dataset[date_col].drop_duplicates()
-    if isinstance(temporal_by_fold, pl.DataFrame):
-        temporal_pd = temporal_by_fold.select([date_col, "fold"]).unique().to_pandas()
-    else:
-        temporal_pd = temporal_by_fold[[date_col, "fold"]].drop_duplicates()
+    temporal_pd = temporal_fold_index(temporal_by_fold, date_col).to_pandas()
 
     dataset_index = pd.DatetimeIndex(pd.to_datetime(dataset_dates, utc=True)).unique().sort_values()
     temporal_pd = temporal_pd.copy()
@@ -1306,6 +1637,65 @@ def validate_temporal_split_geometry(
         )
 
 
+def fold_temporal_frame(
+    temporal_by_fold: Any,
+    fold_id: int,
+    *,
+    temporal_keys: Sequence[str] | None = None,
+    schema: Any = None,
+) -> pl.DataFrame:
+    """The temporal feature rows of one fold, as polars, whatever form the artifact is held in.
+
+    One definition, because selecting a fold out of the temporal artifact was written four
+    separate times - twice against pandas and twice against polars - and copies of a selection
+    rule agree only by luck. It is also the only place that decides how much of the artifact is
+    read: given a :class:`polars.LazyFrame` the fold predicate reaches the scan, so a run holds
+    one fold's rows rather than every fold's.
+
+    ``temporal_keys`` deduplicates, keeping the last row per key as the artifact writer intends.
+    ``schema`` is the frame the result will be joined to; the join keys are cast to match it,
+    because an artifact written with a different integer width joins to nothing and reports
+    itself as missing values rather than as an error.
+    """
+    if temporal_by_fold is None:
+        raise ValueError("no temporal artifact to select a fold from")
+
+    if isinstance(temporal_by_fold, pl.LazyFrame):
+        frame = temporal_by_fold.filter(pl.col("fold") == fold_id).drop("fold").collect()
+    elif isinstance(temporal_by_fold, pl.DataFrame):
+        frame = temporal_by_fold.filter(pl.col("fold") == fold_id).drop("fold")
+    else:  # pandas, for artifacts and tests that still build one eagerly
+        frame = pl.from_pandas(
+            temporal_by_fold[temporal_by_fold["fold"] == fold_id].drop(columns=["fold"])
+        )
+
+    if temporal_keys:
+        frame = frame.unique(subset=list(temporal_keys), keep="last")
+    if schema is not None:
+        casts = {
+            key: schema[key]
+            for key in (temporal_keys or [])
+            if key in frame.columns and key in schema and frame.schema[key] != schema[key]
+        }
+        if casts:
+            frame = frame.cast(casts)
+    return frame
+
+
+def temporal_fold_index(temporal_by_fold: Any, date_col: str) -> pl.DataFrame:
+    """The distinct ``(date, fold)`` pairs an artifact carries, without reading its features.
+
+    What every coverage check needs, and all it needs. Against a lazy artifact the projection
+    reaches the scan, so this costs two columns rather than the whole table.
+    """
+    columns = [date_col, "fold"]
+    if isinstance(temporal_by_fold, pl.LazyFrame):
+        return temporal_by_fold.select(columns).unique().collect()
+    if isinstance(temporal_by_fold, pl.DataFrame):
+        return temporal_by_fold.select(columns).unique()
+    return pl.from_pandas(temporal_by_fold[columns].drop_duplicates())
+
+
 def replace_temporal_columns(
     dataset_pd: pd.DataFrame,
     mask: np.ndarray,
@@ -1319,8 +1709,9 @@ def replace_temporal_columns(
     Returns a copy of the masked rows with temporal columns overwritten.
     """
     rows = dataset_pd.loc[mask].copy()
-    fold_temp = temporal_by_fold[temporal_by_fold["fold"] == fold_id].drop(columns=["fold"])
-    fold_temp = fold_temp.drop_duplicates(subset=temporal_keys, keep="last")
+    fold_temp = fold_temporal_frame(
+        temporal_by_fold, fold_id, temporal_keys=temporal_keys
+    ).to_pandas()
 
     # Drop old temporal columns and merge fold-specific ones
     rows = rows.drop(columns=temporal_feature_names, errors="ignore")
@@ -1560,15 +1951,12 @@ def prepare_single_fold(
             assert temporal_by_fold is not None
             assert temporal_keys is not None
             assert temporal_feature_names is not None
-            fold_temp_pd = temporal_by_fold[temporal_by_fold["fold"] == fold_id].drop(
-                columns=["fold"]
+            fold_temp_pl = fold_temporal_frame(
+                temporal_by_fold,
+                fold_id,
+                temporal_keys=temporal_keys,
+                schema=train_df.schema,
             )
-            fold_temp_pl = pl.from_pandas(fold_temp_pd)
-            fold_temp_pl = fold_temp_pl.unique(subset=temporal_keys, keep="last")
-            # Cast temporal keys to match dataset dtypes
-            for k in temporal_keys:
-                if k in fold_temp_pl.columns and fold_temp_pl.schema[k] != train_df.schema[k]:
-                    fold_temp_pl = fold_temp_pl.cast({k: train_df.schema[k]})
 
             for df_name in ("train_df", "val_df"):
                 df = train_df if df_name == "train_df" else val_df
@@ -1796,6 +2184,50 @@ def compute_classification_metrics(
                 metrics[f"auc_class_{c}"] = auc
 
     return metrics
+
+
+def cross_sectional_ic_mean(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    dates: np.ndarray,
+    entities: np.ndarray,
+    *,
+    min_obs: int = 10,
+) -> float:
+    """Mean cross-sectional Spearman IC over the dates where it is defined.
+
+    The library computes the per-date series from two polars frames. Model
+    evaluation reaches it holding four aligned numpy arrays instead - what a
+    scikit-learn or Optuna objective has in hand inside a fold - so this adapts
+    the one to the other. It is the only thing this function does: the
+    correlation itself is `ml4t.diagnostic`'s.
+
+    A date carries no coefficient when fewer than `min_obs` entities are priced,
+    or when every prediction or every return ties. The library reports those as
+    null; the `is_finite` filter is belt-and-braces against an environment
+    resolving an ml4t-diagnostic older than the 0.1.2 floor, which returned NaN
+    and would poison the mean (#493).
+
+    Returns NaN when no date has a defined coefficient - a real answer to "what
+    was the average IC", unlike 0.0, which reads as "measured, and it was zero".
+    """
+    # Local import: `ml4t.diagnostic` brings scikit-learn's OpenMP runtime up
+    # transitively, and this module is imported by notebooks that must load a
+    # gradient-boosting library first. See .github/scripts/check_openmp_import_order.py.
+    from ml4t.diagnostic.metrics import cross_sectional_ic_series
+
+    ic_per_date = cross_sectional_ic_series(
+        pl.DataFrame({"timestamp": dates, "symbol": entities, "prediction": y_pred}),
+        pl.DataFrame({"timestamp": dates, "symbol": entities, "forward_return": y_true}),
+        pred_col="prediction",
+        ret_col="forward_return",
+        date_col="timestamp",
+        entity_col="symbol",
+        method="spearman",
+        min_obs=min_obs,
+    )
+    defined = ic_per_date.drop_nulls("ic").filter(pl.col("ic").is_finite())
+    return float(defined["ic"].mean()) if defined.height else float("nan")
 
 
 # Deprecated private aliases. Thirty notebook cells import these names with their leading

@@ -14,388 +14,353 @@
 # ---
 
 # %% [markdown]
-# # Causal DML — US Equities 12-1 Momentum
+# # US equities panel: a different question - does momentum cause the return, or predict it?
 #
-# Does the classic Jegadeesh--Titman 12-1 momentum factor *cause* future daily
-# returns, or is the observed premium confounded by volatility and liquidity?
-# On the broadest panel in the book (3,199 stocks, 1962--2018), DML separates
-# the causal effect of `past_ret_12m_skip` from correlated risk factors. With
-# 53.8% confounding and a borderline p-value (0.122), the answer is nuanced:
-# momentum's daily effect is not statistically significant after deconfounding.
+# Every notebook up to here has asked a predictive question: given what is known about a stock
+# today, what return follows? A model that answers it well has found an association, and an
+# association is enough to trade on. It is not enough to act on in any other way.
 #
-# **Treatment rationale**: 12-month skip-month return is the canonical momentum
-# signal. Volatility (21d) and volume ratio confound the relationship --- illiquid
-# stocks with high past returns appear to have stronger momentum, but part of this
-# reflects liquidity risk rather than a genuine behavioral effect.
+# This notebook asks the other question. **Does the treatment change the outcome, or does
+# something else move both?** The treatment here is `past_ret_12m_skip` - a stock's return over
+# the past year excluding the most recent month, the standard momentum measure - and the outcome
+# is the forward return. Momentum predicts returns; that has been true in the panel throughout.
+# Whether it *causes* them is a different claim, and the difference matters because a predictive
+# relation can be an artifact of something both variables respond to.
 #
-# **Learning Objectives**:
-# - Quantify confounding bias in the momentum--return relationship (53.8%)
-# - Understand why broad panels weaken causal identification (regime diversity)
-# - Contrast daily reversal (negative sign) with monthly continuation
+# **The something-else is called a confounder**, and this case study declares three: recent
+# volatility, an illiquidity rank, and a volume ratio. Each plausibly moves both a stock's past
+# year and its next return, so leaving them alone would let their effect be attributed to
+# momentum.
 #
-# **Book Reference**: Chapter 15, Section 15.6 (Cross-Dataset Causal Evidence)
+# **Double machine learning is a way of removing them without assuming the shape of the
+# relation.** It works in two steps. First, two models predict the outcome from the confounders,
+# and the treatment from the confounders - these are the **nuisance models**, so called because
+# nobody is interested in their predictions; they exist to be subtracted. Second, the treatment
+# effect is estimated from what each model got wrong: the part of the outcome the confounders do
+# not explain, regressed on the part of the treatment they do not explain. Whatever the confounders
+# accounted for has been taken out of both sides before the effect is estimated.
 #
-# **Prerequisites**: `03_financial_features.py`, `04_temporal.py`
-
-# %% [markdown]
-# ## Identifying Assumptions
+# **"Double" is why machine learning is safe here.** Using a flexible model to remove a confounder
+# would normally bias the estimate, because the model's own error leaks into what is left.
+# Residualising *both* sides and estimating from the two residual series is what cancels that
+# leakage to first order.
 #
-# DML estimates a causal effect under three assumptions:
-# 1. **Conditional ignorability**: No unobserved confounders — all backdoor paths
-#    between treatment and outcome are blocked by the observed confounders.
-# 2. **Overlap (positivity)**: Every unit has a nonzero probability of receiving
-#    any treatment level, conditional on confounders.
-# 3. **SUTVA**: One unit's treatment doesn't affect another's outcome.
+# **The nuisance models are fitted walk-forward with an embargo**, the same way every predictive
+# model in this case study is. A confounder model fitted on the whole sample would have removed
+# something it learned from the future, and the effect estimated afterwards would inherit it.
 #
-# These are untestable. The refutation test below provides indirect evidence
-# but cannot prove the assumptions hold.
+# **Learning objectives.** By the end of this notebook you will be able to:
+#
+# - State the difference between a predictive and a causal claim about the same pair of variables,
+#   and say which one a backtest needs.
+# - Name what a confounder is, and say what happens to an effect estimate if one is left out.
+# - Describe the two steps of double machine learning and say what each residualisation removes.
+# - Say why the nuisance models have to be fitted walk-forward, and what a whole-sample fit would
+#   have leaked.
+# - State the three assumptions this estimate rests on, and say why a small p-value does not
+#   establish any of them.
+# - Explain what a permutation refutation does and does not rule out.
+#
+# **Book reference**: Chapter 15, Section 15.6 (Cross-Dataset Causal Evidence).
+#
+# **Prerequisites**: [`03_financial_features`](03_financial_features.ipynb) and
+# [`04_model_based_features`](04_model_based_features.ipynb) have written the feature matrices, and
+# [`02_labels`](02_labels.ipynb) the outcome label.
+#
+# **What it writes**: one causal result in `run_log/registry.db`.
+# [`15_model_analysis`](15_model_analysis.ipynb) reads it in a section of its own. It is never
+# placed beside a predictive score and never enters a prediction set, because it answers a
+# different question and is not a ranking.
 
 # %%
-"""Causal DML — walk-forward estimation with refutation tests."""
+"""Estimate the configured causal effect through the shared DML boundary."""
 
-import warnings
+import os
+from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
+import polars as pl
 import yaml
 
-from case_studies.utils.causal import (
-    classify_refutation,
-    embargo_from_buffer,
-    format_dml_summary,
-    register_causal_run,
-    run_dml_analysis,
-)
-from utils.modeling import load_configs, load_modeling_dataset
+from case_studies.research import open_study, supersedes_for
+from utils.modeling import load_configs
 from utils.paths import get_case_study_dir
+from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
-warnings.filterwarnings("ignore")
+# %% [markdown]
+# ## What this estimate rests on, and what it cannot establish
+#
+# Three assumptions carry the causal claim, and none of them is testable from the data:
+#
+# - **No unmeasured confounder.** Every variable that moves both the treatment and the outcome is
+#   in the declared list. If one is missing, its effect is still attributed to momentum, and
+#   nothing in the output says so.
+# - **Overlap.** At every combination of confounder values that occurs, stocks are found across the
+#   range of the treatment. Where they are not, the effect at those values is extrapolated rather
+#   than estimated.
+# - **No interference.** One stock's treatment does not change another stock's outcome. On a
+#   cross-sectional strategy operating in one market this is the least comfortable of the three:
+#   flows into momentum names are exactly the mechanism by which one stock's past return could move
+#   another's future one.
+#
+# **Two things are computed that are sometimes mistaken for tests of the above.** The uncertainty
+# interval is corrected for serial dependence, because overlapping forward returns are not
+# independent observations and an uncorrected interval would be too narrow. And the **refutation**
+# permutes the treatment in blocks within each stock and re-estimates, asking how often an effect
+# this large appears once the treatment's real timing is destroyed. Blocks rather than individual
+# rows, because permuting row by row would break the serial dependence the test is meant to
+# preserve, and would return a p-value that reads like a refutation without being one.
+#
+# **Both check the estimator, not the assumptions.** A small p-value says the effect is unlikely
+# under the permuted null. It says nothing about whether a confounder was left out, and no
+# refutation can, because the missing variable is missing from the permutation too.
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "us_equities_panel"
 PRIMARY_LABEL = ""
+CONFIG_NAME = "dml"
+NUISANCE_OVERRIDES = {}
+EXECUTION_TIER = "canonical"
+WORKSPACE = "experiments"
 MAX_SYMBOLS = 0
-RANDOM_SEED = 42
-CV_FOLDS = 5
-MAX_SAMPLES = 50000
-N_PLACEBO = 100
-
-# %%
-# %%
-CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
-
-# Resolve label from setup.yaml if not overridden
-setup = yaml.safe_load((CASE_DIR / "config" / "setup.yaml").read_text())
-if not PRIMARY_LABEL:
-    PRIMARY_LABEL = setup["labels"]["primary"]
-
-# Load DML config and apply Papermill overrides
-causal_configs = load_configs(CASE_STUDY_ID, PRIMARY_LABEL, "causal_dml")
-dml_cfg = causal_configs[0]
-
-for key, val in [
-    ("n_folds", CV_FOLDS),
-    ("n_placebo", N_PLACEBO),
-    ("max_samples", MAX_SAMPLES),
-    ("seed", RANDOM_SEED),
-]:
-    if dml_cfg.get(key, val) != val:
-        dml_cfg[key] = val
-
-CV_FOLDS = dml_cfg.get("n_folds", 5)
-N_PLACEBO = dml_cfg.get("n_placebo", 100)
-MAX_SAMPLES = dml_cfg.get("max_samples", 50000)
-RANDOM_SEED = dml_cfg.get("seed", 42)
-
-print(f"DML config: {dml_cfg['config_name']}")
-
-# Read causal config from setup.yaml
-causal_cfg = setup.get("causal", {})
-TREATMENT_COL = causal_cfg.get("treatment", "")
-CONFOUNDER_COLS = causal_cfg.get("confounders", [])
-DML_METHOD = causal_cfg.get("method", "walk_forward_dml")
-
-if not TREATMENT_COL:
-    raise ValueError(
-        f"No causal.treatment in {CASE_STUDY_ID}/setup.yaml. "
-        "Add a 'causal:' section with treatment and confounders."
-    )
-
-np.random.seed(RANDOM_SEED)
-
-print("Causal DML Configuration:")
-print(f"  Case study: {CASE_STUDY_ID}")
-print(f"  Treatment: {TREATMENT_COL}")
-print(f"  Outcome: {PRIMARY_LABEL}")
-print(f"  Confounders: {CONFOUNDER_COLS}")
-print(f"  CV folds: {CV_FOLDS}")
-print(f"  Placebo reps: {N_PLACEBO}")
+PREVIEW_MAX_SAMPLES = 0
+PREVIEW_N_FOLDS = 0
+PREVIEW_N_PLACEBO = 0
+SUPERSEDES_CAUSAL: str = ""
 
 # %% [markdown]
-# ## 1. Load Artifacts
+# ## Configure the estimand and execution
 #
-# Load pre-computed features, temporal features, and labels using the
-# shared modeling infrastructure.
+# The treatment and complete confounder list live in `config/setup.yaml`; the outcome is the label
+# selected here. `CONFIG_NAME` chooses a published DML configuration. `NUISANCE_OVERRIDES` changes
+# validated `HistGradientBoostingRegressor` parameters without duplicating the remaining defaults.
+#
+# Canonical execution uses the complete declared pre-holdout population. A reduced pipeline check
+# must use `EXECUTION_TIER = 'preview'` and declare at least one reduction. Preview reductions are
+# part of the immutable identity and cannot enter canonical comparisons or conclusions.
 
 # %%
-mds = load_modeling_dataset(CASE_STUDY_ID, PRIMARY_LABEL, max_symbols=MAX_SYMBOLS)
+case_dir = get_case_study_dir(CASE_STUDY_ID)
+setup = yaml.safe_load((case_dir / "config" / "setup.yaml").read_text())
+label = PRIMARY_LABEL or setup["labels"]["primary"]
 
-dataset = mds.dataset
-feature_names = mds.feature_names
-label_col = mds.label_col
-date_col = mds.date_col
-entity_cols = mds.entity_cols
+published_configs = load_configs(CASE_STUDY_ID, label, family="causal_dml")
+published_names = [str(config["config_name"]) for config in published_configs]
+if CONFIG_NAME not in published_names:
+    raise ValueError(f"Unknown DML configuration: {CONFIG_NAME!r}")
 
-# Verify treatment and confounders are in features
-available = set(dataset.columns)
-assert TREATMENT_COL in available, (
-    f"Treatment '{TREATMENT_COL}' not found in features: {sorted(available)}"
-)
+causal_config = setup.get("causal") or {}
+treatment = causal_config.get("treatment")
+confounders = list(causal_config.get("confounders") or [])
+if not treatment:
+    raise ValueError("config/setup.yaml must declare causal.treatment")
+if not confounders:
+    raise ValueError("config/setup.yaml must declare at least one causal.confounder")
 
-missing_conf = [c for c in CONFOUNDER_COLS if c not in available]
-if missing_conf:
-    print(f"WARNING: Missing confounders {missing_conf}, dropping them")
-    CONFOUNDER_COLS = [c for c in CONFOUNDER_COLS if c in available]
-
-assert len(CONFOUNDER_COLS) >= 1, "Need at least 1 confounder for DML"
-
-print(f"\nDataset: {len(dataset):,} rows x {len(feature_names)} features")
-print(f"Label: {label_col} | Date: {date_col} | Entities: {entity_cols}")
-
-# %% [markdown]
-# ## 2. Prepare Analysis Data
-#
-# Convert to pandas, sort by time, and subset if needed.
-
-# %%
-# Select analysis columns
-analysis_cols = [date_col] + entity_cols + [TREATMENT_COL, label_col] + CONFOUNDER_COLS
-analysis_cols = list(dict.fromkeys(analysis_cols))  # deduplicate
-
-merged_clean = (
-    dataset.select([c for c in analysis_cols if c in available])
-    .drop_nulls()
-    .sort(date_col)
-    .to_pandas()
-)
-
-EMBARGO_PERIODS = embargo_from_buffer(mds.label_buffer)
-
-BLOCK_SIZE = EMBARGO_PERIODS
-
-# Temporal subset if too large
-if len(merged_clean) > MAX_SAMPLES:
-    print(f"Taking most recent {MAX_SAMPLES:,} from {len(merged_clean):,}")
-    merged_clean = merged_clean.iloc[-MAX_SAMPLES:]
-
-# %% [markdown]
-# > **Note**: With `MAX_SAMPLES` capping, results reflect recent-period effects.
-# > For large panels, this covers a narrow time window and should not be interpreted
-# > as stable long-run causal relationships.
-
-# %%
-print(f"\nAnalysis data: {len(merged_clean):,} rows")
-print(f"Date range: {merged_clean[date_col].min()} to {merged_clean[date_col].max()}")
-print(f"Embargo: {EMBARGO_PERIODS} periods | Block size: {BLOCK_SIZE}")
-if entity_cols:
-    print(f"Entities: {merged_clean[entity_cols[0]].nunique()}")
-
-# %% [markdown]
-# ## 3. Run DML Analysis
-#
-# Full pipeline: naive OLS baseline, DML with walk-forward CV + embargo,
-# and block permutation refutation test. HAC bandwidth is set automatically
-# using the cube-root rule: $\lfloor n^{1/3} \rfloor$.
-
-# %%
-results = run_dml_analysis(
-    merged_clean,
-    treatment_col=TREATMENT_COL,
-    outcome_col=label_col,
-    confounder_cols=CONFOUNDER_COLS,
-    n_folds=CV_FOLDS,
-    embargo=EMBARGO_PERIODS,
-    n_placebo=N_PLACEBO,
-    block_size=BLOCK_SIZE,
-    seed=RANDOM_SEED,
-)
-
-print(format_dml_summary(results))
-
-# %% [markdown]
-# **US Equities Momentum — Interpretation**: The classic 12-1 momentum
-# effect on next-day returns shows substantial confounding bias.
-# Naive OLS estimates a daily momentum coefficient of −0.0003, but
-# DML reveals −0.0010 after orthogonalization — volatility (21d) and
-# volume ratio absorb roughly two-thirds of the absolute effect.
-# Amihud illiquidity was specified as a confounder but dropped due to
-# data availability, leaving a 2-confounder model.
-#
-# Both evidence gates clear: HAC t≈−2.2 (p=0.031) and the
-# block-permutation refutation passes decisively (empirical p<0.01).
-# US Equities is one of four panels in the cross-dataset trial where
-# both gates support a causal channel (alongside ETFs, US Firms, and
-# SP500 Options). The negative direction is consistent with short-term
-# reversal at the daily horizon — high past 12-1 momentum causally
-# predicts lower next-day returns even after orthogonalizing the main
-# microstructure confounders.
-
-# %% [markdown]
-# ## 4. Statistical Assessment
-#
-# Confounding bias is defined as:
-#
-# $$\text{Bias \%} = \frac{\hat{\theta}_{\text{naive}} - \hat{\theta}_{\text{DML}}}{|\hat{\theta}_{\text{DML}}|} \times 100$$
-#
-# Positive values mean naive OLS overstates the absolute effect.
-
-# %%
-dml_result = results["dml_result"]
-naive_effect = results["naive_effect"]
-dml_effect = dml_result["theta"]
-se_hac = dml_result["se_hac"]
-bias_pct = results["confounding_bias_pct"]
-
-# p-value computed in run_dml_analysis (no duplication)
-p_value = results["p_value_hac"]
-
-ref = results.get("refutation", {})
-p_value_perm = ref.get("empirical_p", 1.0)
-ref_class = ref.get("refutation_class", classify_refutation(p_value_perm))
-
-print("Statistical significance:")
-print(f"  p-value (HAC): {p_value:.4f}")
-print(f"  Significant at 5%: {'Yes' if p_value < 0.05 else 'No'}")
-if ref:
-    print(f"  Refutation: {ref_class} (p={p_value_perm:.4f})")
-
-# %% [markdown]
-# > **When should you be suspicious of large DML corrections?** A naive-to-DML
-# > amplification exceeding 5x warrants scrutiny. Possible causes:
-# > (1) nuisance models overfitting and stripping outcome-relevant variation,
-# > (2) weak instrument-like behavior where the treatment residual has low variance,
-# > (3) genuine massive confounding that naive OLS entirely misses.
-# > The refutation test helps distinguish (3) from (1-2): if placebos also show
-# > inflated effects, the DML correction may be unreliable.
-
-# %% [markdown]
-# ### Permutation Distribution
-#
-# The observed DML effect (red line) against the distribution of placebo
-# effects under block permutation of the treatment.
-
-# %%
-placebo_arr = np.array(ref.get("placebo_effects", []))
-if len(placebo_arr) > 0:
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.hist(placebo_arr, bins=30, alpha=0.7, label="Placebo effects")
-    ax.axvline(dml_effect, color="red", linewidth=2, label=f"Observed ({dml_effect:.6f})")
-    ax.set_xlabel("Treatment Effect")
-    ax.set_ylabel("Count")
-    ax.set_title("Block Permutation Refutation")
-    ax.legend()
-    fig.show()
-
-# %% [markdown]
-# ## 5. Save Results
-
-# %%
-
-# Per-observation treatment contributions from DML residuals
-T_res = dml_result.get("T_res", np.full(len(merged_clean), np.nan))
-Y_res = dml_result.get("Y_res", np.full(len(merged_clean), np.nan))
-
-# Residuals are NaN for training-only obs; align to merged_clean length
-# (residuals cover the full analysis data before subsampling)
-n_analysis = len(merged_clean)
-if len(T_res) > n_analysis:
-    # Residuals from full data; take tail matching our subsample
-    T_res = T_res[-n_analysis:]
-    Y_res = Y_res[-n_analysis:]
-
-symbol_col = entity_cols[0] if entity_cols else None
-
-predictions = pd.DataFrame(
+config_menu = pl.DataFrame(
     {
-        "timestamp": pd.to_datetime(merged_clean[date_col]),
-        "symbol": merged_clean[symbol_col].values if symbol_col else "ALL",
-        "y_true": merged_clean[label_col].values,
-        "treatment_value": merged_clean[TREATMENT_COL].values,
-        "treatment_residual": T_res,
-        "outcome_residual": Y_res,
-        "treatment_contribution": T_res * dml_effect,
-        "ate": dml_effect,
-        "ate_se": se_hac,
+        "config_name": published_names,
+        "selected": [name == CONFIG_NAME for name in published_names],
+        "treatment": [str(treatment)] * len(published_names),
+        "outcome": [label] * len(published_names),
     }
 )
+config_menu
 
-# Write standardized results JSON
-summary = {
-    "treatment": TREATMENT_COL,
-    "outcome": label_col,
-    "confounders": CONFOUNDER_COLS,
-    "n_observations": dml_result["n_obs"],
-    "naive_effect": float(naive_effect),
-    "dml_effect": float(dml_effect),
-    "dml_se_iid": float(dml_result["se_iid"]),
-    "dml_se_hac": float(se_hac),
-    "confounding_bias_pct": float(bias_pct),
-    "p_value_hac": float(p_value),
-    "hac_maxlags": int(results.get("hac_maxlags", 0)),
-    "refutation_p_value": float(p_value_perm),
-    "refutation_class": ref_class,
-}
+# %%
+preview_reductions = {}
+if MAX_SYMBOLS:
+    preview_reductions["max_symbols"] = int(MAX_SYMBOLS)
+if PREVIEW_MAX_SAMPLES:
+    preview_reductions["max_samples"] = int(PREVIEW_MAX_SAMPLES)
+if PREVIEW_N_FOLDS:
+    preview_reductions["n_folds"] = int(PREVIEW_N_FOLDS)
+if PREVIEW_N_PLACEBO:
+    preview_reductions["n_placebo"] = int(PREVIEW_N_PLACEBO)
 
-register_causal_run(
-    case_study_id=CASE_STUDY_ID,
-    label=PRIMARY_LABEL,
-    results=results,
-    predictions=predictions,
-    treatment_col=TREATMENT_COL,
-    confounder_cols=CONFOUNDER_COLS,
-    n_folds=CV_FOLDS,
-    embargo=EMBARGO_PERIODS,
-    notebook="14_causal_dml",
+# Both tiers resolve the study through `open_study`. It reads the labels and features in place and
+# redirects only writes, so a preview run scores the same inputs a canonical one does and cannot
+# publish over it.
+if EXECUTION_TIER == "canonical":
+    if preview_reductions:
+        raise ValueError("Canonical execution cannot declare preview reductions")
+    study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER)
+elif EXECUTION_TIER == "preview":
+    if not preview_reductions:
+        raise ValueError("Preview execution requires at least one declared reduction")
+    study = open_study(
+        CASE_STUDY_ID,
+        execution_tier=EXECUTION_TIER,
+        workspace=Path(os.environ.get("ML4T_OUTPUT_DIR") or WORKSPACE),
+    )
+else:
+    raise ValueError("EXECUTION_TIER must be 'canonical' or 'preview'")
+
+request = study.causal(
+    method="dml",
+    label=label,
+    config_name=CONFIG_NAME,
+    overrides={"nuisance_params": dict(NUISANCE_OVERRIDES)} if NUISANCE_OVERRIDES else {},
+    execution_tier=EXECUTION_TIER,
+    preview_reductions=preview_reductions,
+    supersedes=supersedes_for(SUPERSEDES_CAUSAL, label, labels=[label]),
+)
+resolved = request.resolve()
+
+# %% [markdown]
+# ## Inspect the resolved request
+#
+# Resolution fails before fitting if the finalized artifacts omit the treatment or any configured
+# confounder. The table below is what the run will actually estimate: the treatment and the
+# confounder list it resolved, the population and temporal design they are estimated over, the
+# nuisance estimator and the parameters it will be fitted with, and the identity the whole thing
+# hashes to.
+
+# %% tags=["results"]
+spec = resolved.spec
+computation = spec["computation"]
+feature_artifacts = computation["feature_artifacts"]
+artifact_names = (
+    sorted(feature_artifacts)
+    if isinstance(feature_artifacts, dict)
+    else [str(item) for item in feature_artifacts]
+)
+resolved_table = pl.DataFrame(
+    [
+        {
+            "config_name": spec["config_name"],
+            "label": spec["label"],
+            "treatment": computation["estimand"]["treatment"],
+            "confounders": computation["estimand"]["confounders"],
+            "nuisance_estimator": computation["model"]["class"].rsplit(".", 1)[-1],
+            "nuisance_params": computation["model"]["nuisance_params"],
+            "feature_artifacts": artifact_names,
+            "features": len(computation["feature_names"]),
+            "analysis_rows": computation["analysis_population"]["n_rows"],
+            "decision_times": computation["analysis_population"]["n_timestamps"],
+            "folds": computation["cv"]["n_folds"],
+            "placebos": computation["refutation"]["n_placebo"],
+            "execution_tier": spec["execution_tier"],
+            "causal_hash": resolved.identity,
+        }
+    ]
+)
+resolved_table
+
+# %% [markdown]
+# ## Execute and validate the result
+#
+# A result is registered only once a finite effect and a finite HAC standard error both exist, so
+# a row in the table below is an estimate rather than an attempt.
+#
+# Two of its columns are the comparison the method is for. **`naive_effect`** is the slope from
+# regressing the forward return on momentum with an intercept and nothing removed - the
+# unadjusted answer, fitted on exactly the rows the second stage uses, so the two estimates are
+# made on the same sample rather than on samples that differ. **`confounding_bias_pct`** is the
+# gap between the two, `naive_effect` minus `dml_effect`, as a percentage of the adjusted
+# estimate's magnitude. It is the size of what the three declared confounders were accounting for,
+# measured against what survives them. A large value says the confounders mattered; it says
+# nothing about whether a fourth one is missing.
+
+# %%
+result = resolved.run()
+if not result.complete:
+    raise RuntimeError(f"Incomplete causal result: {result.hash}")
+if result.hash != resolved.identity:
+    raise RuntimeError("Causal result identity differs from the resolved request")
+if result.execution_tier != EXECUTION_TIER:
+    raise RuntimeError("Causal result execution tier differs from the request")
+
+# %% tags=["results"]
+result_table = pl.DataFrame(
+    [
+        {
+            "causal_hash": result.hash,
+            "observations": result.metrics["n_obs"],
+            "dml_effect": result.metrics["dml_effect"],
+            "hac_standard_error": result.metrics["dml_se_hac"],
+            "hac_p_value": result.metrics["p_value_hac"],
+            "naive_effect": result.metrics["naive_effect"],
+            "confounding_bias_pct": result.metrics["confounding_bias_pct"],
+            "refutation_p_value": result.metrics["refutation_p"],
+            "complete": result.complete,
+            "execution_tier": result.execution_tier,
+        }
+    ]
+)
+result_table
+
+# %% [markdown]
+# ### What the permuted treatments produced
+#
+# The refutation p-value above is one number read off the distribution below. Each draw is the
+# whole estimate redone with the treatment permuted in blocks within each stock, so the draws are
+# what the effect looks like when the treatment's real timing has been destroyed and everything
+# else - the confounders, the folds, the nuisance models - is left alone.
+#
+# What to read: where the observed effect sits relative to the bulk of the draws. Far out in a
+# tail means an effect this size is not something the construction produces by itself. Inside the
+# bulk means it is, and no amount of the estimate's own precision changes that. The spread of the
+# draws is also worth looking at on its own - a wide placebo distribution says this estimand is
+# hard to pin down at this sample size, whatever the point estimate came out at.
+
+# %% tags=["results"]
+placebo_effects = [float(value) for value in result.metrics.get("placebo_effects") or []]
+if not placebo_effects:
+    raise RuntimeError(
+        "the causal result registered no placebo draws, so the refutation p-value above has "
+        "nothing behind it"
+    )
+observed_effect = float(result.metrics["dml_effect"])
+
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+ax.hist(placebo_effects, bins=25, color=COLORS["recede"], edgecolor="none")
+ax.axvline(observed_effect, color=COLORS["blue"], lw=1.6)
+ax.set_xlabel("Estimated effect")
+ax.set_ylabel("Permuted draws")
+add_message_title(
+    ax,
+    "Where the estimate sits once the treatment's timing is destroyed",
+    subtitle=(f"{len(placebo_effects)} block-permuted refits, with the observed effect marked"),
+)
+fig.tight_layout()
+# The alt text counts rather than asserts. Whether the observed effect is extreme is the whole
+# question, so it is read off the draws instead of being described.
+_more_extreme = sum(abs(value) >= abs(observed_effect) for value in placebo_effects)
+show_with_alt(
+    fig,
+    "A histogram of the effect estimated from block-permuted treatments, with a vertical line at "
+    "the effect estimated from the real one. Counted from the draws, "
+    f"{_more_extreme} of {len(placebo_effects)} permutations produced an effect at least as large "
+    "in absolute value as the observed one.",
 )
 
 # %% [markdown]
-# ## Key Takeaways
+# ## Downstream handoff
 #
-# 1. **Both gates clear**: The DML effect on next-day returns is −0.0010
-#    (HAC SE 0.0005, t≈−2.2, p=0.031) and the block-permutation
-#    refutation passes decisively (empirical p<0.01). US Equities is
-#    one of four panels in the trial where both parametric and placebo
-#    evidence support a causal channel (alongside ETFs, US Firms, and
-#    SP500 Options).
-#
-# 2. **Two-thirds confounding**: Volatility (21d) and volume ratio
-#    together absorb roughly two-thirds of the signal in raw OLS — the
-#    naive estimate of −0.0003 understates the absolute DML effect of
-#    −0.0010 by about 67% (confounding bias +67%). Amihud illiquidity,
-#    originally specified as a third confounder, was dropped for data
-#    availability.
-#
-# 3. **Daily reversal versus monthly continuation**: The negative sign
-#    at the daily horizon contrasts with the positive monthly momentum
-#    in `us_firm_characteristics`. Both panels clear both gates in
-#    HistGBR DML. The directional pattern is consistent with short-term
-#    reversal turning into intermediate-horizon continuation as the
-#    holding window lengthens.
-#
-# **Next**: See `10_case_study_insights` for comparison across all 9 case studies.
-#
-# **Book**: Section 15.6 discusses US Equities as one of four panels
-# where both parametric and placebo evidence support a causal channel.
+# [`15_model_analysis`](15_model_analysis.ipynb) opens this result on its own, apart from the
+# predictive ones, because it answers a different question and cannot be ranked beside a score.
 
-# %%
-print("\n" + "=" * 60)
-print(f"CHAPTER 15 RESULTS: {CASE_STUDY_ID} causal DML")
-print("=" * 60)
-for key, value in summary.items():
-    if isinstance(value, float):
-        print(f"  {key}: {value:.6f}")
-    else:
-        print(f"  {key}: {value}")
-
-print(f"\n[OK] Causal DML analysis complete for {CASE_STUDY_ID}")
+# %% [markdown]
+# ## What to notice
+#
+# **The estimate is only as good as the confounder list, and the list is a judgement.** Three
+# variables are declared here because each plausibly moves both a stock's past year and its next
+# return. A fourth that nobody thought of would have its effect folded into the momentum estimate,
+# and every diagnostic in this notebook would still pass.
+#
+# **A causal estimate is not a signal.** It is not a ranking across stocks, it produces no
+# prediction, and it cannot be backtested. That is why it is registered separately and read on its
+# own in [`15_model_analysis`](15_model_analysis.ipynb) rather than placed beside the predictive
+# results.
+#
+# **The interesting outcome is not necessarily a large effect.** A predictive relation that
+# survives conditioning on the confounders and a causal estimate near zero are both informative:
+# the first says momentum carries something the three confounders do not, the second says the
+# association may be something they do carry.
+#
+# **Known limitations.** The three assumptions above are not established by anything computed
+# here, and the no-interference one is genuinely doubtful in a single market where flows into
+# momentum names are a plausible channel between stocks. The estimate is made on the development
+# sample only. And one treatment, one outcome and one confounder set is one specification: nothing
+# here explores how the estimate moves under a different plausible choice of any of the three.

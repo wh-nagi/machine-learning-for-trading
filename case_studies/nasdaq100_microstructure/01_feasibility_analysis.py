@@ -132,7 +132,10 @@ FRICTION_FLOOR_BPS = float(SETUP["costs"]["friction_floor_bps"])
 COST_FEASIBLE = SETUP["universe"]["cost_feasible"]["validation"]
 CADENCE = f"{SETUP['decision']['bar_frequency'].split('_')[0]}m"
 LABEL_BUFFER = SETUP["labels"]["buffer"]
-HORIZONS = sorted({int(b.rstrip("min")) for b in SETUP["labels"]["variant_buffers"].values()})
+# The outcome horizons, not the purge buffers. They differ by one bar here - the label
+# reads a quote one bar past the horizon it names - and reading the buffers would put
+# 6, 16 and 61 minutes on this figure's axis under labels called 5, 15 and 60.
+HORIZONS = sorted({int(h.rstrip("min")) for h in SETUP["labels"]["horizons"].values()})
 WINDOW = {
     "start_date": START_DATE,
     "end_date": HOLDOUT_START,
@@ -604,9 +607,9 @@ print(
 #
 # `generate_cv_splits` places those boundaries from the widths in `setup.yaml::evaluation` and the
 # gap from the label buffer, and the figure draws the boundaries it returned rather than recomputing
-# them, so the picture and the folds cannot disagree. It numbers folds from zero backwards from the
-# most recent, so fold 0 is the one that ends against the holdout. The figure and the printout below
-# label each fold with that number, which is why the labels count down as the folds move forward;
+# them, so the picture and the folds cannot disagree. It numbers folds chronologically, so fold 0 is
+# the earliest and the highest number ends against the holdout. The figure and the printout below
+# label each fold with that number, which is why the labels count up as the folds move forward;
 # every later stage prints the same ones.
 #
 # The splitter is given the whole sample, holdout included, and applies the holdout boundary itself

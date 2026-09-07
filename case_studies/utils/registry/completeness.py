@@ -104,30 +104,64 @@ class PredictionCoverage:
         }
 
 
-def _canonical_key_frame(frame):
+def _prediction_key_columns(frame) -> tuple[str, ...]:
+    columns = set(frame.columns)
+    entities = [name for name in ("symbol", "product") if name in columns]
+    if len(entities) != 1:
+        raise ValueError("prediction coverage requires exactly one of symbol or product")
+    return (
+        entities[0],
+        *(("position",) if "position" in columns else ()),
+        "timestamp",
+        "fold_id",
+    )
+
+
+def _canonical_key_frame(frame, key_columns: tuple[str, ...] | None = None):
     import polars as pl
 
     if not isinstance(frame, pl.DataFrame):
         frame = pl.from_pandas(frame)
     if "fold" in frame.columns and "fold_id" not in frame.columns:
         frame = frame.rename({"fold": "fold_id"})
-    required = {"symbol", "timestamp", "fold_id"}
+    if key_columns is None:
+        key_columns = _prediction_key_columns(frame)
+    required = set(key_columns)
     missing = required - set(frame.columns)
     if missing:
         raise ValueError(
             f"prediction coverage requires columns {sorted(required)}; missing {missing}"
         )
-    return frame.select(
-        pl.col("symbol").cast(pl.String),
-        pl.col("timestamp").cast(pl.String),
-        pl.col("fold_id").cast(pl.Int64),
-    )
+    return frame.select(*(_canonical_key_column(frame, name) for name in key_columns))
 
 
-def _key_digest(frame) -> str:
+def _canonical_key_column(frame, name: str):
+    """One key column rendered so two frames from different paths can be joined on it.
+
+    Casting a temporal column straight to String renders whatever dtype it happens to carry:
+    a `Date` becomes `2016-01-29` and a `Datetime("ms")` of the same instant becomes
+    `2016-01-29 00:00:00.000`. The two never join, so a registry frame meeting a dataset
+    frame reports every expected row missing and every actual row extra - a 100% mismatch
+    that reads as a data problem and is a dtype problem. Family runners never see it because
+    both of their frames come from one source.
+
+    Every temporal dtype is therefore normalized to microsecond UTC first, so the rendering
+    is decided by this function rather than by which loader produced the frame.
+    """
+    import polars as pl
+
+    if name == "fold_id":
+        return pl.col(name).cast(pl.Int64)
+    dtype = frame.schema[name]
+    if dtype == pl.Date or isinstance(dtype, pl.Datetime):
+        return pl.col(name).cast(pl.Datetime("us")).cast(pl.String).alias(name)
+    return pl.col(name).cast(pl.String)
+
+
+def _key_digest(frame, key_columns: tuple[str, ...]) -> str:
     from case_studies.utils.artifact_digest import value_digest
 
-    return value_digest(frame, ("symbol", "timestamp", "fold_id"))
+    return value_digest(frame, key_columns)
 
 
 def evaluate_prediction_coverage(expected_keys, predictions) -> PredictionCoverage:
@@ -135,16 +169,15 @@ def evaluate_prediction_coverage(expected_keys, predictions) -> PredictionCovera
     import polars as pl
 
     expected = _canonical_key_frame(expected_keys)
-    actual = _canonical_key_frame(predictions)
-    if expected.n_unique(["symbol", "timestamp", "fold_id"]) != expected.height:
+    key_columns = tuple(expected.columns)
+    actual = _canonical_key_frame(predictions, key_columns)
+    if expected.n_unique(key_columns) != expected.height:
         raise ValueError("expected prediction coverage keys must be unique")
 
-    unique_actual = actual.unique(["symbol", "timestamp", "fold_id"])
+    unique_actual = actual.unique(key_columns)
     n_duplicates = actual.height - unique_actual.height
-    n_missing = expected.join(
-        unique_actual, on=["symbol", "timestamp", "fold_id"], how="anti"
-    ).height
-    n_extra = unique_actual.join(expected, on=["symbol", "timestamp", "fold_id"], how="anti").height
+    n_missing = expected.join(unique_actual, on=key_columns, how="anti").height
+    n_extra = unique_actual.join(expected, on=key_columns, how="anti").height
 
     if not isinstance(predictions, pl.DataFrame):
         predictions = pl.from_pandas(predictions)
@@ -154,8 +187,8 @@ def evaluate_prediction_coverage(expected_keys, predictions) -> PredictionCovera
     score = predictions.get_column(score_col).cast(pl.Float64, strict=False)
     n_null = score.null_count()
     n_non_finite = (score.is_not_null() & ~score.is_finite()).sum()
-    expected_digest = _key_digest(expected)
-    actual_digest = _key_digest(unique_actual)
+    expected_digest = _key_digest(expected, key_columns)
+    actual_digest = _key_digest(unique_actual, key_columns)
     complete = not any((n_duplicates, n_missing, n_extra, n_null, n_non_finite)) and (
         expected_digest == actual_digest
     )

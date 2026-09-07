@@ -1,14 +1,19 @@
 """A variant label's fold must validate after the primary's fold stops training.
 
-A stage-04 artifact carries one fold set, built on the primary label's geometry.
-A model trained on a variant label reads that artifact by ``fold`` id, so the values
-it gets for fold F were fit on data through the *primary* label's ``train_end``. The
-variant's validation window has to open after that.
+A *fold-scoped* stage-04 artifact carries one fold set, built on the primary label's
+geometry. A model trained on a variant label reads that artifact by ``fold`` id, so the
+values it gets for fold F were fit on data through the *primary* label's ``train_end``.
+The variant's validation window has to open after that.
 
 Measured across the eight stage-04 case studies on 2026-08-09: 20 variant labels,
 zero violations. Nothing in the code would have noticed if there had been one - five
 of the eight assert nothing, and fx_pairs' assertion compares the outer span, which
 never reads ``val_start``.
+
+A case study whose stage 04 has been converted to a refit schedule writes no fold column
+at all, and this whole question stops existing for it: one value per (entity, timestamp)
+serves every label, so there are no two fold sets to line up. The corpus test below skips
+such an artifact rather than asserting on a column it does not have.
 """
 
 from __future__ import annotations
@@ -209,7 +214,7 @@ def _tiny_case_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, splits: li
     monkeypatch.setattr(
         cv_window,
         "temporal_artifact_fold_boundaries",
-        lambda case_study, primary_label, _artifact_path: cv_window.modeling_fold_boundaries(
+        lambda case_study, primary_label, _artifact_path: cv_window._derive_modeling_splits(
             case_study, primary_label
         ),
     )
@@ -257,7 +262,7 @@ def test_loading_a_variant_whose_validation_opens_after_the_fit_is_allowed(
     # artifact would pass this file vacuously.
     assert mds.temporal_by_fold is not None
     assert mds.splits == variant_splits
-    assert mds.temporal_artifact_splits == cv_window.modeling_fold_boundaries("cs", "primary")
+    assert mds.temporal_artifact_splits == primary_splits
     requested = [
         {
             key: value.isoformat() if hasattr(value, "isoformat") else value
@@ -465,6 +470,13 @@ def test_corpus_temporal_fold_geometry_covers_resolved_validation_windows(
     import polars as pl
 
     artifact = _available_corpus_artifact(case_study)
+    if "fold" not in pl.read_parquet_schema(artifact):
+        # A converted case study bounds a fitted feature by its declared refit schedule
+        # rather than by a fold, so it writes one row per (entity, timestamp) and there is
+        # no fold geometry for this test to check. That is the property
+        # ``04_model_based_features`` asserts at its own write, which is where it belongs -
+        # here the artifact simply has nothing to say.
+        pytest.skip(f"{case_study} writes a fold-free model-based artifact")
     primary_label = cv_window.configured_labels(case_study)[0]
     resolved = cv_window.temporal_artifact_fold_boundaries(
         case_study,

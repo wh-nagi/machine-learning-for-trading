@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -100,7 +101,7 @@ def write_darts_checkpoint(
     return path
 
 
-def load_darts_checkpoint(path: Path):
+def load_darts_checkpoint(path: Path, *, device: str = "cpu"):
     """Load a Darts checkpoint after both persisted files pass their digests."""
     model_path, weights_path, sidecar_path = _darts_checkpoint_files(Path(path))
     if not all(item.is_file() for item in (model_path, weights_path, sidecar_path)):
@@ -120,7 +121,7 @@ def load_darts_checkpoint(path: Path):
         raise ValueError(f"unsupported Darts architecture at {model_path}")
     model = model_cls.load(
         str(model_path),
-        pl_trainer_kwargs=_trainer_kwargs("cpu"),
+        pl_trainer_kwargs=_trainer_kwargs(device),
         weights_only=False,
     )
     return model, record["metadata"]
@@ -319,13 +320,43 @@ class _DartsEpochProgressCallback(pl_lightning.callbacks.Callback):
         )
 
 
+# Lightning announces itself on every trainer it builds - the accelerator, the TPU count, the
+# visible CUDA devices, a logging-service advertisement, and the reason `fit` stopped. One fit is
+# five lines. A checkpointed Darts run builds one trainer per checkpoint increment, so eight folds
+# at a hundred epochs in five-epoch steps is a hundred and sixty of them, and they land in the
+# executed notebook as thousands of output entries around the results.
+#
+# Measured before this was silenced: `case_studies/etfs/10_dl_tsmixer.ipynb` committed at 11.9 MB
+# and 441,860 lines, with 62,901 output entries in a single cell - a notebook that neither GitHub
+# nor JupyterLab will open, so the chapter had no readable artifact at all.
+#
+# These are `rank_zero_info` records rather than progress-bar or logger output, which is why
+# `enable_progress_bar` and `logger` below do not cover them. Raising the level is the whole fix:
+# nothing here is a warning, and a real Lightning warning still comes through.
+_LIGHTNING_ANNOUNCEMENT_LOGGERS = (
+    "pytorch_lightning",
+    "pytorch_lightning.utilities.rank_zero",
+    "pytorch_lightning.accelerators.cuda",
+    "lightning.pytorch",
+    "lightning.pytorch.utilities.rank_zero",
+)
+
+
+def silence_lightning_announcements() -> None:
+    """Keep Lightning's per-trainer banners out of the executed notebook."""
+    for name in _LIGHTNING_ANNOUNCEMENT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def _trainer_kwargs(device: str) -> dict[str, Any]:
     accelerator = "gpu" if device == "cuda" and torch.cuda.is_available() else "cpu"
+    silence_lightning_announcements()
     return {
         "accelerator": accelerator,
         "devices": 1,
         "deterministic": True,
         "enable_checkpointing": False,
+        "enable_model_summary": False,
         "enable_progress_bar": False,
         "logger": False,
     }
@@ -694,6 +725,7 @@ def darts_validation_keys(
     date_col: str,
     entity_col: str,
     case_study: str,
+    calendar_id: str | None = None,
     temporal_by_fold=None,
     temporal_keys: list[str] | None = None,
     temporal_feature_names: list[str] | None = None,
@@ -702,12 +734,14 @@ def darts_validation_keys(
     input_chunk_length, output_chunk_length = _resolve_chunk_lengths(
         config, _parse_label_horizon(label_col)
     )
-    from utils.cv_splits import make_walk_forward_config
+    if calendar_id is None:
+        from utils.cv_splits import make_walk_forward_config
 
+        calendar_id = make_walk_forward_config(case_study, date_col=date_col).calendar_id
     dataset_pd = _attach_expected_periods(
         dataset_pd.copy(),
         date_col=date_col,
-        calendar_id=make_walk_forward_config(case_study, date_col=date_col).calendar_id,
+        calendar_id=calendar_id,
         case_study=case_study,
     )
     dataset_pd = _attach_darts_target(
@@ -893,6 +927,18 @@ def _overlay_fold_temporal_features(
     )
 
 
+def darts_forecast_reduction(params: dict[str, Any]) -> str:
+    """The reduction a config's forecasts are scored with.
+
+    A ``lagged_label`` target is already the whole horizon's return, so its forecast is read at
+    its terminal step; every other target is a per-period return whose path compounds. The fit
+    and the fitted-state reconstruction both resolve it here, because when they resolved it
+    separately the reconstruction silently scored ``expm1(path.sum())`` against a fit that had
+    published ``expm1(path[-1])``.
+    """
+    return "terminal" if params.get("darts_target") == "lagged_label" else "compound_path"
+
+
 def _predict_fold(
     model,
     fold_series: list[_FoldSeries],
@@ -900,7 +946,10 @@ def _predict_fold(
     date_col: str,
     entity_col: str,
     output_chunk_length: int,
-    forecast_reduction: str = "compound_path",
+    *,
+    # No default: the fit and the fitted-state reconstruction have to agree on this, and they
+    # drifted precisely because one of them could leave it out and take whatever the default was.
+    forecast_reduction: str,
 ) -> pl.DataFrame:
     frames: list[pl.DataFrame] = []
     for state in fold_series:
@@ -996,21 +1045,24 @@ def run_darts_cv(
     if register and save_dir is None:
         raise ValueError("register=True requires save_dir for Darts prediction artifacts.")
 
-    from case_studies.utils.deep_learning import _register_dl_config
+    from case_studies.utils.deep_learning import _register_dl_config, sequence_identity_params
 
     def _config_identity_params(cfg: dict[str, Any]) -> dict[str, Any] | None:
-        params = dict(identity_params or {})
-        if input_data_spec is not None:
-            params.update(
-                darts_training_identity(
-                    cfg,
-                    label_col,
-                    case_study=case_study,
-                    input_data_spec=input_data_spec,
-                    max_train_sequences=max_train_sequences,
-                )
-            )
-        return params or None
+        # The same function `run_dl_cv` computes its lookup hash with. These two used to
+        # be separate transcriptions of one rule, which held only while the rule did not
+        # change: `run_dl_cv` decides whether a Darts config is already complete, and
+        # `run_darts_cv` decides what it registers under. Any field in one and not the
+        # other means the lookup can never find the registration, so every invocation
+        # refits from scratch and writes to a hash nobody queries.
+        return sequence_identity_params(
+            cfg,
+            identity_params=identity_params,
+            input_data_spec=input_data_spec,
+            label_col=label_col,
+            case_study=case_study,
+            max_train_sequences=max_train_sequences,
+            device=device,
+        )
 
     label_horizon = _parse_label_horizon(label_col)
     from utils.cv_splits import make_walk_forward_config
@@ -1189,11 +1241,7 @@ def run_darts_cv(
                     date_col,
                     entity_col,
                     output_chunk_length,
-                    forecast_reduction=(
-                        "terminal"
-                        if params.get("darts_target") == "lagged_label"
-                        else "compound_path"
-                    ),
+                    forecast_reduction=darts_forecast_reduction(params),
                 )
                 elapsed = time.perf_counter() - t0
                 if checkpoint_preds.height == 0:

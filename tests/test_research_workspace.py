@@ -3,28 +3,20 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
 import pytest
 
-from case_studies.research import CVSpec, LabelDefinition, Study
+from case_studies.research import CVSpec, LabelDefinition, Study, open_study
 from case_studies.research.contracts import ExecutionTier
+from case_studies.research.model_planning import ModelPlan, PlannedModel
 from case_studies.utils import linear
 from case_studies.utils.registry.store import _open_registry
 from utils import modeling
 from utils.artifact_specs import load_setup_config
 from utils.paths import get_case_study_dir
-
-
-@pytest.fixture(autouse=True)
-def _restore_output_root():
-    yield
-    os.environ.pop("ML4T_OUTPUT_DIR", None)
-    from case_studies.research import workspace
-
-    workspace._ACTIVE_OUTPUT_ROOT = None
-    workspace._clear_root_sensitive_caches()
 
 
 def _tree_digest(root: Path) -> str:
@@ -71,6 +63,273 @@ def _seed_release(tmp_path: Path, *, marker: str = "release") -> Path:
     shared.mkdir(parents=True)
     (shared / "ridge.yaml").write_text("family: linear\nparams: {}\n")
     return release
+
+
+def test_crypto_preview_then_canonical_workspace_isolates_symlinked_inputs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from case_studies.crypto_perps_funding import research_workflow
+
+    release = tmp_path / "release"
+    case_root = release / "case_studies" / "crypto_perps_funding"
+    artifacts = tmp_path / "artifacts"
+    for name in ("features", "labels", "run_log"):
+        source = artifacts / name
+        source.mkdir(parents=True)
+        case_root.mkdir(parents=True, exist_ok=True)
+        (case_root / name).symlink_to(source, target_is_directory=True)
+    (artifacts / "features" / "input.bin").write_bytes(b"release")
+    (artifacts / "run_log" / "registry.db").write_bytes(b"released-run-log")
+    (case_root / "config").mkdir()
+    (case_root / "config" / "setup.yaml").write_text("evaluation: {}\n")
+    (release / "case_studies" / "config").mkdir()
+    # The release root is named through the environment rather than by patching the
+    # module's REPO_ROOT: `research_workflow.open_study` no longer passes one, so that
+    # every caller reaches the same resolution - an explicit argument, else
+    # ML4T_RELEASE_ROOT, else REPO_ROOT - and the harness can point a run at a
+    # checkout-shaped tree instead of at the worktree's symlinks into ~/ml4t/artifacts.
+    monkeypatch.setenv("ML4T_RELEASE_ROOT", str(release))
+
+    workspace = tmp_path / "workspace"
+    preview_study = research_workflow.open_study(execution_tier="preview", workspace=workspace)
+    preview_root = preview_study.activate("preview")
+    assert preview_root == workspace / ".preview" / "crypto_perps_funding"
+    assert preview_root.joinpath("features").resolve() == workspace.joinpath(
+        "crypto_perps_funding", "features"
+    )
+    study = research_workflow.open_study(execution_tier="canonical", workspace=workspace)
+
+    assert study.root == workspace / "crypto_perps_funding"
+    assert study.root.joinpath("features").is_dir()
+    assert not study.root.joinpath("features").is_symlink()
+    study.root.joinpath("features", "input.bin").write_bytes(b"workspace")
+    assert artifacts.joinpath("features", "input.bin").read_bytes() == b"release"
+    assert study.root.joinpath("labels").is_dir()
+    assert not study.root.joinpath("labels").is_symlink()
+    assert study.root.joinpath("run_log").is_dir()
+    assert not study.root.joinpath("run_log").is_symlink()
+    assert study.root.joinpath("config", "setup.yaml").read_text() == "evaluation: {}\n"
+    assert not study.root.joinpath("config").is_symlink()
+    assert study.output_root.joinpath("config").is_dir()
+    assert not study.output_root.joinpath("config").is_symlink()
+    study.root.joinpath("config", "setup.yaml").write_text("evaluation: changed\n")
+    assert case_root.joinpath("config", "setup.yaml").read_text() == "evaluation: {}\n"
+    study.output_root.joinpath("config", "probe.yaml").write_text("workspace: true\n")
+    assert not release.joinpath("case_studies", "config", "probe.yaml").exists()
+    # The workspace starts an empty run log rather than inheriting the released one,
+    # so a preview cannot read released results as if it had produced them.
+    assert study.root.joinpath("run_log", "registry.db").read_bytes() != b"released-run-log"
+    assert artifacts.joinpath("run_log", "registry.db").read_bytes() == b"released-run-log"
+    assert study.manifest["baseline_source_commit"]
+    assert study.manifest["baseline_manifest_sha256"]
+
+
+def _planned(
+    family: str,
+    label: str,
+    config_name: str,
+    training_hash: str,
+    prediction_hash: str,
+) -> PlannedModel:
+    return PlannedModel(
+        family=family,
+        label=label,
+        config_name=config_name,
+        training_hash=training_hash,
+        checkpoint_kind="final",
+        checkpoint_value=None,
+        prediction_hash=prediction_hash,
+        spec_json="{}",
+    )
+
+
+def test_crypto_model_population_is_frozen_before_the_first_fit(tmp_path, monkeypatch) -> None:
+    from case_studies.crypto_perps_funding import research_workflow
+
+    root = tmp_path / "crypto_perps_funding"
+    root.mkdir()
+    _open_registry(root).close()
+    study = Study(
+        case_study="crypto_perps_funding",
+        root=root,
+        release_root=tmp_path,
+        output_root=tmp_path,
+        read_only=False,
+        manifest={},
+    )
+
+    class _FailingPlan(ModelPlan):
+        def run(self):
+            # The registry must already carry the complete declared population at the moment
+            # the first fit is attempted, so a failed member cannot silently disappear.
+            with sqlite3.connect(root / "run_log" / "registry.db") as db:
+                row = db.execute(
+                    "SELECT p.name, p.member_kind, m.member_hash "
+                    "FROM official_populations AS p "
+                    "JOIN official_population_members AS m USING (population_hash)"
+                ).fetchone()
+            assert row == (
+                "crypto-linear-validation-predictions-v1",
+                "prediction",
+                "prediction-1",
+            )
+            raise RuntimeError("first fit failed")
+
+    plan = _FailingPlan(
+        study,
+        (object(),),
+        (_planned("linear", "fwd_ret_8h", "ols", "training-1", "prediction-1"),),
+        ExecutionTier.CANONICAL,
+        (),
+    )
+    monkeypatch.setattr(research_workflow, "plan_models", lambda *args, **kwargs: plan)
+
+    with pytest.raises(RuntimeError, match="first fit failed"):
+        research_workflow.run_model_catalog(
+            study,
+            pl.DataFrame({"family": ["linear"], "label": ["fwd_ret_8h"], "config_name": ["ols"]}),
+            execution_tier="canonical",
+            population_name="crypto-linear-validation-predictions-v1",
+        )
+
+    population = research_workflow.OfficialPopulation.one(
+        study, name="crypto-linear-validation-predictions-v1"
+    )
+    assert population.members == ("prediction-1",)
+    with pytest.raises(ValueError, match="prediction-1:missing"):
+        population.require_complete()
+
+
+def test_crypto_official_population_declares_gpu_and_imbalance_treatment(
+    tmp_path, monkeypatch
+) -> None:
+    """A silent CPU fallback would change the training identity of every GPU family."""
+    from case_studies.crypto_perps_funding import research_workflow
+
+    study = Study(
+        case_study="crypto_perps_funding",
+        root=tmp_path / "crypto_perps_funding",
+        release_root=tmp_path,
+        output_root=tmp_path,
+        read_only=False,
+        manifest={},
+    )
+    monkeypatch.setattr(
+        research_workflow,
+        "load_configs",
+        lambda case_study, label, family: [
+            {
+                "config_name": {
+                    "linear": "ols",
+                    "gbm": "default_mse",
+                    "tabular_dl": "tabm_s",
+                    "deep_learning": "lstm_h64",
+                }[family]
+            }
+        ],
+    )
+
+    requests = research_workflow.official_model_requests(study)
+    overrides = {request.family: request.overrides for request in requests}
+    labels = {}
+    for request in requests:
+        labels.setdefault(request.family, set()).add(request.label)
+
+    assert overrides["tabular_dl"]["device"] == "cuda"
+    assert overrides["deep_learning"]["device"] == "cuda"
+    # Unbalanced intraday direction is the point of the TabM path; losing this silently
+    # trains on the majority class and still registers a complete-looking result.
+    assert overrides["tabular_dl"]["class_weight"] == "balanced"
+    # A CPU-only family must not carry a device override at all, or its identity moves too.
+    assert overrides["linear"] == {}
+    assert overrides["gbm"] == {}
+    # Sequence families are declared for the regression labels only.
+    assert labels["deep_learning"] == set(research_workflow.REGRESSION_LABELS)
+    assert labels["linear"] == set(research_workflow.ALL_LABELS)
+    assert all(request.execution_tier is ExecutionTier.CANONICAL for request in requests)
+
+
+def test_crypto_official_population_equals_the_union_of_the_model_notebooks(tmp_path) -> None:
+    """Nothing may be declared that no notebook produces, or produced that nothing declares."""
+    from case_studies.crypto_perps_funding import research_workflow as rw
+
+    study = Study(
+        case_study="crypto_perps_funding",
+        root=tmp_path / "crypto_perps_funding",
+        release_root=tmp_path,
+        output_root=tmp_path,
+        read_only=False,
+        manifest={},
+    )
+
+    # Restated independently of research_workflow: one entry per model notebook, matching the
+    # catalog each one builds. If a notebook's slice moves, this disagrees with the official
+    # population rather than letting the population quietly cover something nothing produces.
+    notebook_slices = [
+        ("linear", rw.ALL_LABELS, None),
+        ("gbm", rw.ALL_LABELS, None),
+        ("tabular_dl", rw.ALL_LABELS, "tabm"),
+        ("deep_learning", rw.REGRESSION_LABELS, ("nlinear", "lstm")),
+        ("deep_learning", rw.REGRESSION_LABELS, "tcn"),
+    ]
+    from_notebooks = {
+        (family, row["label"], row["config_name"])
+        for family, labels, prefix in notebook_slices
+        for row in rw.model_request_catalog(family, labels=labels, config_prefix=prefix).iter_rows(
+            named=True
+        )
+    }
+    official = {
+        (request.family, request.label, request.config_name)
+        for request in rw.official_model_requests(study)
+    }
+
+    assert official == from_notebooks
+
+    # And the union must exhaust the published menu apart from the members the sequence
+    # runner cannot execute, which must be non-empty here or the rule is untested.
+    assert rw.declared_menu() - official == rw.unsupported_requests()
+    assert rw.unsupported_requests()
+    # nlinear has published results in the released registry, so it must be covered, not excluded.
+    assert ("deep_learning", "fwd_ret_8h", "nlinear") in official
+
+
+def test_crypto_complete_model_population_is_frozen_before_family_execution(
+    tmp_path, monkeypatch
+) -> None:
+    from case_studies.crypto_perps_funding import research_workflow
+
+    root = tmp_path / "crypto_perps_funding"
+    root.mkdir()
+    _open_registry(root).close()
+    study = Study(
+        case_study="crypto_perps_funding",
+        root=root,
+        release_root=tmp_path,
+        output_root=tmp_path,
+        read_only=False,
+        manifest={},
+    )
+    requests = (object(), object())
+    plan = ModelPlan(
+        study,
+        requests,
+        (
+            _planned("linear", "fwd_ret_8h", "ols", "training-1", "prediction-1"),
+            _planned("gbm", "fwd_dir_8h", "lgbm", "training-2", "prediction-2"),
+        ),
+        ExecutionTier.CANONICAL,
+        (),
+    )
+    monkeypatch.setattr(research_workflow, "official_model_requests", lambda study: requests)
+    monkeypatch.setattr(research_workflow, "plan_models", lambda *args, **kwargs: plan)
+
+    population = research_workflow.freeze_official_model_population(study)
+
+    assert population.name == research_workflow.OFFICIAL_POPULATION
+    assert population.members == ("prediction-1", "prediction-2")
+    with pytest.raises(ValueError, match="prediction-1:missing, prediction-2:missing"):
+        population.require_complete()
 
 
 def _seed_regeneration_release(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
@@ -490,3 +749,362 @@ def test_custom_cv_cannot_relabel_fold_scoped_temporal_features() -> None:
     changed = [{**artifact[1], "train_end": "2021-05-31"}]
     with pytest.raises(ValueError, match="incompatible with fold-scoped temporal features"):
         require_fold_scoped_temporal_compatibility(changed, artifact)
+
+
+def test_preview_records_the_entry_point_when_generated_dirs_are_not_symlinks(
+    tmp_path: Path,
+) -> None:
+    """A clean clone has regular generated directories, and its runs must still say who wrote them.
+
+    The symlink branch of `open_study` is a maintainer-worktree convenience; the branch taken
+    everywhere else must carry `entry_point` just the same, or the registry row loses the only
+    column that names the notebook.
+    """
+    release = _seed_release(tmp_path)
+    generated = release / "case_studies" / "etfs"
+    assert not any((generated / name).is_symlink() for name in ("features", "labels", "run_log")), (
+        "fixture must exercise the regular-directory branch"
+    )
+
+    study = open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=tmp_path / "ws",
+        release_root=release,
+        entry_point="06_linear",
+    )
+    training = study.results.register_training(
+        {
+            "identity_version": 2,
+            "execution_tier": "preview",
+            "family": "linear",
+            "label": "fwd_ret_21d",
+            "config_name": "ridge",
+            "seed": 42,
+            "preview_reductions": {"folds": [0]},
+        },
+        execution_tier="preview",
+    )
+
+    with sqlite3.connect(training.root / "run_log" / "registry.db") as db:
+        recorded = db.execute(
+            "SELECT entry_point FROM training_runs WHERE training_hash = ?", (training.hash,)
+        ).fetchone()
+    assert recorded == ("06_linear",)
+
+
+def test_open_study_says_it_read_inputs_in_place(tmp_path: Path, capsys) -> None:
+    """`open_study` takes one of two branches and used to say nothing about which.
+
+    A maintainer worktree symlinks its generated directories to shared artifacts, so it reads
+    inputs in place; a CI checkout has real directories and adopts the workspace. Which branch
+    ran is decided by the checkout, not by the caller, so the same notebook reports different
+    inputs on the two with nothing in the log telling them apart (ml4t/agent-workspace#974).
+    """
+    release, _ = _seed_regeneration_release(tmp_path)
+    generated = release / "case_studies" / "etfs"
+    assert all((generated / name).is_symlink() for name in ("features", "labels", "run_log")), (
+        "fixture must exercise the symlink branch"
+    )
+    capsys.readouterr()
+
+    open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=tmp_path / "ws",
+        release_root=release,
+    )
+
+    reported = capsys.readouterr().out
+    assert "open_study(etfs)" in reported
+    assert "symlinks - reading inputs in place" in reported
+    assert str(generated) in reported
+
+
+def test_open_study_says_the_workspace_is_the_root(tmp_path: Path, capsys) -> None:
+    """The other branch, which is the one CI takes and the one no worktree here exercises."""
+    release = _seed_release(tmp_path)
+    generated = release / "case_studies" / "etfs"
+    assert not any((generated / name).is_symlink() for name in ("features", "labels", "run_log")), (
+        "fixture must exercise the regular-directory branch"
+    )
+    capsys.readouterr()
+
+    open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=tmp_path / "ws",
+        release_root=release,
+    )
+
+    reported = capsys.readouterr().out
+    assert "open_study(etfs)" in reported
+    assert "real directories - the workspace is the study root" in reported
+
+
+def test_a_second_study_previewing_into_one_workspace_repoints_the_input_links(
+    tmp_path: Path,
+) -> None:
+    """Two studies, one workspace, in sequence: the second must not inherit the first's inputs.
+
+    `activate` links `labels` and `features` into `<workspace>/.preview/<case>/` so a preview
+    reads real inputs while writing only to the workspace. The link belongs to whichever study
+    is active. When a second study with different input directories activates into the same
+    workspace, the link has to follow it: leaving it is worse than any error, because the
+    preview would then read the previous study's labels under the current study's name.
+
+    This is the case that shipped. `_ensure_input_link` refused a link resolving elsewhere while
+    `_ensure_config_link`, ten lines below, repaired exactly that situation for `config`. Two
+    functions handling one situation two ways, and the refusal is the wrong half.
+
+    It never surfaced in CI, which is the part worth keeping: a plain clone has regular
+    generated directories, so every study routes through the same branch and resolves the same
+    inputs. Only a maintainer worktree, whose `labels`/`features`/`run_log` are symlinks into
+    shared data, reaches the branch where two studies disagree - and there the failure is
+    ordered, so a notebook passes alone and fails after its predecessor in the same session.
+    """
+    first_release, _ = _seed_regeneration_release(tmp_path / "first")
+    second_release, _ = _seed_regeneration_release(tmp_path / "second")
+    workspace = tmp_path / "workspace"
+
+    first = open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=workspace,
+        release_root=first_release,
+    )
+    first_labels = (first.root / "labels").resolve(strict=True)
+
+    second = open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=workspace,
+        release_root=second_release,
+    )
+    second_labels = (second.root / "labels").resolve(strict=True)
+
+    assert first_labels != second_labels, "fixture must give the two studies different inputs"
+
+    link = workspace / ".preview" / "etfs" / "labels"
+    assert link.is_symlink()
+    assert link.resolve(strict=True) == second_labels
+
+
+class TestTheSingleRootReadOnlyForm:
+    """`Study.at`, the form an analysis notebook uses because it must not activate.
+
+    A notebook that only reads has no writes to place, and every other way into a `Study` ends
+    in `activate()`: it rewrites `ML4T_OUTPUT_DIR` for the whole process and clears the caches
+    keyed on it, so every later `get_case_study_dir` answers for a different directory than the
+    one the notebook resolved. On the preview tier that directory is `.preview/<case>`, whose
+    registry `activate()` creates empty - which is why the failure this form prevents is not a
+    crash but a comparison that reports on nothing and calls it success.
+    """
+
+    def test_it_does_not_move_the_active_output_root(self, tmp_path: Path) -> None:
+        """The property the notebooks depend on, asserted in both directions."""
+        release = _seed_release(tmp_path)
+        case_dir = release / "case_studies" / "etfs"
+
+        os.environ["ML4T_OUTPUT_DIR"] = str(tmp_path / "chosen")
+        Study.at(case_dir, case_study="etfs")
+        assert os.environ["ML4T_OUTPUT_DIR"] == str(tmp_path / "chosen")
+
+        os.environ.pop("ML4T_OUTPUT_DIR", None)
+        Study.at(case_dir, case_study="etfs")
+        assert "ML4T_OUTPUT_DIR" not in os.environ
+
+    def test_activating_it_points_the_path_helpers_at_its_own_root(self, tmp_path: Path) -> None:
+        """`Study.at` never activates, but the things it hands out do.
+
+        `LabelCatalog.get` calls `study.activate(tier)` before resolving the artifact, so a
+        read-only study does reach `activate()`. That branch used to pop `ML4T_OUTPUT_DIR`,
+        and `get_case_study_dir` falls back to the repo's own `case_studies/` when the
+        variable is absent - so every later lookup answered for the repo instead of the
+        directory the notebook resolved, for the rest of the process. Under a redirected
+        output root the repo holds none of these artifacts and the failure reads as a
+        missing label rather than as a moved root.
+        """
+        release = _seed_release(tmp_path)
+        case_dir = release / "case_studies" / "etfs"
+        os.environ["ML4T_OUTPUT_DIR"] = str(tmp_path / "elsewhere")
+
+        study = Study.at(case_dir, case_study="etfs")
+        assert study.activate() == case_dir.resolve()
+
+        from utils.paths import get_case_study_dir
+
+        assert get_case_study_dir("etfs", create=False) == case_dir.resolve()
+
+    def test_both_roots_are_the_directory_it_was_given(self, tmp_path: Path) -> None:
+        """`OfficialPopulation.one` reads `root`; `Result.open` reads `release_case_root`.
+
+        They have to be the same directory, or the notebook resolves a population from one
+        registry and loads its members' artifacts from another.
+        """
+        release = _seed_release(tmp_path)
+        case_dir = release / "case_studies" / "etfs"
+
+        study = Study.at(case_dir, case_study="etfs")
+
+        assert study.root == case_dir.resolve()
+        assert study.release_case_root == case_dir.resolve()
+        assert study.read_only
+        assert study.output_root is None
+
+    def test_it_reads_the_root_it_is_given_and_not_the_repo_checkout(self, tmp_path: Path) -> None:
+        """`release_root` still answers for the repo, so provenance lookups keep working.
+
+        The directory a fixture or an output tree hands over is not `<repo>/case_studies/<name>`
+        and cannot be derived from `release_root`, which is the whole reason this form carries
+        the case directory explicitly rather than deriving it.
+        """
+        release = _seed_release(tmp_path)
+        case_dir = release / "case_studies" / "etfs"
+
+        study = Study.at(case_dir, case_study="etfs")
+
+        assert study.release_case_root != study.release_root / "case_studies" / "etfs"
+        assert study.release_case_root == case_dir.resolve()
+
+    def test_the_case_study_name_defaults_to_the_directory_name(self, tmp_path: Path) -> None:
+        release = _seed_release(tmp_path)
+        case_dir = release / "case_studies" / "etfs"
+
+        assert Study.at(case_dir).case_study == "etfs"
+
+
+def _publish_into_release_registry(release: Path, prediction_hash: str) -> None:
+    """One published prediction in a released registry, written as the registry stores it."""
+    case_dir = release / "case_studies" / "etfs"
+    _open_registry(case_dir).close()
+    # Closed, not merely committed. The registry runs in WAL mode and a released root is
+    # read with `immutable=1`, which tells SQLite to skip WAL recovery - so a row left in
+    # the log rather than checkpointed into the database file is invisible to the read
+    # under test, and the test would pass by not seeing what it is meant to see.
+    db = sqlite3.connect(case_dir / "run_log" / "registry.db")
+    try:
+        db.execute(
+            "INSERT INTO training_runs (training_hash, identity_version, execution_tier, family, "
+            "label, config_name, spec_json, started_at, created_at) "
+            "VALUES ('t-published', 2, 'canonical', 'linear', 'fwd_ret_1d', 'ridge', '{}', "
+            "'2026-09-01T00:00:00', '2026-09-01T00:00:00')"
+        )
+        db.execute(
+            "INSERT INTO prediction_sets (prediction_hash, training_hash, split, created_at) "
+            f"VALUES ('{prediction_hash}', 't-published', 'validation', '2026-09-01T00:00:00')"
+        )
+        db.commit()
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        db.close()
+
+
+def test_the_release_root_defaults_to_the_repository(monkeypatch) -> None:
+    """Unset, nothing moves: a reader and a production run read the checkout they are in."""
+    monkeypatch.delenv("ML4T_RELEASE_ROOT", raising=False)
+    from case_studies.research.workspace import default_release_root
+    from utils.paths import REPO_ROOT as repo_root
+
+    assert default_release_root() == repo_root
+
+
+def test_the_environment_names_the_release_root_a_study_reads(tmp_path: Path, monkeypatch) -> None:
+    """The half of #912 that makes a harness run hermetic.
+
+    `open_study` resolved canonical reads through REPO_ROOT, whose
+    `case_studies/<cs>/run_log` is a symlink into the published registry in every
+    maintainer worktree and does not exist on any CI runner. The overlay itself is the
+    contract and is not in question; which released tree an unqualified caller gets is
+    what made a local run and a CI run read different rows.
+    """
+    release = _seed_release(tmp_path)
+    _publish_into_release_registry(release, "published-1")
+    monkeypatch.setenv("ML4T_RELEASE_ROOT", str(release))
+
+    study = Study.open("etfs", workspace=tmp_path / "workspace")
+
+    assert study.release_root == release
+    assert study.predictions.table()["prediction_hash"].to_list() == ["published-1"]
+
+
+def test_a_named_release_root_still_wins_over_the_environment(tmp_path: Path, monkeypatch) -> None:
+    """Otherwise the variable would silently redirect a caller that named its own root.
+
+    Every research_workflow that used to pass `release_root=REPO_ROOT` explicitly now
+    relies on the default, so the precedence has to be stated rather than assumed.
+    """
+    named = _seed_release(tmp_path)
+    _publish_into_release_registry(named, "from-the-argument")
+    other = _seed_release(tmp_path / "elsewhere")
+    _publish_into_release_registry(other, "from-the-environment")
+    monkeypatch.setenv("ML4T_RELEASE_ROOT", str(other))
+
+    study = Study.open("etfs", workspace=tmp_path / "workspace", release_root=named)
+
+    assert study.release_root == named
+    assert study.predictions.table()["prediction_hash"].to_list() == ["from-the-argument"]
+
+
+def test_a_checkout_shaped_release_root_carries_no_run_log(tmp_path: Path) -> None:
+    """What the harness builds, and the property that makes it hermetic.
+
+    It mirrors `config/` and the tracked top-level files and stops there. No `run_log`
+    is the point - that is the directory a maintainer worktree symlinks into
+    `~/ml4t/artifacts` and a CI checkout does not have at all - and no `features` or
+    `labels`, so `_release_manifest_digest` does not walk an artifact tree it is never
+    asked about.
+    """
+    from tests.conftest import _checkout_shaped_release_root
+
+    release = _checkout_shaped_release_root(tmp_path / "out")
+
+    case_dir = release / "case_studies" / "etfs"
+    assert (case_dir / "config").is_dir()
+    for generated in ("run_log", "features", "labels"):
+        assert not (case_dir / generated).exists(), (
+            f"{generated} must not be reachable through the harness release root, or the "
+            "harness reads the machine's published state again"
+        )
+    assert (release / "case_studies" / "config").is_dir()
+
+
+def test_a_bare_label_read_keeps_the_tier_the_study_was_opened_at(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`labels.get(name)` must not re-activate the study at canonical.
+
+    `LabelCatalog.get` used to default `execution_tier` to CANONICAL and pass it straight to
+    `Study.activate`, so a caller who did not name a tier silently undid the preview activation
+    the notebook performed when it called `open_study`. A canonical activation skips the
+    `.preview` path segment and skips linking `labels/` and `features/` into the preview case
+    directory, so the label resolved to `<workspace>/<case_study>/labels/<name>.parquet` -
+    a path nothing writes - and the run died claiming the artifact was missing.
+
+    Asserted through the resolved path rather than through the returned ref, because the ref is
+    identical either way and the path is the thing that was wrong.
+    """
+    release = _seed_release(tmp_path)
+    case_dir = release / "case_studies" / "etfs"
+    artifacts = tmp_path / "artifacts" / "labels"
+    artifacts.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "symbol": ["SPY", "SPY"],
+            "timestamp": [datetime(2024, 1, 2), datetime(2024, 1, 3)],
+            "fwd_ret_21d": [0.01, -0.02],
+        }
+    ).write_parquet(artifacts / "fwd_ret_21d.parquet")
+    # A maintainer worktree, which is the shape open_study reads inputs in place for.
+    (case_dir / "labels").symlink_to(artifacts, target_is_directory=True)
+
+    workspace = tmp_path / "workspace"
+    study = open_study("etfs", execution_tier="preview", workspace=workspace, release_root=release)
+
+    resolved = study.labels.get("fwd_ret_21d").path
+
+    assert resolved.is_file(), f"a bare read resolved to a path nothing writes: {resolved}"
+    assert ".preview" in resolved.parts, f"a bare read left the preview tier: {resolved}"
+    # And naming the tier explicitly reaches the same artifact, so the default is a default
+    # rather than a second behaviour.
+    assert study.labels.get("fwd_ret_21d", execution_tier="preview").path == resolved

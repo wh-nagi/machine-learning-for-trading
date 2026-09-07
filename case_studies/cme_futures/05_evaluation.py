@@ -6,7 +6,7 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.19.3
+#       jupytext_version: 1.19.5
 #   kernelspec:
 #     display_name: Python 3
 #     language: python
@@ -84,7 +84,7 @@ from scipy.stats import spearmanr
 from case_studies.utils.feature_engineering import quantile_profile
 from utils.artifact_specs import load_setup_config, resolve_label_buffer
 from utils.cv_splits import generate_cv_splits
-from utils.data_quality import validate_modeling_inputs
+from utils.data_quality import top_entities, validate_modeling_inputs
 from utils.paths import display_path, get_case_study_dir
 from utils.style import COLORS, GRAY_FILLS, show_plotly_with_alt
 
@@ -206,24 +206,20 @@ TOP_PAIRS = 15  # correlated pairs the redundancy figure ranks
 # so the holdout is still untouched when it is used, once, to confirm or disconfirm the
 # final result.
 #
-# **Which rows the model-derived features are read on.** `model_based.parquet` carries a
-# `fold` column: the walk-forward test fits its estimators separately for each fold, so
-# a value on one date exists once per fold. Two of the three families in that file are
-# fitted, and a fitted value is out of sample only inside its own fold's validation
-# window - outside it, the estimator that produced the number was fitted on a window
-# containing the date it sits on. Those columns are therefore read only inside the
-# validation window of the fold that produced them. The third family carries no fitted
-# parameter and holds the same values in every fold, which the cell below asserts rather
-# than assumes, and is then read once.
+# **Which rows the model-derived features are read on.** `model_based.parquet` carries one
+# row per `(timestamp, product, position)` and no `fold` column. Both fitted families in it
+# are re-estimated on the schedule `setup.yaml` declares, so a value on a date was produced
+# by an estimate made from sessions strictly earlier than it -
+# `04_model_based_features` section A sets out why a walk-forward period does not do that
+# job on its own - and the same value is out of sample wherever it is read. There is no
+# vintage to choose between and nothing to select by fold id.
 #
-# That fixes the rows for everything else too. The screen runs on the union of the five
-# validation windows rather than on the whole span before the holdout, and the
-# price-derived features are measured on the same rows as the model-derived ones. Two
-# reasons. On the full span a fold-fitted feature would be present only on the share of
-# dates the folds happen to cover, and the coverage gate below would read that design
-# property as a broken feature. And a correlation measured over the whole span is not
-# comparable with one measured over the validation windows alone, so a ranking that
-# mixed the two would rank the window as much as the feature.
+# The screen still runs on the union of the five validation windows rather than on the
+# whole span before the holdout, and the price-derived features are measured on the same
+# rows. A correlation measured over the whole span is not comparable with one measured over
+# the validation windows alone, so a ranking that mixed the two would rank the window as
+# much as the feature - and the training sessions are the ones the estimates behind a
+# column read, which is the half a screen must not report on.
 
 # %%
 features = pl.read_parquet(CASE_DIR / "features" / "financial.parquet").filter(
@@ -282,9 +278,8 @@ with pl.Config(tbl_rows=universe.height, tbl_width_chars=170, fmt_str_lengths=40
 # into, so a feature is always judged on dates after the ones any estimator saw. The
 # boundaries come from `generate_cv_splits`, which reads them out of `config/setup.yaml`
 # and is the same call every other notebook in this pipeline makes. They are derived
-# here rather than copied, because the fold numbers printed below have to mean the same
-# thing as the fold numbers stored in `model_based.parquet` for the join further down to
-# be sound.
+# here rather than copied, so the periods printed below are the ones
+# `04_model_based_features` screens over too.
 #
 # The gap between a training window's end and its validation window's start is the label
 # horizon. Without it, the last training dates would carry a return that resolves after
@@ -321,57 +316,42 @@ display(
 )
 
 # %% [markdown]
-# ### Reading each model-derived feature where it is out of sample
+# ### Checking the artifact is keyed the way this notebook believes it is
 #
-# The columns whose names begin with a fitted family's prefix are kept only on the dates
-# inside their own fold's validation window; the rest are asserted to be identical
-# across folds and read once. The assertion is what makes the second half safe: if a
-# column that is supposed to carry no fitted parameter ever started to depend on the
-# fold, this cell would stop rather than quietly average two different quantities.
+# Under the previous artifact this section had real work to do: the hidden Markov model was
+# fitted once per fold, so its value for a date depended on which fold was asking, and each
+# fitted column had to be taken from its own fold's validation window while the unfitted
+# ones were asserted identical across folds and read once.
+#
+# None of that survives the conversion. Every fitted column is now produced by a refit
+# schedule, so it is out of sample wherever it is read, and the artifact holds one row per
+# key. What is left is the check that this is actually true of the file in front of us: a
+# `fold` column here, or a duplicated key, means the writer changed and this cell did not.
 
 # %%
-FITTED_PREFIXES = ("arima_", "hmm_")
-# The artifact as written, one row per key and fold. The quality gate below reads this
-# rather than the resolved frame, because every fold's value is a value the training
-# notebooks can read, and the resolved frame has dropped most of them.
+assert "fold" not in temporal.columns, (
+    "model_based.parquet carries a fold column; this notebook reads the fold-free artifact "
+    "04_model_based_features writes and would count a session once per fold"
+)
+assert temporal.select(JOIN_COLS).is_duplicated().sum() == 0, (
+    "model_based.parquet is not one row per (timestamp, product, position)"
+)
+# The artifact as written. The quality gate below reads this rather than the screened
+# frame, because the training notebooks read every row of it and the screened frame keeps
+# only the validation windows.
 temporal_artifact = temporal
-temporal_feature_cols = [c for c in temporal.columns if c not in (*JOIN_COLS, "fold")]
-invariant_cols = [c for c in temporal_feature_cols if not c.startswith(FITTED_PREFIXES)]
-fitted_cols = [c for c in temporal_feature_cols if c.startswith(FITTED_PREFIXES)]
-
-folds = sorted(temporal["fold"].unique().to_list())
-_reference = temporal.filter(pl.col("fold") == folds[0]).select([*JOIN_COLS, *invariant_cols])
-for fold_id in folds[1:]:
-    other = temporal.filter(pl.col("fold") == fold_id).select([*JOIN_COLS, *invariant_cols])
-    assert _reference.sort(JOIN_COLS).equals(other.sort(JOIN_COLS)), (
-        f"fold {fold_id} disagrees with fold {folds[0]} on {invariant_cols}, "
-        "which this notebook reads once because they carry no fitted parameter"
-    )
-
-val_windows = {int(s["fold"]): (_as_date(s["val_start"]), _as_date(s["val_end"])) for s in splits}
+temporal_feature_cols = [c for c in temporal.columns if c not in JOIN_COLS]
+val_windows = {
+    int(sp["fold"]): (_as_date(sp["val_start"]), _as_date(sp["val_end"])) for sp in splits
+}
 IN_VALIDATION = pl.any_horizontal(
     [(pl.col(DATE_COL) >= start) & (pl.col(DATE_COL) <= end) for start, end in val_windows.values()]
 )
-fitted_oos = (
-    temporal.select([*JOIN_COLS, "fold", *fitted_cols])
-    .filter(
-        pl.col("fold").replace_strict(
-            {f: start for f, (start, _) in val_windows.items()}, default=None
-        )
-        <= pl.col(DATE_COL),
-    )
-    .filter(
-        pl.col(DATE_COL)
-        <= pl.col("fold").replace_strict(
-            {f: end for f, (_, end) in val_windows.items()}, default=None
-        )
-    )
-    .drop("fold")
+print(
+    f"Model-based artifact: {len(temporal):,} rows on {JOIN_COLS}, "
+    f"{temporal[DATE_COL].min()} to {temporal[DATE_COL].max()}, no fold column."
 )
-assert fitted_oos.select(JOIN_COLS).is_duplicated().sum() == 0, (
-    "validation windows overlap; a fitted feature would take two values on one date"
-)
-temporal = _reference.join(fitted_oos, on=JOIN_COLS, how="left")
+
 
 # %% [markdown]
 # ### Assembling the table
@@ -398,9 +378,14 @@ eval_panel = (
 assert eval_panel[DATE_COL].max() < HOLDOUT_START
 
 # Reduce the universe for a fast development run. Left at zero, every product is kept.
+# `top_entities` breaks a tie on the product code, which a local sort did not: on a padded
+# grid every product quoting the whole window carries the same row count, and the winner
+# then came from frame order. Two callers reducing the same panel to the same size have to
+# choose the same universe, or a product one of them kept joins to null features in the
+# other and the run answers cleanly and wrongly.
 if MAX_SYMBOLS > 0:
-    top = eval_panel.group_by("product").len().sort("len", descending=True).head(MAX_SYMBOLS)
-    eval_panel = eval_panel.filter(pl.col("product").is_in(top["product"]))
+    kept = top_entities(eval_panel, MAX_SYMBOLS, entity_col="product")
+    eval_panel = eval_panel.filter(pl.col("product").is_in(kept))
 
 n_rows = len(eval_panel)
 n_symbols = eval_panel["product"].n_unique()
@@ -417,6 +402,85 @@ print(
 )
 print(f"  {len(financial_cols)} price-derived, {len(temporal_cols)} model-derived")
 print(f"  a session counts once at least {MIN_CROSS_SECTION} products carry both columns")
+
+# %% [markdown]
+# ### What each fold's training window can actually supply
+#
+# A feature can be present in the declared set, present in every model's recorded
+# specification, and still be almost entirely absent from the rows a given fold trains on.
+# Anything with a long warm-up does this by construction: a rolling statistic over a year
+# needs a year before it produces anything, and a feature derived from a model fitted on
+# history cannot exist before that model has enough history to fit.
+#
+# Nothing downstream will complain. The imputer fills a missing value with the training
+# median, the scaler standardises that median to zero, and the fit proceeds with a column
+# that is present, inert, and indistinguishable in the registry from a column carrying real
+# variation. The only case that raises is a feature missing from *every* training row, which
+# is a narrow escape rather than a safety net: it fires at zero coverage and says nothing at
+# one per cent.
+#
+# So the rate is reported here, before any model is fitted, for both halves of the declared
+# set. Both are read from the artifacts as written rather than from the screened frame
+# above, which keeps only the validation windows - and the training rows are exactly what
+# this question is about. For the model-derived columns the rate now varies across periods
+# only because the periods have different training windows, not because a different fit
+# produced each one.
+#
+# **This table does not repair anything, and it is not meant to.** Whether a fold should be
+# fitted at all when one of its declared features barely exists there is a question about
+# what this case study is teaching, and it is answered by a reader looking at the numbers,
+# not by a notebook quietly imputing its way past them.
+
+# %%
+train_windows = {
+    int(split["fold"]): (_as_date(split["train_start"]), _as_date(split["train_end"]))
+    for split in splits
+}
+
+
+def _coverage_rows(
+    frame: pl.DataFrame, columns: list[str], source: str, fold_id: int
+) -> list[dict]:
+    height = frame.height
+    return [
+        {
+            "fold": fold_id,
+            "source": source,
+            "feature": column,
+            "train_rows": height,
+            "non_null_pct": (frame.get_column(column).drop_nulls().len() / height * 100)
+            if height
+            else 0.0,
+        }
+        for column in columns
+    ]
+
+
+fold_coverage_rows: list[dict] = []
+for fold_id, (start, end) in sorted(train_windows.items()):
+    in_window = pl.col(DATE_COL).is_between(start, end)
+    fold_coverage_rows += _coverage_rows(
+        features.filter(in_window), financial_cols, "price-derived", fold_id
+    )
+    fold_coverage_rows += _coverage_rows(
+        temporal_artifact.filter(in_window),
+        temporal_feature_cols,
+        "model-derived",
+        fold_id,
+    )
+fold_coverage = pl.DataFrame(fold_coverage_rows)
+
+SPARSE_PCT = 5.0
+sparse = fold_coverage.filter(pl.col("non_null_pct") < SPARSE_PCT).sort("fold", "feature")
+print(f"{fold_coverage.height} (fold, feature) pairs across {len(train_windows)} folds")
+print(f"{sparse.height} are below {SPARSE_PCT:.0f}% non-null in their fold's training window")
+
+# %% tags=["results"]
+# Every feature whose fold sees almost none of it, and the per-fold rate for the columns
+# that vary most across folds. A feature absent here is imputed, not refused.
+fold_coverage.filter(
+    pl.col("feature").is_in(sparse.get_column("feature").unique().to_list())
+).pivot(on="fold", index=["source", "feature"], values="non_null_pct").sort("source", "feature")
 
 # %% [markdown]
 # ## 0. Data quality gate
@@ -458,7 +522,7 @@ quality_result = validate_modeling_inputs(
     fail_on_critical=True,
 )
 
-print("Model-derived features, every fold, and the label:")
+print("Model-derived features, every session before the holdout, and the label:")
 temporal_quality = validate_modeling_inputs(
     features_df=sealed_temporal,
     label_df=sealed_labels,

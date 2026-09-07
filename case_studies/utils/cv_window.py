@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -46,6 +46,35 @@ def _to_date(x) -> date:
     if isinstance(x, datetime):
         return x.date()
     return datetime.fromisoformat(str(x)[:19]).date()
+
+
+def fold_boundary_date(boundary: Any) -> date:
+    """One fold boundary as the calendar date a daily span is written in.
+
+    :func:`generate_cv_splits` indexes the label timeline with a pandas ``DatetimeIndex``, so
+    every boundary it returns - and therefore every boundary :func:`modeling_fold_boundaries`
+    passes through - is a ``Timestamp`` whatever dtype the label parquet stored. ``str()`` on one
+    reads ``2020-01-06 00:00:00``, which no date parser accepts, so a consumer that carries the
+    boundary as text and rebuilds a filter from it gets an error instead of rows. Converting once,
+    here, is what keeps a span comparable to the date column it filters.
+
+    A boundary with a clock reading is refused rather than truncated. The case studies that call
+    :func:`modeling_fold_boundaries` use daily calendars, so their spans cannot represent a time
+    of day. Intraday artifacts use :func:`temporal_artifact_fold_boundaries`, which preserves the
+    producer's boundary resolution.
+    """
+    if isinstance(boundary, datetime):
+        clock = boundary.time()
+    elif isinstance(boundary, date):
+        clock = time.min
+    else:
+        clock = datetime.fromisoformat(str(boundary)).time()
+    if clock != time.min:
+        raise ValueError(
+            f"fold boundary {boundary!r} carries a time of day; the spans that read it are "
+            "daily, so truncating it would move the fold"
+        )
+    return _to_date(boundary)
 
 
 @lru_cache(maxsize=32)
@@ -87,6 +116,7 @@ def _derive_modeling_splits(case_study: str, label: str) -> list[dict] | None:
     from utils.artifact_specs import (
         load_label_spec,
         resolve_label_buffer,
+        resolve_label_buffer_unit,
         resolve_label_horizon,
         resolve_storage_path,
     )
@@ -141,6 +171,10 @@ def _derive_modeling_splits(case_study: str, label: str) -> list[dict] | None:
         label_buffer=label_buffer,
         outcome_horizon=resolve_label_horizon(case_study, label, setup),
         date_col=date_col,
+        # The declared boundaries have to be derived the same way the fitted ones are, or
+        # `utils/modeling.py` and this resolver disagree about what the buffer counts and
+        # the register describes folds no model was fitted on.
+        buffer_unit=resolve_label_buffer_unit(case_study, label, setup),
     )
     return splits or None
 
@@ -165,10 +199,10 @@ def modeling_fold_boundaries(case_study: str, label: str) -> list[dict] | None:
     return [
         {
             "fold": int(split["fold"]),
-            "train_start": split["train_start"],
-            "train_end": split["train_end"],
-            "val_start": split["val_start"],
-            "val_end": split["val_end"],
+            "train_start": fold_boundary_date(split["train_start"]),
+            "train_end": fold_boundary_date(split["train_end"]),
+            "val_start": fold_boundary_date(split["val_start"]),
+            "val_end": fold_boundary_date(split["val_end"]),
         }
         for split in splits
     ]
@@ -203,6 +237,7 @@ def temporal_artifact_fold_boundaries(
         load_feature_spec,
         load_label_spec,
         resolve_label_buffer,
+        resolve_label_buffer_unit,
         resolve_label_horizon,
     )
     from utils.cv_splits import generate_cv_splits
@@ -251,6 +286,7 @@ def temporal_artifact_fold_boundaries(
         "case_study_id": case_study,
         "label_buffer": label_buffer,
         "date_col": date_col,
+        "buffer_unit": resolve_label_buffer_unit(case_study, primary_label, setup),
     }
     if include_outcome_horizon:
         split_kwargs["outcome_horizon"] = resolve_label_horizon(case_study, primary_label, setup)
@@ -295,7 +331,7 @@ def assert_variant_folds_are_out_of_sample(
     which never reads ``val_start`` and would pass on a geometry that leaks.
 
     **Compares timestamps, never dates.** At date granularity
-    nasdaq100_microstructure fold 0 reads as a violation, 2020-12-29 against
+    a nasdaq100_microstructure fold reads as a violation, 2020-12-29 against
     2020-12-29; the bars are minutes, the fit closes at 15:22 and the variant's
     validation opens at 15:38.
 

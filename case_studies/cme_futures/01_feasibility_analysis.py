@@ -659,7 +659,7 @@ print(
 # capture, and no model would fix that. Section B.5 is the measurement that would show it.
 #
 # The other ways this design can fail are strategy outcomes, not properties of the data, and
-# they are measured where the backtests are. `17_strategy_analysis` asks whether the validation
+# they are measured where the backtests are. `19_strategy_analysis` asks whether the validation
 # Sharpe ratio's confidence interval clears zero, and whether the holdout difference against an
 # equally weighted portfolio of the same products falls entirely below it.
 #
@@ -712,10 +712,10 @@ print(
 # figure then draws the boundaries the splitter returned, rather than recomputing them, so the
 # picture and the folds cannot disagree.
 #
-# `generate_cv_splits` numbers folds from zero backwards from the most recent, so fold 0 is the last
-# one before the holdout and the highest number is the earliest. The figure draws them earliest-first
-# and labels each with that number, which is why the labels count down; every later stage prints
-# the same ones.
+# `generate_cv_splits` numbers folds chronologically, so fold 0 is the earliest and the highest
+# number is the last one before the holdout. The figure draws them earliest-first and labels each
+# with that number, so the labels count up alongside the dates; every later stage prints the same
+# ones.
 #
 # The splitter is given the whole sample, holdout included, and applies the holdout boundary
 # itself from `evaluation.holdout_start`, which is what every later stage does too. Trimming the

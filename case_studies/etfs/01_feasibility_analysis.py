@@ -402,7 +402,7 @@ show_with_alt(
 #
 # One caveat on the spread. Daily bars record what traded, not what was quoted, so there is no bid
 # and no ask in this data and the half-spread cannot be measured from it. It is assigned by tier, as
-# B.1 described, and `16_costs` re-runs the strategy under harsher assumptions to see how much the
+# B.1 described, and `17_costs` re-runs the strategy under harsher assumptions to see how much the
 # answer depends on it.
 
 # %%
@@ -667,10 +667,10 @@ print(
 # then draws the boundaries the splitter returned rather than recomputing them, so the picture and
 # the folds cannot disagree.
 #
-# `generate_cv_splits` numbers folds from zero backwards from the most recent, so fold 0 is the last
-# one before the holdout and the highest number is the earliest. The figure draws them earliest-first
-# and labels each with that number, which is why the labels count down; every later stage prints
-# the same ones.
+# `generate_cv_splits` numbers folds chronologically, so fold 0 is the earliest and the highest
+# number is the last one before the holdout. The figure draws them earliest-first and labels each
+# with that number, so the labels count up alongside the dates; every later stage prints the same
+# ones.
 #
 # The splitter is given the whole sample, holdout included, and applies the holdout boundary itself
 # from `evaluation.holdout_start`, which is what every later stage does too. Trimming the data first

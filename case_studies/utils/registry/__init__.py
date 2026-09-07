@@ -62,17 +62,19 @@ from .lineage import modeling_input_fingerprint
 # --- maintenance ---
 from .maintenance import (
     DuplicateBacktest,
+    TrainingIdentityMigration,
     deduplicate_semantic_backtests,
     find_semantic_backtest_duplicates,
+    migrate_equivalent_training_identity,
 )
 
 # --- metrics ---
 from .metrics import (
     compute_backtest_fold_metrics,
     compute_classification_metrics_from_predictions,
+    compute_cross_sectional_direction_auc,
     compute_fold_metrics_from_predictions,
     compute_prediction_fold_metrics,
-    compute_regression_vs_binary_auc,
 )
 
 # --- queries ---
@@ -187,11 +189,13 @@ __all__ = [
     "compute_backtest_fold_metrics",
     "compute_fold_metrics_from_predictions",
     "compute_classification_metrics_from_predictions",
-    "compute_regression_vs_binary_auc",
+    "compute_cross_sectional_direction_auc",
     # maintenance
     "DuplicateBacktest",
+    "TrainingIdentityMigration",
     "find_semantic_backtest_duplicates",
     "deduplicate_semantic_backtests",
+    "migrate_equivalent_training_identity",
     # queries
     "load_training_runs",
     "load_prediction_sets",

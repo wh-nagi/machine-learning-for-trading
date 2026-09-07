@@ -16,7 +16,7 @@ from ..notebook_contracts import (
     filter_active_model_rows,
     full_coverage_prediction_sql,
 )
-from .specs import canonical_json
+from .specs import IDENTITY_VERSION, canonical_json
 from .store import (
     _backtest_dir,
     _case_dir,
@@ -26,6 +26,7 @@ from .store import (
     _registry_db_path,
     _run_log_dir,
     _stage_filter_clause,
+    _timestamps_as_utc,
     _training_dir,
 )
 
@@ -459,6 +460,20 @@ def load_all_prediction_metrics():
 # ---------------------------------------------------------------------------
 
 
+def _spans_identity_generations(case_dir: Path) -> bool:
+    """True when ``training_runs`` holds rows from more than one identity generation.
+
+    A NULL ``identity_version`` is a generation, not an absence: it is what a row written
+    before the field existed carries. So is a store with no such column at all. One
+    generation, whichever it is, is not something a query can select across.
+    """
+    try:
+        versions = _query_table(case_dir, "SELECT DISTINCT identity_version FROM training_runs", ())
+    except sqlite3.OperationalError:
+        return False
+    return versions.height > 1
+
+
 def load_prediction_index(
     case_study: str,
     *,
@@ -503,8 +518,20 @@ def load_prediction_index(
             ON p.prediction_hash = m.prediction_hash
     """
     conditions = []
-    params: list[str] = []
+    params: list[str | int] = []
     exclude_clause, exclude_params = excluded_family_sql(case_study, "t.family", for_backtest=True)
+    # A registry may hold pre-rebuild rows beside rebuild-era ones. Selecting across both
+    # generations compares models fitted under different identity rules, so a backtest must
+    # see only the current generation. Legacy rows predate the field and carry NULL.
+    #
+    # Applied only when the store actually spans generations. The guard is against selecting
+    # ACROSS them, and a store holding one cannot. Filtering unconditionally emptied every
+    # registry whose rows predate the field - including CI's seeded fixture, whose
+    # training_runs has no identity_version column at all - and took three case-study jobs
+    # from green to "No predictions found" in the backtest downstream of the model stage.
+    if _spans_identity_generations(case_dir):
+        conditions.append("t.identity_version = ?")
+        params.append(IDENTITY_VERSION)
     if label:
         conditions.append("t.label = ?")
         params.append(label)
@@ -620,7 +647,10 @@ def read_predictions(
         renames["fold"] = "fold_id"
     if renames:
         df = df.rename(renames)
-    return df
+    # A naive decision-time column means the same instants as a UTC-aware one and is
+    # localized rather than converted, so the artifacts a case study wrote before
+    # `_timestamps_as_utc` reached the writer still join against the ones it wrote after.
+    return _timestamps_as_utc(df)
 
 
 # ---------------------------------------------------------------------------
@@ -760,16 +790,19 @@ def _canonical_family_coverage_bar(
     label: str,
     split: str,
     case_dir: Path,
+    prediction_hashes: set[str] | None = None,
 ) -> dict[str, int]:
-    """Max in-window coverage per family, over EVERY prediction set for the label.
+    """Max in-window coverage per family over the eligible prediction population.
 
     The eligibility bar has to be the family's best coverage, not the best among the
     rows that happen to carry a backtest at the stage being resolved. Taking the max
     after a stage filter lowers the bar whenever the family's full-coverage prediction
     was never backtested at that stage, and a partial-coverage prediction then
     qualifies - which is exactly what ``full_coverage_prediction_sql`` prevents on the
-    raw path, where the ``MAX(ic_n_days)`` subquery ranges over all of
-    ``(split, family, label)`` with no stage restriction.
+    raw path, where the ``MAX(ic_n_days)`` subquery ranges over all eligible members
+    of ``(split, family, label)`` with no stage restriction. An explicit immutable
+    population is a deliberate eligibility boundary, so retired identities outside
+    it do not set the comparison bar.
 
     Requires a ``prediction_metrics`` row, matching the raw path's implicit
     requirement (``full_coverage_prediction_sql`` joins ``pm``): a prediction set
@@ -791,6 +824,10 @@ def _canonical_family_coverage_bar(
     bar: dict[str, int] = {}
     if universe.is_empty():
         return bar
+    if prediction_hashes is not None:
+        universe = universe.filter(pl.col("prediction_hash").is_in(prediction_hashes))
+        if universe.is_empty():
+            return bar
     for prediction_hash, family in universe.select("prediction_hash", "family").iter_rows():
         days = canonical_coverage_days(case_study, label, split, prediction_hash, case_dir)
         if days is None:
@@ -811,6 +848,8 @@ def _resolve_best_predictions_canonical(
     universe_filter: str | None,
     case_dir: Path | None,
     checkpoints_per_config: int,
+    prediction_hashes: set[str] | None,
+    backtest_hashes: set[str] | None = None,
 ):
     """``resolve_best_predictions(coverage_window="canonical")``.
 
@@ -836,7 +875,14 @@ def _resolve_best_predictions_canonical(
     degenerate_clause = degenerate_prediction_sql("p.prediction_hash")
 
     universe_clause = ""
-    params: list[str] = [label] + stage_params + exclude_params + [split]
+    backtest_cte = ""
+    backtest_clause = ""
+    params: list[str] = []
+    if backtest_hashes is not None:
+        backtest_cte = "WITH backtest_members(backtest_hash) AS (SELECT value FROM json_each(?))"
+        backtest_clause = "AND b.backtest_hash IN (SELECT backtest_hash FROM backtest_members)"
+        params.append(json.dumps(sorted(backtest_hashes)))
+    params += [label] + stage_params + exclude_params + [split]
     if universe_filter:
         universe_clause = "AND json_extract(b.spec_json, '$.strategy.signal.universe_filter') = ?"
         params.append(universe_filter)
@@ -844,6 +890,7 @@ def _resolve_best_predictions_canonical(
     # Same per_prediction shape as the raw path, minus full_coverage_prediction_sql —
     # that comparison is replaced below by canonical_coverage_days, computed in Python.
     query = f"""
+        {backtest_cte}
         SELECT
             p.prediction_hash,
             p.training_hash,
@@ -864,17 +911,28 @@ def _resolve_best_predictions_canonical(
           {degenerate_clause}
           AND p.split = ?
           {universe_clause}
+          {backtest_clause}
         GROUP BY p.prediction_hash
     """
     per_prediction = _query_table(case_dir, query, tuple(params))
     if per_prediction.is_empty():
         return pl.DataFrame(schema=_BEST_PREDICTIONS_SCHEMA)
+    if prediction_hashes is not None:
+        per_prediction = per_prediction.filter(pl.col("prediction_hash").is_in(prediction_hashes))
+        if per_prediction.is_empty():
+            return pl.DataFrame(schema=_BEST_PREDICTIONS_SCHEMA)
 
     in_window = {
         h: canonical_coverage_days(case_study, label, split, h, case_dir)
         for h in per_prediction["prediction_hash"].unique().to_list()
     }
-    bar = _canonical_family_coverage_bar(case_study, label, split, case_dir)
+    bar = _canonical_family_coverage_bar(
+        case_study,
+        label,
+        split,
+        case_dir,
+        prediction_hashes=prediction_hashes,
+    )
     per_prediction = per_prediction.with_columns(
         pl.col("prediction_hash").replace_strict(in_window, default=None).alias("_in_window_days"),
         pl.col("family").replace_strict(bar, default=None).alias("_family_bar"),
@@ -933,6 +991,8 @@ def resolve_best_predictions(
     case_dir: Path | None = None,
     checkpoints_per_config: int = 1,
     coverage_window: str = "raw",
+    prediction_hashes: set[str] | None = None,
+    backtest_hashes: set[str] | None = None,
 ):
     """Return top-N prediction hashes ranked by backtest Sharpe at a given stage.
 
@@ -972,6 +1032,18 @@ def resolve_best_predictions(
         study's prediction sets predate a canonical-window change and raw
         ``ic_n_days`` differs across peers only by out-of-window dates.
         Requires ``split``.
+    prediction_hashes : set[str], optional
+        Restrict eligibility to these prediction identities before ranking
+        configurations and checkpoints.
+    backtest_hashes : set[str], optional
+        Restrict the Sharpe each prediction is ranked on to these backtest
+        identities - the members of the candidate set the previous stage
+        published, normally. ``prediction_hashes`` cannot do this: the registry
+        is immutable, so a live prediction re-swept under a changed entry grid or
+        engine configuration keeps its retired backtests, and ``MAX(sharpe)``
+        over all of them ranks the configuration on a number no current result
+        carries. Restricting the predictions leaves that untouched, because the
+        stale rows belong to predictions that are themselves still current.
 
     Returns
     -------
@@ -992,6 +1064,8 @@ def resolve_best_predictions(
             universe_filter=universe_filter,
             case_dir=case_dir,
             checkpoints_per_config=checkpoints_per_config,
+            prediction_hashes=prediction_hashes,
+            backtest_hashes=backtest_hashes,
         )
 
     if case_dir is None:
@@ -1018,9 +1092,53 @@ def resolve_best_predictions(
     stage_clause, stage_params = _stage_filter_clause(stage, chapter_filter)
     exclude_clause, exclude_params = excluded_family_sql(case_study, "t.family")
     degenerate_clause = degenerate_prediction_sql("p.prediction_hash")
+    population_cte = ""
+    population_clause = ""
+    coverage_clause = full_coverage_prediction_sql("p", "t", "pm")
 
     split_clause = ""
-    params: list[str] = [label] + stage_params + exclude_params
+    params: list[str] = []
+    if prediction_hashes is not None:
+        population_cte = "population_members(prediction_hash) AS (SELECT value FROM json_each(?)),"
+        population_clause = (
+            "AND p.prediction_hash IN (SELECT prediction_hash FROM population_members)"
+        )
+        coverage_clause = full_coverage_prediction_sql(
+            "p",
+            "t",
+            "pm",
+            population_subquery="SELECT prediction_hash FROM population_members",
+        )
+        params.append(json.dumps(sorted(prediction_hashes)))
+    backtest_cte = ""
+    backtest_clause = ""
+    if backtest_hashes is not None:
+        # Second CTE, and its parameter is bound second because the CTEs are rendered in
+        # this order. A restriction on the BACKTEST side, not the prediction side: the two
+        # are different questions and only this one can drop a retired sweep of a
+        # still-current prediction.
+        backtest_cte = "backtest_members(backtest_hash) AS (SELECT value FROM json_each(?)),"
+        backtest_clause = "AND b.backtest_hash IN (SELECT backtest_hash FROM backtest_members)"
+        params.append(json.dumps(sorted(backtest_hashes)))
+        if prediction_hashes is None:
+            # The eligibility bar has to move with the restriction, or the restriction is worse
+            # than useless. `full_coverage_prediction_sql` keeps rows whose `ic_n_days` equals
+            # the maximum for their (split, family, label); computed over every historical
+            # identity, a retired prediction with wider stored coverage sets a bar no member of
+            # the named population can reach, and the call returns nothing. Scoped to the
+            # predictions behind the named backtests, the bar is the best any candidate actually
+            # offers. An explicit `prediction_hashes` is left to scope it, because that is the
+            # caller naming the population itself.
+            coverage_clause = full_coverage_prediction_sql(
+                "p",
+                "t",
+                "pm",
+                population_subquery=(
+                    "SELECT prediction_hash FROM backtest_runs "
+                    "WHERE backtest_hash IN (SELECT backtest_hash FROM backtest_members)"
+                ),
+            )
+    params.extend([label, *stage_params, *exclude_params])
     if split:
         split_clause = "AND p.split = ?"
         params.append(split)
@@ -1032,7 +1150,8 @@ def resolve_best_predictions(
     params.append(str(max(1, int(checkpoints_per_config))))
 
     query = f"""
-        WITH per_prediction AS (
+        WITH {population_cte}{backtest_cte}
+        per_prediction AS (
             -- Best backtest Sharpe per prediction_hash (a prediction may have
             -- been backtested with multiple signal methods)
             SELECT
@@ -1053,9 +1172,11 @@ def resolve_best_predictions(
               {stage_clause}
               {exclude_clause}
               {degenerate_clause}
-              {full_coverage_prediction_sql("p", "t", "pm")}
+              {coverage_clause}
               {split_clause}
               {universe_clause}
+              {population_clause}
+              {backtest_clause}
             GROUP BY p.prediction_hash
         ),
         top_configs AS (
@@ -1111,6 +1232,7 @@ def _resolve_best_backtest_runs_canonical(
     chapter: str | None,
     top_n: int,
     case_dir: Path | None,
+    prediction_hashes: set[str] | None,
 ):
     """``resolve_best_backtest_runs(coverage_window="canonical")``.
 
@@ -1165,12 +1287,22 @@ def _resolve_best_backtest_runs_canonical(
     df = _query_table(case_dir, query, tuple([label] + exclude_params + stage_params + [split]))
     if df.is_empty():
         return df
+    if prediction_hashes is not None:
+        df = df.filter(pl.col("prediction_hash").is_in(prediction_hashes))
+        if df.is_empty():
+            return df
 
     in_window = {
         h: canonical_coverage_days(case_study, label, split, h, case_dir)
         for h in df["prediction_hash"].unique().to_list()
     }
-    bar = _canonical_family_coverage_bar(case_study, label, split, case_dir)
+    bar = _canonical_family_coverage_bar(
+        case_study,
+        label,
+        split,
+        case_dir,
+        prediction_hashes=prediction_hashes,
+    )
     df = df.with_columns(
         pl.col("prediction_hash").replace_strict(in_window, default=None).alias("_in_window_days"),
         pl.col("family").replace_strict(bar, default=None).alias("_family_bar"),
@@ -1203,6 +1335,7 @@ def resolve_best_backtest_runs(
     top_n: int = 3,
     case_dir: Path | None = None,
     coverage_window: str = "raw",
+    prediction_hashes: set[str] | None = None,
 ):
     """Return top-N backtest runs at a given stage, ranked by Sharpe.
 
@@ -1234,6 +1367,9 @@ def resolve_best_backtest_runs(
     coverage_window : str
         See ``resolve_best_predictions``. "raw" (default) is unchanged behavior;
         "canonical" requires an explicit ``split``.
+    prediction_hashes : set[str], optional
+        Restrict eligibility to these prediction identities before coverage filtering and
+        ranking.
 
     Returns
     -------
@@ -1251,6 +1387,7 @@ def resolve_best_backtest_runs(
             chapter=chapter,
             top_n=top_n,
             case_dir=case_dir,
+            prediction_hashes=prediction_hashes,
         )
 
     if case_dir is None:
@@ -1274,6 +1411,9 @@ def resolve_best_backtest_runs(
     stage_clause, stage_params = _stage_filter_clause(stage)
     exclude_clause, exclude_params = excluded_family_sql(case_study, "t.family")
     degenerate_clause = degenerate_prediction_sql("p.prediction_hash")
+    population_cte = ""
+    population_clause = ""
+    coverage_clause = full_coverage_prediction_sql("p", "t", "pm")
 
     split_clause = ""
     split_params: list[str] = []
@@ -1281,7 +1421,25 @@ def resolve_best_backtest_runs(
         split_clause = "AND p.split = ?"
         split_params = [split]
 
+    params: list[str] = []
+    if prediction_hashes is not None:
+        population_cte = (
+            "WITH population_members(prediction_hash) AS (SELECT value FROM json_each(?))"
+        )
+        population_clause = (
+            "AND p.prediction_hash IN (SELECT prediction_hash FROM population_members)"
+        )
+        coverage_clause = full_coverage_prediction_sql(
+            "p",
+            "t",
+            "pm",
+            population_subquery="SELECT prediction_hash FROM population_members",
+        )
+        params.append(json.dumps(sorted(prediction_hashes)))
+    params.extend([label, *exclude_params, *stage_params, *split_params, str(top_n)])
+
     query = f"""
+        {population_cte}
         SELECT
             b.backtest_hash,
             b.prediction_hash,
@@ -1298,15 +1456,16 @@ def resolve_best_backtest_runs(
           {exclude_clause}
           {stage_clause}
           {degenerate_clause}
-          {full_coverage_prediction_sql("p", "t", "pm")}
+          {coverage_clause}
           {split_clause}
+          {population_clause}
         ORDER BY bm.sharpe DESC
         LIMIT ?
     """
     df = _query_table(
         case_dir,
         query,
-        tuple([label] + exclude_params + stage_params + split_params + [str(top_n)]),
+        tuple(params),
     )
     if df.is_empty():
         return df
