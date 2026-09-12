@@ -61,7 +61,7 @@ forecasts will be turned into trades.
   02_regularization_paths. Direction prediction is often more tractable than magnitude prediction because most trading
   decisions reduce to long/short/flat.
 
-### 11.4 Inside the Black Box: Model Interpretability with SHAP
+### 11.4 Interpreting Models with SHAP
 
 This section argues that interpretability is part of model validation, not a cosmetic extra. It uses SHAP to connect
 predictions back to features, making it possible to test whether the model is learning economically sensible
@@ -86,7 +86,7 @@ raw predictions become risk-aware forecasts.
   assume Gaussian residuals, conformal prediction provides finite-sample valid intervals under minimal assumptions (
   exchangeability).
   
-### 11.6 Linear Models Across Nine Case Studies
+### 11.6 Case Study Insights
 
 This section broadens the chapter from method exposition to empirical judgment. It shows where linear models work well,
 where they are only marginally useful, and where they largely fail, while also highlighting label sensitivity, horizon
@@ -108,7 +108,7 @@ more model complexity is only justified when the linear benchmark genuinely leav
 uv run python 11_ml_pipeline/<notebook>.py
 
 # Test mode (reduced data via Papermill)
-uv run pytest tests/test_notebooks.py -v -k "11_ml_pipeline"
+uv run pytest tests/test_chapter_notebooks.py -v -k "11_ml_pipeline"
 ```
 
 ## References

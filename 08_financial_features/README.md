@@ -37,7 +37,7 @@ This section shows how fundamentals, calendars, and macro variables enter ML sys
 
 - [`04_fundamentals_macro_calendar`](04_fundamentals_macro_calendar.ipynb) — Slow-moving features that condition faster signals: SEC XBRL fundamentals (value/quality factors with point-in-time ASOF alignment), FRED macro indicators (yield curve, VIX regimes, credit spreads with publication-lag handling), and calendar encodings (cyclical sin/cos, time-to-event proximity).
 
-### 8.5 Cross-Cutting Features and the Limits of Aggregation
+### 8.5 Cross-Cutting Feature Types and the Limits of Direct Aggregation
 
 This section marks the conceptual boundary of the chapter. It explains when deterministic rolling transformations are enough and when hidden structure -- latent states, conditional dynamics, cycle strength, or path shape -- requires fitted models and learned representations, which sets up Chapter 9 cleanly without duplicating it.
 
@@ -57,7 +57,7 @@ This is the chapter's second major contribution after the feature-design grammar
 uv run python 08_financial_features/<notebook>.py
 
 # Test mode (reduced data via Papermill)
-uv run pytest tests/test_notebooks.py -v -k "08_financial_features"
+uv run pytest tests/test_chapter_notebooks.py -v -k "08_financial_features"
 ```
 
 > Memory: `03_structural_cross_instrument_features` peaks at ~7.4 GB RSS scanning the AlgoSeek S&P-500 options surface — recommend ≥8 GB system RAM for §8.3.

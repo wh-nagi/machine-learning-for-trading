@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import subprocess
 from collections.abc import Mapping
@@ -27,6 +28,19 @@ UTC = UTC
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
+#
+# Keep prose out of the SQL below. SQLite stores a table's CREATE text verbatim in
+# `sqlite_master` and re-parses it on `ALTER TABLE ... DROP COLUMN`; a trailing `--`
+# comment inside the statement makes that re-parse fail with "incomplete input", so a
+# comment written for the next reader breaks a migration years later. Explain a column
+# here, or above the migration that adds it.
+#
+# `prediction_metrics.direction_label_error` says why `direction_label` is NULL when a
+# direction sibling was declared and scoring against it still did not land - a NULL that
+# otherwise reads identically to "this label declares no sibling". It is declared rather
+# than left to `_upsert_wide_metrics`'s auto-add, which types a new column from the first
+# value it sees: on a healthy registry that is the None a successful run writes, which
+# would make the column REAL and put every later message in a numeric one.
 
 REGISTRY_SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS training_runs (
@@ -96,7 +110,8 @@ CREATE TABLE IF NOT EXISTS prediction_metrics (
     ic_mean REAL, ic_std REAL, ic_t REAL, n_folds REAL,
     pct_positive REAL, task_type TEXT,
     accuracy REAL, balanced_accuracy REAL, auc_roc REAL, auc_pr REAL,
-    log_loss REAL, brier_score REAL
+    log_loss REAL, brier_score REAL,
+    direction_label_error TEXT
 );
 
 CREATE TABLE IF NOT EXISTS fold_metrics (
@@ -161,12 +176,26 @@ CREATE TABLE IF NOT EXISTS causal_runs (
     n_obs            INTEGER,
     dml_effect       REAL,
     dml_se_hac       REAL,
+    -- Which estimator produced dml_se_hac: "driscoll_kraay", "newey_west", or
+    -- "failed". Without it the row cannot say what its own standard error is, and
+    -- the two robust estimators differ by whether the caller supplied decision-time
+    -- groups. manual_dml_timeseries used to seed se_hac with the HC0 value and report
+    -- a successful Driscoll-Kraay whatever happened, so a fallback was indistinguishable
+    -- from a robust result in the row, in the p-value, and in the prose.
+    covariance_type  TEXT,
     p_value_hac      REAL,
     naive_effect     REAL,
     confounding_bias_pct REAL,
     refutation_p     REAL,
     refutation_n_successful INTEGER,
     refutation_placebo_json TEXT,
+    -- The placebo t-statistics behind refutation_p, which since
+    -- ml4t/agent-workspace#1120 is the statistic the test is computed on. The thetas
+    -- above stay because they are still what a reader wants to see on the effect scale,
+    -- but a figure drawn from them no longer shows the distribution the p-value came
+    -- from: permuting the treatment inflates var(T_res) and shrinks every placebo theta
+    -- toward zero, which is the defect. Two columns because these are two quantities.
+    refutation_placebo_t_json TEXT,
     -- The share of treatment rows block permutation could not move, because they sit in
     -- segments too short to hold two blocks. The runner warns that it must be read
     -- alongside the p-value - the bias runs toward p = 1 - and the warning fires only on
@@ -629,10 +658,29 @@ _BACKTEST_UNCERTAINTY_COLUMNS = (
     "bootstrap_n",
 )
 
+# Written on every run by `compute_portfolio_metrics`: whether the path lost its
+# capital, and the index of the period where it did (ml4t/agent-workspace#920).
+_BACKTEST_RUIN_COLUMNS = ("ruin", "ruin_period")
+
+# Written on every run by `RiskTriggerLog.as_metrics`: how often each declared risk
+# control acted, NULL where none of that kind was declared (ml4t/agent-workspace#1051).
+_BACKTEST_RISK_TRIGGER_COLUMNS = (
+    "risk_triggers",
+    "risk_triggers_stop_loss",
+    "risk_triggers_trailing_stop",
+    "risk_triggers_time_exit",
+    "risk_triggers_max_drawdown",
+    "risk_triggers_daily_loss",
+)
+
 _DECLARED_METRIC_COLUMNS: dict[str, tuple[str, ...]] = {
-    "backtest_metrics": _BACKTEST_UNCERTAINTY_COLUMNS,
+    "backtest_metrics": _BACKTEST_UNCERTAINTY_COLUMNS
+    + _BACKTEST_RUIN_COLUMNS
+    + _BACKTEST_RISK_TRIGGER_COLUMNS,
     # n_periods rides along: the fold table declares n_days, and the metric pass writes both.
-    "backtest_fold_metrics": _BACKTEST_UNCERTAINTY_COLUMNS + ("n_periods",),
+    "backtest_fold_metrics": _BACKTEST_UNCERTAINTY_COLUMNS
+    + _BACKTEST_RUIN_COLUMNS
+    + ("n_periods",),
     "prediction_metrics": tuple(
         f"{metric}_{suffix}"
         for metric in ("ic", "auc")
@@ -836,6 +884,20 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
     ):
         db.execute("ALTER TABLE candidate_sets ADD COLUMN supersedes_hash TEXT")
 
+    # Additive and outside every hash: registry columns reach no specification, so this
+    # moves no identity and invalidates no registered row. It exists because a NULL
+    # `direction_label` carried two opposite meanings - "no direction sibling is declared
+    # for this label", which `fwd_ret_24h` legitimately produces in every family, and "one
+    # is declared and scoring against it failed", which every `deep_learning` run in
+    # `crypto_perps_funding` produced for months while the only trace was a warning in a
+    # papermill log the harness deletes on success. Declared explicitly for the type: the
+    # auto-add in `_upsert_wide_metrics` would infer REAL from the None a healthy run
+    # writes first.
+    if "prediction_metrics" in tables and not _table_has_column(
+        db, "prediction_metrics", "direction_label_error"
+    ):
+        db.execute("ALTER TABLE prediction_metrics ADD COLUMN direction_label_error TEXT")
+
     # The share of treatment rows the block permutation could not move. It is computed on
     # every fit and warned about, and the warning only fires when the fit executes, so a
     # cache-hit re-run reported the p-value with no way to see whether it was biased toward
@@ -853,6 +915,24 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
         db, "causal_runs", "refutation_placebo_json"
     ):
         db.execute("ALTER TABLE causal_runs ADD COLUMN refutation_placebo_json TEXT")
+
+    # The placebo t-statistics, which since ml4t/agent-workspace#1120 are what
+    # refutation_p is computed on. Additive and outside the causal computation
+    # specification, so it moves no causal hash. A row written before this column existed
+    # carries NULL, which is the truthful answer: that run's p-value was computed on raw
+    # thetas and the draws behind it are not recoverable on the t scale.
+    if "causal_runs" in tables and not _table_has_column(
+        db, "causal_runs", "refutation_placebo_t_json"
+    ):
+        db.execute("ALTER TABLE causal_runs ADD COLUMN refutation_placebo_t_json TEXT")
+
+    # Which covariance estimator produced dml_se_hac. Additive and outside the causal
+    # computation specification, so it moves no causal hash and invalidates no registered
+    # row. A row written before this column carries NULL, which is the truthful answer:
+    # nothing recorded it at the time, and the number cannot be re-attributed after the
+    # fact because the fallback returned an HC0 value under the robust name.
+    if "causal_runs" in tables and not _table_has_column(db, "causal_runs", "covariance_type"):
+        db.execute("ALTER TABLE causal_runs ADD COLUMN covariance_type TEXT")
 
     # Migration 3: tall → wide metric tables
     if "prediction_metrics" in tables:
@@ -1209,6 +1289,68 @@ def _save_parquet(path: Path, frame) -> None:
 # ---------------------------------------------------------------------------
 
 
+_INCREMENTAL_SHARD = re.compile(r"^(?P<stem>.+)_ep(?P<epoch>\d+)\.parquet$")
+
+
+def incremental_shard_path(incr_dir: Path, config_name: str, fold: int, epoch: int) -> Path:
+    """The one file a (config, fold, checkpoint) triple ever writes."""
+    return incr_dir / f"{config_name}_fold{int(fold)}_ep{int(epoch)}.parquet"
+
+
+def clear_fold_predictions(incr_dir: Path, config_name: str, fold: int) -> None:
+    """Drop whatever an earlier attempt at this (config, fold) left behind.
+
+    A shard is written once and never rewritten, so a re-fit that produces fewer
+    checkpoints than the attempt before it would otherwise read the leftovers back as
+    its own. Rewriting one file per fold used to truncate them implicitly.
+    """
+    if not incr_dir.exists():
+        return
+    for path in incr_dir.glob(f"{config_name}_fold{int(fold)}_ep*.parquet"):
+        path.unlink()
+    legacy = incr_dir / f"{config_name}_fold{int(fold)}.parquet"
+    if legacy.exists():
+        legacy.unlink()
+
+
+def incremental_prediction_shards(
+    incr_dir: Path,
+    config_name: str | None = None,
+) -> list[tuple[str, int, Path]]:
+    """Return ``(stem, checkpoint, path)`` in the order their rows concatenate.
+
+    The order is the one a single file per fold produced: folds by the lexicographic
+    order of ``<config>_fold<fold>``, and inside a fold the checkpoints ascending, which
+    is the order they were fitted in. Registry identity does not depend on it -
+    ``published_prediction_digest`` sorts its row hashes - but every artifact these
+    runners write does, and holding the order is what let the change be compared against
+    the implementation it replaced.
+    """
+    pattern = "*.parquet" if config_name is None else f"{config_name}_fold*.parquet"
+    shards: list[tuple[str, int, Path]] = []
+    legacy: list[str] = []
+    for path in incr_dir.glob(pattern):
+        match = _INCREMENTAL_SHARD.match(path.name)
+        if match is None:
+            legacy.append(path.name)
+            continue
+        shards.append((match["stem"], int(match["epoch"]), path))
+    if legacy:
+        raise ValueError(
+            f"{incr_dir} holds {len(legacy)} prediction file(s) written one-per-fold by an "
+            f"earlier version ({', '.join(sorted(legacy)[:3])}). They carry every checkpoint "
+            f"the fold reached and would be counted a second time alongside the per-checkpoint "
+            f"shards beside them. Delete the directory and re-fit."
+        )
+    shards.sort(key=lambda item: (item[0], item[1]))
+    return shards
+
+
+def incremental_prediction_files(incr_dir: Path, config_name: str | None = None) -> list[Path]:
+    """The shard paths from :func:`incremental_prediction_shards`, in the same order."""
+    return [path for _stem, _epoch, path in incremental_prediction_shards(incr_dir, config_name)]
+
+
 def flush_fold_predictions(
     incr_dir: Path,
     config_name: str,
@@ -1223,10 +1365,19 @@ def flush_fold_predictions(
     eval_actual: np.ndarray | None = None,
     eval_col: str = "eval_actual",
 ) -> None:
-    """Write one fold's checkpoint predictions to parquet for crash safety.
+    """Write each checkpoint's fold predictions to its own parquet shard.
 
     Shared by deep_learning, tabular_dl, and darts_forecasting runners.
     Handles Object-typed date columns from pandas datetime arrays.
+
+    One shard per (config, fold, checkpoint), written once. The sequence runner calls
+    this at every checkpoint with every checkpoint fitted so far, and this used to
+    rewrite one file per fold from all of them, so both the frames it built and the bytes
+    it wrote grew with the square of the schedule. A nasdaq fold is 3,993,874 validation
+    rows, which is a measured 172 MB a checkpoint: at the twentieth checkpoint of twenty
+    the writer built 3.8 GB of frames to write a file it had already written nineteen
+    times, and wrote 210 checkpoints' worth of parquet over the fold where 20 were new. A
+    shard that already exists is left alone.
     """
     import numpy as np
     import polars as pl
@@ -1237,8 +1388,10 @@ def flush_fold_predictions(
             strict=False
         )
 
-    frames = []
     for ep, preds in checkpoint_preds.items():
+        shard = incremental_shard_path(incr_dir, config_name, fold, ep)
+        if shard.exists():
+            continue
         n = len(preds)
         entities = val_entities if val_entities is not None else np.array(["unknown"] * n)
         df = pl.DataFrame(
@@ -1254,10 +1407,8 @@ def flush_fold_predictions(
         )
         if eval_actual is not None:
             df = df.with_columns(pl.Series(eval_col, eval_actual.astype(np.float64)))
-        frames.append(df)
-
-    if frames:
-        _save_parquet(incr_dir / f"{config_name}_fold{fold}.parquet", pl.concat(frames))
+        _save_parquet(shard, df)
+        del df
 
 
 def flush_fold_training_log(

@@ -28,6 +28,7 @@ failed - 423 of them at the time this landed.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,6 +36,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / ".github" / "scripts"))
+
+pytestmark = pytest.mark.usefixtures("tmp_repo")
 
 import notebook_provenance  # noqa: E402
 from notebook_provenance import (  # noqa: E402
@@ -97,6 +100,64 @@ def test_an_execution_count_inside_an_output_is_ignored_too():
     second = _notebook([_code_cell("1 + 2", [{**result, "execution_count": 9}])])
 
     assert outputs_digest(first) == outputs_digest(second)
+
+
+def test_papermills_injected_cell_does_not_move_the_digest():
+    """`nb-run.sh` stamps before dropping that cell, so the digest must not see it.
+
+    The ordering is fixed at both ends: the stamper cross-checks its parameter declaration
+    against the injected cell, so it has to run first, and the cell has to go before
+    `jupytext --sync` can bake the argument values into the paired `.py`. A digest that
+    counted the cell therefore described a notebook that is never committed, and every
+    parameterized production run reported OUTPUTS CHANGED on a file nothing had edited.
+    """
+    committed = _notebook([_code_cell("print(sharpe)", [_stream("0.81\n")])])
+    executed = _notebook(
+        [
+            {
+                "cell_type": "code",
+                "metadata": {"tags": ["injected-parameters"]},
+                "source": "REPLACE_HOLDOUT = True\n",
+                "outputs": [],
+                "execution_count": None,
+            },
+            _code_cell("print(sharpe)", [_stream("0.81\n")]),
+        ]
+    )
+
+    assert outputs_digest(executed) == outputs_digest(committed)
+
+
+def test_the_parameters_cell_itself_is_still_covered():
+    """Only papermill's fossil is excluded, not the notebook's own parameters cell.
+
+    That cell is source a reader edits and can carry output; dropping it from the digest
+    would let a stamped notebook change what it declares without the gate noticing.
+    """
+    before = _notebook(
+        [
+            {
+                "cell_type": "code",
+                "metadata": {"tags": ["parameters"]},
+                "source": "LABEL = 'fwd_ret_5d'\n",
+                "outputs": [_stream("fwd_ret_5d\n")],
+                "execution_count": 1,
+            }
+        ]
+    )
+    after = _notebook(
+        [
+            {
+                "cell_type": "code",
+                "metadata": {"tags": ["parameters"]},
+                "source": "LABEL = 'fwd_ret_5d'\n",
+                "outputs": [_stream("fwd_ret_21d\n")],
+                "execution_count": 1,
+            }
+        ]
+    )
+
+    assert outputs_digest(before) != outputs_digest(after)
 
 
 def test_editing_prose_does_not_change_the_digest():
@@ -369,6 +430,35 @@ def test_stamping_a_run_that_never_wrote_the_notebook_is_refused(
         stamp_notebook(nb_path, executor="test", parameters={})
 
     assert "never wrote this file" in str(exc.value)
+
+
+def test_a_refusal_about_a_notebook_outside_the_repo_prints_the_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The three refusals name the notebook, and a notebook may not be under REPO_ROOT.
+
+    `relative_to` raises for a path outside the root, so the caller who most needs the
+    message - the one being refused - got a `ValueError` traceback out of the error path
+    instead of the error. `clear` already carried a local `try`/`except` for this, which is
+    what says it happens rather than that it might. A notebook is outside the worktree
+    whenever it is executed somewhere else: a scratch copy, a staging path under `/tmp`.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", tmp_path / "repo")
+    (tmp_path / "repo").mkdir()
+
+    py = outside / "nb.py"
+    py.write_text("# %%\nprint(1)\n")
+    nb_path = outside / "nb.ipynb"
+    nb_path.write_text(json.dumps(_notebook([_code_cell("print(1)\n", [], execution_count=None)])))
+
+    with pytest.raises(SystemExit) as exc:
+        stamp_notebook(nb_path, executor="test", parameters={})
+
+    message = str(exc.value)
+    assert "nothing in it was executed" in message
+    assert str(nb_path) in message
 
 
 def test_a_deterministic_notebook_can_say_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

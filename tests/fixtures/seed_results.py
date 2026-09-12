@@ -21,6 +21,7 @@ import yaml
 
 from case_studies.utils.registry.specs import IDENTITY_VERSION
 from case_studies.utils.registry.store import _open_registry
+from tests.fixture_registry import choose_reference_panel, panel_signature
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 CS_ROOT = REPO_ROOT / "case_studies"
@@ -882,20 +883,11 @@ def _reference_panels(cs_dir: Path, hash_rows: list, survives, _pl) -> dict:
             entity = next((c for c in ENTITY_COLUMN_CANDIDATES if c in frame.columns), None)
             if entity is None or not {"timestamp", "actual"} <= set(frame.columns):
                 continue
-            # Only ever compared for equality, so stringifying the identifiers is
-            # enough and keeps a column carrying nulls from raising in sorted().
-            signature = (
-                frame.height,
-                tuple(sorted(map(str, frame[entity].unique().to_list()))),
-                tuple(map(str, frame["timestamp"].unique().sort().to_list())),
-            )
+            signature = panel_signature(frame, entity)
             by_signature.setdefault(signature, []).append((p_hash, frame, entity))
         if not by_signature:
             continue
-        _, entries = min(
-            by_signature.items(),
-            key=lambda item: (-len(item[1]), -item[0][0], item[1][0][0]),
-        )
+        _, entries = choose_reference_panel(by_signature)
         _, frame, entity = entries[0]
         panels[key] = _subsampled_panel(frame, entity, _pl)
     return panels
@@ -1939,52 +1931,6 @@ def _seed_demo_predictions(cs_dir: Path, cs_id: str, primary_label: str) -> None
         df.write_parquet(str(pred_file))
 
 
-def _seed_news_features(output_dir: Path) -> None:
-    """Seed a minimal news_features.parquet for Ch10/08_text_feature_evaluation.
-
-    The notebook loads from get_output_dir(8, "fnspid") / "news_features.parquet".
-    In test mode that becomes {ML4T_OUTPUT_DIR}/ch08_fnspid/news_features.parquet.
-    Required columns: symbol, timestamp, fwd_ret_1d, fwd_ret_5d, fwd_ret_20d,
-    weighted_surprise, sentiment_mean, sentiment_momentum, coverage_count.
-    """
-    try:
-        import numpy as np
-        import polars as _pl
-    except ImportError:
-        return
-
-    out_dir = output_dir / "ch08_fnspid"
-    path = out_dir / "news_features.parquet"
-    if path.exists():
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    rng = np.random.default_rng(42)
-    symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM"]
-    from datetime import date, timedelta
-
-    start = date(2023, 1, 3)
-    dates = [
-        start + timedelta(days=i) for i in range(60) if (start + timedelta(days=i)).weekday() < 5
-    ]
-    n = len(symbols) * len(dates)
-
-    df = _pl.DataFrame(
-        {
-            "symbol": [s for _ in dates for s in symbols],
-            "timestamp": _pl.Series([d for d in dates for _ in symbols]).cast(_pl.Date),
-            "fwd_ret_1d": rng.normal(0, 0.01, n).tolist(),
-            "fwd_ret_5d": rng.normal(0, 0.02, n).tolist(),
-            "fwd_ret_20d": rng.normal(0, 0.04, n).tolist(),
-            "weighted_surprise": rng.normal(0, 0.5, n).tolist(),
-            "sentiment_mean": rng.normal(0, 0.3, n).tolist(),
-            "sentiment_momentum": rng.normal(0, 0.2, n).tolist(),
-            "coverage_count": rng.poisson(3, n).tolist(),
-        }
-    )
-    df.write_parquet(str(path))
-
-
 def _write_if_missing(path: Path, data: dict) -> None:
     """Write JSON file only if it doesn't already exist."""
     if path.exists():
@@ -2070,6 +2016,3 @@ def seed_results(output_dir: Path, case_study_ids: list[str]) -> None:
 
         # Ch25 live-simulation demo predictions
         _seed_demo_predictions(cs_dir, cs_id, primary_label)
-
-    # --- Non-case-study chapter fixtures ---
-    _seed_news_features(output_dir)

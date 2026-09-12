@@ -42,14 +42,16 @@
 import json
 import sqlite3
 import time
-import warnings
 
 import matplotlib.pyplot as plt
 import polars as pl
 
-warnings.filterwarnings("ignore")
-
-from case_studies.research import CandidateSet, Study, open_selection_field
+from case_studies.research import (
+    CandidateSet,
+    Study,
+    open_selection_field,
+    open_study,
+)
 from case_studies.utils.backtest_loaders import (
     get_backtest_config,
     load_backtest_prices_for,
@@ -77,10 +79,12 @@ from case_studies.utils.sweep_config import (
     get_top_n_predictions,
 )
 from utils.paths import get_case_study_dir
-from utils.style import COLORS, FIGSIZE, add_message_title
+from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "sp500_equity_option_analytics"
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
 LABEL = ""
 MAX_SYMBOLS = 0
 TOP_N_COMBOS = 1
@@ -93,6 +97,20 @@ TOP_N_COMBOS = 1
 # parameter wins; otherwise the case study's own declaration does.
 
 # %%
+# A preview run reads and registers in a smoke chain's own workspace, under `.preview/<case>`,
+# and `open_study` is what activates that root. Activation rewrites `ML4T_OUTPUT_DIR` for the
+# rest of the process, so it has to happen before the first `get_case_study_dir` rather than
+# beside the registry read further down: `CASE_DIR` has to already answer for the workspace.
+_preview_study = None
+if EXECUTION_TIER == "preview":
+    if not WORKSPACE:
+        raise ValueError("preview execution requires WORKSPACE")
+    _preview_study = open_study(
+        CASE_STUDY_ID,
+        execution_tier="preview",
+        workspace=WORKSPACE,
+        entry_point="17_costs",
+    )
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
 REGISTRY_DB = CASE_DIR / "run_log" / "registry.db"
 bt_config = get_backtest_config(CASE_STUDY_ID)
@@ -124,8 +142,12 @@ print(
 # `run_log` are symlinks: true in a maintainer worktree, false in every clean clone and CI run.
 # `CASE_DIR` is already the directory this notebook resolved, including under a preview, so
 # asking it directly answers for the registry the rest of the notebook reads.
-_study = Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="17_costs")
-_members, _population_notes = prediction_members_in_force(_study)
+_study = (
+    _preview_study
+    if _preview_study is not None
+    else Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="17_costs")
+)
+_members, _population_notes = prediction_members_in_force(_study, CASE_DIR)
 for _note in _population_notes:
     print(_note)
 CURRENT_MEMBERS = _members
@@ -528,7 +550,12 @@ add_message_title(
     "Exploratory flat-dollar convention; band: conditional bootstrap",
 )
 
-fig.show()
+show_with_alt(
+    fig,
+    "Two panels of annualized validation Sharpe against a cost axis, each a line with a shaded "
+    "95% bootstrap band and a dashed line at zero: one-way cost in basis points on the left with "
+    "the configured level marked, a uniform per-share half-spread on the right.",
+)
 
 # %% [markdown]
 # ## Key takeaways

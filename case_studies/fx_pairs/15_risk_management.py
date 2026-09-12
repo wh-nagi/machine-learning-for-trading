@@ -65,9 +65,11 @@ from case_studies.research import (
     plan_backtests,
     population_supersedes,
     research_name,
+    reuse_disclosure,
     run_backtests,
     superseded_members,
 )
+from case_studies.utils.strategy_analysis import selectable_validation_candidates
 from case_studies.utils.sweep_config import (
     get_allocators,
     get_portfolio_risk_controls,
@@ -90,18 +92,30 @@ SEED = 42
 RUN_SWEEP = True
 FORCE_REBACKTEST = False
 POPULATION_NAME = ""
-SUPERSEDES_RISK_BACKTESTS: str = "cd421f7757e0"
+# `df20d72ab319` was the tip of `fx_pairs:risk-overlay-backtests` when it was written, and
+# `create` accepts the tip and nothing else, so the literal was correct exactly until this
+# notebook next published. `"live"` names the lineage and is resolved against it at run time.
+SUPERSEDES_RISK_BACKTESTS: str = "live"
 # A candidate set is immutable under its name, exactly as a population is, so a rebuilt upstream
 # generation has to name the set it replaces. Keyed by the full set name because that is what the
 # refusal prints: pasting back the name it names is the obvious thing to try, and it has to work.
 # Resolved through `candidate_set_supersedes` rather than passed straight to `create`, because a
 # reader's clean clone has no generation to supersede and `create` refuses a first version that
 # claims to replace one.
+#
+# `"live"` names the lineage rather than a generation of it, which is what stops these going
+# stale again. Three of the four hashes it replaces were already dead: the three
+# `pre-risk-strategies` sets moved on 2026-09-09 (`d966caa61faf` -> `669d50f0f525`,
+# `fde7af05fff6` -> `93b56a9dfb42`, `ff269dc95622` -> `f70630285818`), so each named the
+# generation its own successor had replaced and the next membership move here would have been
+# refused at the freeze, after the fit. `bf21ae4c9070` was still the head of
+# `fx_pairs:holdout-candidates` and would have gone the same way on the next publish.
+# See `case_studies.research.population.SUPERSEDES_LIVE`.
 SUPERSEDES_CANDIDATE_SETS: dict[str, str] = {
-    "fx_pairs:fwd_ret_1d:pre-risk-strategies": "208fc4bbc14c",
-    "fx_pairs:fwd_ret_5d:pre-risk-strategies": "ceea3ffc2dd3",
-    "fx_pairs:fwd_ret_21d:pre-risk-strategies": "23087a1081bf",
-    "fx_pairs:holdout-candidates": "4aea5c6c1218",
+    "fx_pairs:fwd_ret_1d:pre-risk-strategies": "live",
+    "fx_pairs:fwd_ret_5d:pre-risk-strategies": "live",
+    "fx_pairs:fwd_ret_21d:pre-risk-strategies": "live",
+    "fx_pairs:holdout-candidates": "live",
 }
 
 # %% [markdown]
@@ -173,10 +187,11 @@ catalog = study.predictions.table(include_preview=include_preview).filter(
 # replaced in the registry, complete and current, so this filter alone would carry a retired
 # prediction set into the sweep. `superseded_members` reads the lineage instead - see
 # `13_backtest`, which drops the same set before it freezes the baseline population.
-# `SUPERSEDES_RISK_BACKTESTS` names the snapshot this run replaces under the name it publishes,
-# offered through `population_supersedes` on the same rule. It is empty until that name has a
-# first generation; after that, an upstream refit changes this population's member list and
-# the registry refuses the write without it. `13_backtest` states the reasoning once.
+# `SUPERSEDES_RISK_BACKTESTS` is the sentinel `"live"`, so it names the lineage this run
+# publishes under and `population_supersedes` resolves the generation in force at write time.
+# It resolves to nothing until that name has a first generation, which is also what a reader's
+# clean clone sees; after that, an upstream refit changes this population's member list and the
+# registry refuses the write without the tip. `13_backtest` states the reasoning once.
 retired = superseded_members(study, member_kind="prediction")
 if retired:
     catalog = catalog.filter(~pl.col("prediction_hash").is_in(list(retired)))
@@ -294,21 +309,42 @@ else:
             f"upstream {upstream_labels}, "
             f"catalog {sorted(catalog.get_column('label').unique())}"
         )
+    # Eligibility and order both come from `selectable_validation_candidates`, the function
+    # `resolve_solvent_carrier` ranks. Re-deriving them here swept the risk variants over a
+    # strategy the case study never publishes: the populations above are read whole, and nothing
+    # applies the retired-prediction test to them, so a backtest whose prediction a later refit
+    # superseded still won on raw Sharpe. `16_costs` carried the same defect.
+    _eligible_order = {
+        row["backtest_hash"]: position
+        for position, row in enumerate(
+            selectable_validation_candidates(CASE_STUDY_ID, labels=[LABEL] if LABEL else None)
+        )
+    }
     for label in upstream_labels:
         members = [result for result in upstream if _label(result) == label]
+        eligible = [result for result in members if result.hash in _eligible_order]
+        if not eligible:
+            raise RuntimeError(
+                f"none of the {len(members)} upstream backtests for {label} is selectable: "
+                "every one is retired on the backtest or the prediction side, or belongs to no "
+                "population its producer publishes. Re-run the validation stages rather than "
+                "sweeping risk controls over a strategy nothing reports."
+            )
         _set_name = research_name(
             CASE_STUDY_ID, f"{label}:pre-risk-strategies", scope=POPULATION_NAME
         )
+        # The frozen set records the field the selection actually saw, so it holds the
+        # selectable members and not every row the three populations list.
         candidates = CandidateSet.create(
             study,
             name=_set_name,
-            members=members,
+            members=eligible,
             supersedes=candidate_set_supersedes(
                 study, name=_set_name, declared=SUPERSEDES_CANDIDATE_SETS.get(_set_name)
             ),
         )
         candidate_sets[label] = candidates
-        leader = candidates.best_validation_sharpe()
+        leader = min(eligible, key=lambda result: _eligible_order[result.hash])
         if not isinstance(leader, BacktestResult):
             raise TypeError("strategy selection did not return a backtest")
         selected_by_label[label] = leader
@@ -391,6 +427,10 @@ def _non_risk_projection(spec: dict[str, Any]) -> dict[str, Any]:
     metadata = projected.get("backtest_config", {}).get("metadata")
     if isinstance(metadata, dict):
         metadata.pop("chapter", None)
+        # An absolute filesystem path, and already excluded from the identity hash by
+        # `_HASH_EXCLUDED_METADATA` for that reason. Comparing it here makes the notebook
+        # refuse its own siblings from any checkout but the one that registered the parents.
+        metadata.pop("preset_path", None)
     return projected
 
 
@@ -494,7 +534,7 @@ for job in risk_jobs:
 
 served = run_status.count("reused")
 print(
-    f"Risk overlays: {len(risk_results) - served} computed, {served} served from the registry, "
+    f"Risk overlays: {reuse_disclosure(len(risk_results) - served, served)}, "
     f"{len(risk_results)} in the population"
 )
 

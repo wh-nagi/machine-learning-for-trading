@@ -68,12 +68,10 @@
 import json
 import sqlite3
 import time
-import warnings
 
 import polars as pl
 
-warnings.filterwarnings("ignore")
-
+from case_studies.research import open_study
 from case_studies.utils.backtest_loaders import (
     get_backtest_config,
     load_backtest_prices_for,
@@ -83,8 +81,10 @@ from case_studies.utils.backtest_presets import (
     build_backtest_spec,
     clone_backtest_spec,
     ensure_backtest_spec,
+    prediction_age_declaration,
     set_backtest_costs_bps,
     strategy_view,
+    traded_universe_declaration,
 )
 from case_studies.utils.backtest_runner import run_backtest
 from case_studies.utils.notebook_contracts import excluded_families
@@ -104,8 +104,41 @@ CASE_STUDY_ID = "nasdaq100_microstructure"
 LABEL = ""
 MAX_SYMBOLS = 0
 TOP_N_COMBOS = None
+# Both names stay bound here although nothing below reads them: that is what makes the harness
+# force preview and supply a workspace - `_declares_tier_and_workspace` in `tests/pm_helpers.py`
+# looks for exactly this pair. Without them the canonical branch regenerates in place, which
+# needs generated-artifact symlinks a CI checkout does not have.
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
 
 # %%
+# A reduced run is a preview run. Refused on the canonical tier so a narrowed result can
+# never land in the registry the book's numbers come from, and so the two can never sit in
+# one registry to be ranked against each other: `resolve_best_backtest_runs` takes the top
+# Sharpe over every backtest at a stage, and a Sharpe earned over a handful of names would
+# outrank one earned over the whole panel. `us_equities_panel` 16 through 19 already refuse
+# the parameter this way, and `canonically_refused_parameters` reads the refusal out of the
+# source, so the canonical fixture path drops the name rather than handing the notebook
+# something its first cell raises on (ml4t/agent-workspace#911).
+if EXECUTION_TIER == "canonical" and MAX_SYMBOLS:
+    raise ValueError(
+        "MAX_SYMBOLS narrows the universe this run trades, which makes it a different "
+        "portfolio from the declared one and gives it its own backtest identity "
+        "(ml4t/agent-workspace#911). A canonical run trades the declared universe: set "
+        "MAX_SYMBOLS=0, or run under EXECUTION_TIER='preview' with a WORKSPACE."
+    )
+
+# %% [markdown]
+# The study is opened before anything resolves a path or reads the registry. Opening it
+# activates a root and rewrites `ML4T_OUTPUT_DIR` process-wide, and every later
+# `get_case_study_dir`, prediction read and registry write resolves against that variable. A
+# `CASE_DIR` bound before this line points at the released registry while this notebook writes
+# to the workspace, and the two never meet: the sweep finds nothing registered and every reader
+# scoped to hashes from the other root comes back empty.
+
+# %%
+study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
+
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
 bt_config = get_backtest_config(CASE_STUDY_ID)
 if TOP_N_COMBOS is None:
@@ -131,13 +164,13 @@ if excluded_families(CASE_STUDY_ID):
 # behaves around them before the two recovery levers — the screen and the cadence — are
 # applied.
 #
-# **The pool is every stage a carrier can come from, not just `allocation`.** A risk overlay
-# is a strategy in its own right: `16_risk_management` registers it at `stage='risk_overlay'`
-# with its own Sharpe, and it is a candidate to carry the case study. Pricing only the
-# allocation rows would put a cost curve in the chapter for a strategy the case study does
-# not select whenever an overlay outranks its own parent, which is the ordinary case - four
-# of the seven completed case studies have a `risk_overlay` as their rank-1 validation
-# carrier. The stages come from `STAGE_SEQUENCE` rather than a tuple typed here, so the pool
+# **The pool is every stage a selected configuration can come from, not just `allocation`.** A risk
+# overlay is a strategy in its own right: `16_risk_management` registers it at
+# `stage='risk_overlay'` with its own Sharpe, and it is a candidate to carry the case study.
+# Pricing only the allocation rows would put a cost curve in the chapter for a strategy the case
+# study does not select whenever an overlay outranks its own parent, which is the ordinary case -
+# four of the seven completed case studies have a `risk_overlay` as their rank-1 validation
+# configuration. The stages come from `STAGE_SEQUENCE` rather than a tuple typed here, so the pool
 # cannot drift from the library when a stage is added.
 #
 # `cost_sensitivity` is the one member excluded, because that is the stage this notebook
@@ -165,7 +198,7 @@ PRE_COST_STAGES = tuple(stage for stage in STAGE_SEQUENCE if stage != "cost_sens
 CANONICAL_UNIVERSE = get_universe_filters_for(CASE_STUDY_ID)[0]
 
 
-def _on_canonical_universe(frame: pl.DataFrame) -> pl.DataFrame:
+def _on_canonical_universe(frame: pl.DataFrame, stage: str = "upstream") -> pl.DataFrame:
     """Drop runs selected under a universe this case study does not treat as canonical.
 
     `None` means the case study pins no universe, and then every run qualifies - the filter
@@ -174,6 +207,17 @@ def _on_canonical_universe(frame: pl.DataFrame) -> pl.DataFrame:
     """
     if CANONICAL_UNIVERSE is None:
         return frame
+    # An empty resolver result carries no columns at all, so reading `spec_json` off it raised
+    # `ColumnNotFoundError: "spec_json" not found`, naming a column rather than the absence that
+    # produced it. Returning the empty frame is NOT the fix: it made this notebook exit 0 having
+    # registered nothing, which is the same absence wearing a success. Measured 2026-09-09 on the
+    # smoke chain - 202 signal backtests registered, none carrying `universe_filter`, and this
+    # notebook reported no error at all.
+    if frame.is_empty():
+        raise RuntimeError(
+            f"no {stage} backtests are registered for {CASE_STUDY_ID}, so there is nothing "
+            "to price. Run 14_backtest through 16_risk_management against this registry first."
+        )
     keep = [
         strategy_view(json.loads(spec)).get("signal", {}).get("universe_filter")
         == CANONICAL_UNIVERSE
@@ -183,7 +227,7 @@ def _on_canonical_universe(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def resolve_pre_cost_runs(top_n: int) -> pl.DataFrame:
-    """The highest-Sharpe validation runs across every stage a carrier may come from.
+    """The highest-Sharpe validation runs across every stage a selected configuration may come from.
 
     Each stage is asked for its whole ranked list and the pool is sorted afterwards, rather
     than taking `top_n` from each and merging them: truncating first lets one stage's leader
@@ -198,7 +242,8 @@ def resolve_pre_cost_runs(top_n: int) -> pl.DataFrame:
                 _on_canonical_universe(
                     resolve_best_backtest_runs(
                         CASE_STUDY_ID, LABEL, split="validation", stage=stage, top_n=1_000_000
-                    )
+                    ),
+                    stage,
                 ),
             )
             for stage in PRE_COST_STAGES
@@ -239,7 +284,7 @@ else:
             initial_cash=bt_config.initial_cash,
         )
         alloc = strategy_view(spec).get("allocation", {}).get("method", "equal_weight")
-        # The stage is printed because it is the thing that changed: a `risk_overlay` carrier
+        # The stage is printed because it is the thing that changed: a `risk_overlay` configuration
         # and its `allocation` parent share a prediction hash, so nothing else in this line
         # distinguishes the overlaid run from the un-overlaid one it was built on.
         print(
@@ -359,7 +404,8 @@ explorer = BacktestExplorer(CASE_STUDY_ID)
 
 # %% [markdown]
 # **The curve is scoped to the rows this run just registered.** `cost_sensitivity()` unscoped
-# returns every row the stage has ever held - previous carriers, superseded generations, and
+# returns every row the stage has ever held - configurations selected earlier, superseded
+# generations, and
 # the full-universe rows section 4 registers on purpose. Plotting those together produces one
 # line per allocator drawn through several strategies at once, which is not a Sharpe-versus-cost
 # curve for anything. `backtest_explorer.cost_sensitivity`'s own docstring names this case study
@@ -507,10 +553,11 @@ from case_studies.utils.registry import read_predictions
 db_path = CASE_DIR / "run_log" / "registry.db"
 conn = sqlite3.connect(str(db_path))
 cur = conn.cursor()
-# The universe predicate is the same statement section 1 makes about the carrier pool, and it
-# has to be made again here: this query picks its own row. Without it the cadence exhibit - the
-# publication finding of this notebook - is built on whichever signal row ranks highest, which
-# is the full-universe variant `setup.yaml` excludes from canonical candidacy whenever it wins.
+# The universe predicate is the same statement section 1 makes about the selected configuration
+# pool, and it has to be made again here: this query picks its own row. Without it the cadence
+# exhibit - the publication finding of this notebook - is built on whichever signal row ranks
+# highest, which is the full-universe variant `setup.yaml` excludes from canonical candidacy
+# whenever it wins.
 cur.execute(
     """
 SELECT br.prediction_hash, tr.family, tr.config_name, bm.sharpe
@@ -557,10 +604,28 @@ else:
 # %% [markdown]
 # ### Aligning predictions to target bar frequency
 #
-# The predictions are at 15-minute resolution. When rebalancing at hourly
-# cadence, we take the **last available prediction** at or before each price
-# bar timestamp via an asof join. This is realistic: the portfolio manager
-# uses the most recent signal when the rebalance fires.
+# The predictions are minute-level. When rebalancing at hourly cadence, we take the
+# **last available prediction** at or before each price bar timestamp via an asof join.
+# This is realistic: the portfolio manager uses the most recent signal when the
+# rebalance fires.
+#
+# A backward asof join produces a null only *before* a symbol's series begins, so
+# dropping nulls trims the leading edge and nothing else. Everything after a symbol's
+# series *ends* reuses its last score for as long as the panel runs, and the coarser the
+# cadence the larger a share of the result that is. On this registry's `fwd_dir_15m`
+# predictions, eleven of 113 symbols stop reporting mid-sample - ten of them together at
+# the 2020-12-18 fold boundary and `UAL` after a single session - and the oldest match
+# the join produced was 252 sessions, the whole panel. At 30-minute cadence 19,667 of
+# 303,641 aligned rows carried a prediction more than one session old; at four-hour
+# cadence, 3,593 of 55,355.
+#
+# So the age is bounded, and in sessions rather than minutes: an overnight or weekend
+# carry is legitimate and is 5,600 minutes wide, while a symbol that has left the
+# universe is months of *sessions* stale. Measured on the same predictions, age 0 and
+# age 1 cover every symbol that stays; every row beyond that belongs to one of the
+# twelve that leave or have a hole. `MAX_PREDICTION_AGE_SESSIONS` is the bound, and the
+# rows it removes are counted and printed rather than dropped quietly - an alignment
+# that silently discards a symbol is the same absence this bound exists to end.
 
 # %% [markdown]
 # The cadences swept come from `backtest.sweep.cadence_sweep` in `setup.yaml`,
@@ -597,10 +662,34 @@ COST_LABELS = [f"{v * 100:g}¢" for v in COST_PER_SHARE_GRID]
 cadence_results = []
 
 
-def align_predictions_to_bars(preds: pl.DataFrame, bar_timestamps: pl.Series) -> pl.DataFrame:
-    """Align 15-min predictions to coarser bar timestamps via asof join."""
-    # For each symbol, find the last prediction at or before each bar timestamp
+# One session, so a bar may use the session's own prediction or the one before it -
+# which is what an overnight or weekend gap produces - and nothing older.
+MAX_PREDICTION_AGE_SESSIONS = 1
+
+
+def align_predictions_to_bars(
+    preds: pl.DataFrame,
+    bar_timestamps: pl.Series,
+    *,
+    max_age_sessions: int = MAX_PREDICTION_AGE_SESSIONS,
+    label: str = "",
+) -> pl.DataFrame:
+    """Align minute predictions to coarser bars, refusing a match older than the bound.
+
+    Sessions come from the prediction panel's own dates, so the bound counts trading days
+    rather than calendar time: a Friday prediction matched to a Monday bar is one session
+    old, not three days.
+
+    Returns the aligned frame and, when the bound removed rows, the declaration that has to
+    reach `backtest_hash` with them. Without that second value the fix would be invisible to
+    the registry: `prediction_hash` and the strategy spec are unchanged by a filter on the
+    aligned frame, so a bounded run and an unbounded one hash alike and the later one is
+    served the earlier one's result - the same shape as ml4t/agent-workspace#911.
+    """
     bar_df = pl.DataFrame({"timestamp": bar_timestamps}).unique().sort("timestamp")
+    sessions = preds.select(
+        pl.col("timestamp").dt.date().unique().sort().alias("session")
+    ).with_row_index("session_index")
     symbols = preds["symbol"].unique().sort().to_list()
 
     aligned = []
@@ -608,13 +697,59 @@ def align_predictions_to_bars(preds: pl.DataFrame, bar_timestamps: pl.Series) ->
         sym_preds = preds.filter(pl.col("symbol") == sym).sort("timestamp")
         sym_bars = bar_df.with_columns(pl.lit(sym).alias("symbol"))
         joined = sym_bars.join_asof(
-            sym_preds.drop("symbol"),
+            sym_preds.drop("symbol").with_columns(pl.col("timestamp").alias("prediction_ts")),
             on="timestamp",
             strategy="backward",
         )
         aligned.append(joined.drop_nulls("y_score"))
 
-    return pl.concat(aligned) if aligned else pl.DataFrame()
+    if not aligned:
+        return pl.DataFrame(), None
+
+    matched = pl.concat(aligned)
+    dated = (
+        matched.with_columns(pl.col("timestamp").dt.date().alias("session"))
+        .join(sessions, on="session", how="left")
+        .drop("session")
+        .with_columns(pl.col("prediction_ts").dt.date().alias("session"))
+        .join(sessions, on="session", how="left", suffix="_prediction")
+        .drop("session")
+        .with_columns(
+            (pl.col("session_index") - pl.col("session_index_prediction")).alias("age_sessions")
+        )
+    )
+    fresh = dated.filter(pl.col("age_sessions") <= max_age_sessions)
+    stale = dated.filter(pl.col("age_sessions") > max_age_sessions)
+    # Printed on every cadence, including the ones that drop nothing. A line only on the bad
+    # case is indistinguishable from the function not having run, which is the shape of the
+    # defect this bound closes.
+    summary = (
+        f"  {label or 'alignment'}: match age {dated['age_sessions'].median():.0f} session(s) "
+        f"median, {dated['age_sessions'].max()} max, bound {max_age_sessions}"
+    )
+    declaration = None
+    if stale.height:
+        names = sorted(stale["symbol"].unique().to_list())
+        summary += (
+            f" - dropped {stale.height:,} of {dated.height:,} on "
+            f"{len(names)} of {dated['symbol'].n_unique()} symbols "
+            f"({', '.join(names[:6])}{' ...' if len(names) > 6 else ''})"
+        )
+        # Declared only when it removed something, so a cadence the bound does not touch
+        # produces the spec it produced before this existed and keeps its registered identity.
+        declaration = prediction_age_declaration(
+            max_age_sessions=max_age_sessions,
+            dropped=stale.height,
+            kept=fresh.height,
+            symbols_dropped=len(names),
+        )
+    else:
+        summary += " - nothing dropped"
+    print(summary)
+    aligned = fresh.drop(
+        "session_index", "session_index_prediction", "age_sessions", "prediction_ts"
+    )
+    return aligned, declaration
 
 
 # %% [markdown]
@@ -626,7 +761,7 @@ def align_predictions_to_bars(preds: pl.DataFrame, bar_timestamps: pl.Series) ->
 
 # %%
 def run_cadence_cost_backtest(
-    cadence, cadence_label, cost_ps, cadence_prices, aligned_preds, state
+    cadence, cadence_label, cost_ps, cadence_prices, aligned_preds, state, prediction_age=None
 ):
     """Run one cadence × cost backtest and record results."""
     state["n_done"] += 1
@@ -640,6 +775,15 @@ def run_cadence_cost_backtest(
         initial_cash=bt_config.initial_cash,
         chapter="ch18",
         label=LABEL,
+        # `MAX_SYMBOLS` reduced `cadence_prices` and, until the run said so in its own
+        # specification, that reduction did not reach `backtest_hash`: a reduced run and the
+        # full run over the same predictions hashed alike (ml4t/agent-workspace#911). Built
+        # from the panel this spec is being built against, which is the one `run_backtest`
+        # is handed below. A full run declares nothing and hashes as it did before.
+        traded_universe=(traded_universe_declaration(cadence_prices) if MAX_SYMBOLS else None),
+        # Travels with the spec for the same reason the universe does: it changes what this
+        # run is computed from and `prediction_hash` cannot see it.
+        prediction_age=prediction_age,
         # The universe travels with the spec, not just with the query above. A row registered
         # without it reads as full-universe to every later reader - including section 4's
         # full-versus-screened query and `derived_tables_off_canonical_universe` - so the
@@ -722,9 +866,14 @@ for cadence in CADENCES if best_pred_hash else []:
     )
     bar_ts = cadence_prices["timestamp"].unique().sort()
 
-    aligned_preds = (
-        predictions_15m if freq == "15m" else align_predictions_to_bars(predictions_minute, bar_ts)
-    )
+    if freq == "15m":
+        # The 15-minute cadence is the prediction grid itself, so no as-of match is made and
+        # there is no age to bound.
+        aligned_preds, prediction_age = predictions_15m, None
+    else:
+        aligned_preds, prediction_age = align_predictions_to_bars(
+            predictions_minute, bar_ts, label=cadence_label
+        )
     if aligned_preds.is_empty():
         print(f"  {cadence_label}: no aligned predictions — skipping")
         continue
@@ -734,7 +883,13 @@ for cadence in CADENCES if best_pred_hash else []:
     )
     for cost_ps in COST_PER_SHARE_GRID:
         run_cadence_cost_backtest(
-            cadence, cadence_label, cost_ps, cadence_prices, aligned_preds, sweep_state
+            cadence,
+            cadence_label,
+            cost_ps,
+            cadence_prices,
+            aligned_preds,
+            sweep_state,
+            prediction_age=prediction_age,
         )
 
 # %%

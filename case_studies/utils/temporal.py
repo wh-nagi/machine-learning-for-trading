@@ -17,7 +17,10 @@ and asserting the results are identical.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -32,23 +35,67 @@ from case_studies.utils.artifact_digest import write_artifact
 
 __all__ = [
     "HmmFit",
+    "LiftedStream",
     "arima_one_step_forecast",
+    "chain_worker_pool",
     "filtered_state_probs",
     "fit_hmm_kmeans_init",
     "fit_hmm_restarts",
+    "fit_wasserstein_kmeans",
     "fold_feature_geometry",
     "garch11_conditional_volatility",
+    "lift_stream",
     "refit_boundaries",
     "relabel_states",
     "sort_states_by_mean",
     "sort_states_by_variance",
     "walk_forward_feature",
+    "wasserstein_barycenter_1d",
+    "wasserstein_distance_1d",
     "write_model_based",
 ]
 
 # Guards the log of a zero transition or start probability. Small enough not to move a
 # fitted probability, large enough that log() stays finite.
 _LOG_FLOOR = 1e-300
+
+
+@contextmanager
+def chain_worker_pool(n_threads: int):
+    """Size the BLAS and OpenMP pools of sampler chain workers, leaving this process alone.
+
+    ``pm.sample(cores=...)`` runs each chain in its own process, started through
+    multiprocessing's forkserver. Those children are fresh interpreters: they import numpy
+    and scipy themselves, so they size their pools from these variables at import. Setting
+    the variables is the only thing that reaches them - ``threadpoolctl`` reconfigures pools
+    already loaded in the calling interpreter, and the workers are not in it. Measured on an
+    sp500_options SV fit, peak threads across the process tree: 113 with nothing set, 115
+    with ``threadpool_limits`` around the sampler, 41 with this.
+
+    The forkserver starts at the first parallel sample, which is why the variables have to be
+    set before it and why restoring them afterwards is safe: by then it exists, and later
+    samples reuse it. This process's own pools are untouched, so whatever else the notebook
+    fits keeps the threading it had.
+
+    The pool size does not change the draws. Same data and seed at 2,000 draws, 2,000 tune
+    and 4 chains, every variant above returns a ``sigma_eta`` array equal bit for bit, so this
+    is a runtime setting and stays out of any identity. Contrast ``DML_THREAD_LIMIT`` in
+    ``case_studies/utils/causal.py``, which is recorded in the resolved specification because
+    there the reduction order does move the estimate.
+    """
+    if n_threads < 1:
+        raise ValueError("chain_worker_pool needs at least one thread per worker")
+    names = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update(dict.fromkeys(names, str(n_threads)))
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def filtered_state_probs(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
@@ -242,10 +289,12 @@ def arima_one_step_forecast(fitted: Any, y_prefix: np.ndarray) -> np.ndarray:
     and the check that it stayed correct, not a reimplementation of the filter.
 
     Two neighbouring calls are wrong in ways that no assertion over the output frame can see.
-    ``apply(endog)`` defaults to ``refit=True`` and re-estimates on the array it is given, which
-    in a walk-forward feature means every emitted value was fitted on the block it is emitted
-    over. ``forecast(h)`` continues past the end of the data instead of filtering across it, so
-    it returns *h* values for an *n*-row prefix and lines up with nothing.
+    ``apply(endog, refit=True)`` re-estimates on the array it is given, which in a walk-forward
+    feature means every emitted value was fitted on the block it is emitted over. ``forecast(h)``
+    continues past the end of the data instead of filtering across it, so it returns *h* values
+    for an *n*-row prefix and lines up with nothing. In the locked ``statsmodels`` 0.14.6 the
+    default is ``refit=False``, which is the safe one - this paragraph previously said the
+    opposite, and the reason it matters is the next one, not the default.
 
     The parameter comparison is not decoration. ``refit=False`` is a keyword whose name is the
     only thing asserting the behaviour, and a default that changed upstream would otherwise
@@ -505,6 +554,160 @@ def _cluster_covariance(cluster: np.ndarray, pooled: np.ndarray) -> np.ndarray:
     if cluster.shape[0] < 2:
         return pooled.copy()
     return np.atleast_2d(np.cov(cluster.T))
+
+
+@dataclass(frozen=True)
+class LiftedStream:
+    """Overlapping windows of a return series, each held both raw and sorted.
+
+    A distribution-based regime estimator does not read a return series point by point; it
+    reads a window of it as an empirical measure. Lifting is that reshaping, done once:
+    ``segments`` holds the windows in time order and ``sorted_segments`` holds each window's
+    values ascending, which is the form every 1D optimal-transport quantity below takes.
+    Sorting once here rather than inside the distance is most of what makes the k-means
+    affordable, since each window is re-scored against every centroid on every iteration.
+    """
+
+    segments: np.ndarray  # (n_segments, window_len)
+    sorted_segments: np.ndarray  # Each row of `segments`, ascending
+    starts: np.ndarray  # Index into the input series where each window opens
+    window_len: int
+    step: int
+
+
+def lift_stream(returns: np.ndarray, window_len: int, overlap: int) -> LiftedStream:
+    """Lift a 1D return stream into overlapping windows of ``window_len``.
+
+    Consecutive windows advance by ``window_len - overlap``, so ``overlap`` is how many
+    sessions two neighbouring windows share. A trailing partial window is dropped rather
+    than padded: a short window is a different measure, not a shorter view of the same one.
+    """
+    step = window_len - overlap
+    windows_view = np.lib.stride_tricks.sliding_window_view(returns, window_shape=window_len)
+    windows_view = windows_view[::step]
+    segments = np.ascontiguousarray(windows_view, dtype=np.float64)
+    sorted_segments = np.sort(segments, axis=1)
+    starts = np.arange(0, segments.shape[0] * step, step, dtype=np.int64)
+
+    return LiftedStream(
+        segments=segments,
+        sorted_segments=sorted_segments,
+        starts=starts,
+        window_len=window_len,
+        step=step,
+    )
+
+
+def wasserstein_distance_1d(
+    sorted_a: np.ndarray, sorted_b: np.ndarray, p: float = 1.0
+) -> np.ndarray:
+    """1D p-Wasserstein distance between equal-weight empirical measures.
+
+    Two equal-sized samples in one dimension are matched by rank - the smallest of one to
+    the smallest of the other, and so on up - so the transport cost is a mean over the
+    sorted arrays and needs no optimizer. Both arguments must already be sorted ascending;
+    that is what :class:`LiftedStream` stores.
+
+    Reduces over the last axis and broadcasts over the rest, so a stack of sorted windows
+    against one sorted centroid returns one distance per window.
+    """
+    return (np.abs(sorted_a - sorted_b) ** p).mean(axis=-1) ** (1.0 / p)
+
+
+def wasserstein_barycenter_1d(sorted_members: np.ndarray, p: float = 1.0) -> np.ndarray:
+    """Wasserstein barycenter of sorted 1D measures: median at ``p=1``, mean at ``p=2``.
+
+    Taken rank by rank, which is what makes the result a distribution rather than an
+    average of numbers: the barycenter's smallest atom is the median of the members'
+    smallest atoms.
+    """
+    if p == 1.0:
+        return np.median(sorted_members, axis=0).astype(np.float64)
+    return sorted_members.mean(axis=0).astype(np.float64)
+
+
+def _wasserstein_assignments(
+    sorted_segments: np.ndarray, centroids: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Distance from every segment to every centroid, and each segment's nearest."""
+    dists = np.stack(
+        [
+            wasserstein_distance_1d(sorted_segments, centroids[k][None, :])
+            for k in range(centroids.shape[0])
+        ],
+        axis=1,
+    )
+    return dists, dists.argmin(axis=1)
+
+
+def fit_wasserstein_kmeans(
+    sorted_segments: np.ndarray,
+    n_clusters: int = 2,
+    max_iter: int = 50,
+    n_init: int = 5,
+    random_state: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit k-means on sorted 1D segments under the Wasserstein distance.
+
+    Ordinary Lloyd's algorithm with the two Euclidean quantities replaced by their
+    optimal-transport counterparts: :func:`wasserstein_distance_1d` for the assignment step
+    and :func:`wasserstein_barycenter_1d` for the update. A cluster is therefore a
+    distribution that the windows assigned to it are close to *as distributions*, which is
+    what separates a calm month from a turbulent one when both may have the same mean.
+
+    An empty cluster keeps its previous centroid rather than being re-seeded, so a restart
+    that collapses to fewer than ``n_clusters`` occupied clusters stays reproducible instead
+    of consuming draws from ``rng``.
+
+    Restarts are scored by inertia - the summed distance from each segment to the centroid
+    it was assigned - and the lowest wins. The distances that score a restart are computed
+    against the centroids that restart returns. That is not a restatement of the loop: the
+    scoring used to reuse the last assignment pass, which runs *before* the final centroid
+    update, so a restart that exhausted ``max_iter`` was scored against centroids one update
+    older than the ones it returned, and the wrong restart could win. A restart that
+    converges is unaffected, because the update it broke on moved the centroids by less than
+    ``atol``.
+
+    Returns
+    -------
+    tuple of ndarray
+        The labels and centroids of the lowest-inertia restart. Centroids come back in
+        whatever order the winning restart produced; a caller emitting a feature named for
+        one of them has to impose an order, the way ``sort_states_by_*`` does for an HMM.
+    """
+    rng = np.random.default_rng(random_state)
+    n_samples = sorted_segments.shape[0]
+    best_labels = None
+    best_centroids = None
+    best_inertia = float("inf")
+
+    for _ in range(n_init):
+        idx = rng.choice(n_samples, size=n_clusters, replace=False)
+        centroids = sorted_segments[idx].copy()
+
+        for _ in range(max_iter):
+            _, labels = _wasserstein_assignments(sorted_segments, centroids)
+
+            new_centroids = np.zeros_like(centroids)
+            for k in range(n_clusters):
+                members = sorted_segments[labels == k]
+                if len(members) > 0:
+                    new_centroids[k] = wasserstein_barycenter_1d(members, p=1.0)
+                else:
+                    new_centroids[k] = centroids[k]
+
+            if np.allclose(centroids, new_centroids, atol=1e-6):
+                break
+            centroids = new_centroids
+
+        dists, labels = _wasserstein_assignments(sorted_segments, centroids)
+        inertia = float(dists[np.arange(n_samples), labels].sum())
+        if inertia < best_inertia:
+            best_inertia = inertia
+            best_labels = labels
+            best_centroids = centroids
+
+    return best_labels, best_centroids
 
 
 def fold_feature_geometry(
