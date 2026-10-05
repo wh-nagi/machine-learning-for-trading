@@ -30,7 +30,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 # result would not be identity-stable across the readers' hardware.
 DML_THREAD_LIMIT = 1
 # 1 -> 2 on 2026-09-10: the block-permutation refutation moved from comparing raw effects
-# to comparing HAC t-statistics (ml4t/agent-workspace#1120). That changes a registered
+# to comparing HAC t-statistics. That changes a registered
 # value, so it has to move the identity - and causal rows have no migration path, so every
 # causal row in every case study refits rather than being re-keyed. That is the intended
 # cost: a stored refutation_p computed on raw effects is anti-conservative, always in the
@@ -38,16 +38,13 @@ DML_THREAD_LIMIT = 1
 # because the t-scale draws were never recorded.
 CAUSAL_RUNNER_VERSION = 2
 
-import hashlib
 import importlib.metadata
 import json
 import platform
 import re
 import time
-import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -65,6 +62,7 @@ if TYPE_CHECKING:
 
 
 from case_studies.utils.preview_fields import DML_PREVIEW_FIELDS as _DML_PREVIEW_FIELDS
+from case_studies.utils.warning_policy import warn_the_reader
 
 
 @dataclass(frozen=True)
@@ -387,6 +385,10 @@ def _walk_forward_indices(
     """Build expanding-window folds in rows or complete decision-time groups."""
     if groups is None:
         fold_size = n_rows // (n_folds + 1)
+        if fold_size == 0:
+            raise ValueError(
+                f"{n_folds}-fold walk-forward needs at least {n_folds + 1} rows, got {n_rows}."
+            )
         folds = []
         for fold in range(n_folds):
             train_end = (fold + 1) * fold_size
@@ -405,7 +407,24 @@ def _walk_forward_indices(
     ):
         raise ValueError("groups must be sorted and contiguous")
 
+    # A fold is `len(ordered_groups) // (n_folds + 1)` decision times wide, and integer
+    # division makes that 0 whenever the panel holds fewer complete decision times than
+    # folds. Every train and test slice is then empty, every fold is skipped downstream,
+    # and the estimate comes back NaN over zero observations with nothing raised - the
+    # caller's guard counts ROWS (`(n_folds + 1) * 50 + n_folds * embargo`), which a wide
+    # panel clears on a handful of dates. Measured on a 10,000-row cap of
+    # us_firm_characteristics/09_causal_dml: 8,180 rows, 4 complete decision months,
+    # 5 folds, `4 // 6 == 0`, full summary printed, DML effect nan.
+    #
+    # The count that has to clear the geometry is decision times, so it is checked here,
+    # at the one place the geometry is built, rather than in each caller.
     fold_size = len(ordered_groups) // (n_folds + 1)
+    if fold_size == 0:
+        raise ValueError(
+            f"{n_folds}-fold walk-forward needs at least {n_folds + 1} complete decision "
+            f"times, got {len(ordered_groups)}. On a panel the fold geometry is sized in "
+            f"decision times, not rows, so a row-count minimum does not constrain it."
+        )
     folds = []
     for fold in range(n_folds):
         train_end = (fold + 1) * fold_size
@@ -606,13 +625,13 @@ def manual_dml_timeseries(
             # bandwidth cap becomes self-consistent: `max(1, n_periods // 2)` floors
             # the bandwidth at one lag even when the sample holds none.
             covariance_type = "failed"
-            warnings.warn(
-                f"manual_dml_timeseries: Driscoll-Kraay needs at least two decision "
-                f"times; got {n_periods} over {n_valid} rows. Reporting se_hac, "
-                f"t_stat_hac and p_value_hac as NaN; se_iid carries the HC0 standard "
-                f"error under its own name.",
-                RuntimeWarning,
-                stacklevel=2,
+            warn_the_reader(
+                f"Driscoll-Kraay needs at least two decision times; got {n_periods} over "
+                f"{n_valid} rows. Reporting se_hac, t_stat_hac and p_value_hac as NaN; "
+                f"se_iid carries the HC0 standard error under its own name.",
+                source="manual_dml_timeseries",
+                key=("dk_periods", n_periods, n_valid),
+                category=RuntimeWarning,
             )
         else:
             try:
@@ -648,13 +667,13 @@ def manual_dml_timeseries(
                 # what a singular or ill-conditioned fit raises; anything else here is
                 # a defect in this function and propagates.
                 covariance_type = "failed"
-                warnings.warn(
-                    f"manual_dml_timeseries: robust covariance failed "
-                    f"({type(exc).__name__}: {exc}). Reporting se_hac, t_stat_hac and "
-                    f"p_value_hac as NaN; se_iid carries the HC0 standard error under "
-                    f"its own name.",
-                    RuntimeWarning,
-                    stacklevel=2,
+                warn_the_reader(
+                    f"robust covariance failed ({type(exc).__name__}: {exc}). Reporting "
+                    f"se_hac, t_stat_hac and p_value_hac as NaN; se_iid carries the HC0 "
+                    f"standard error under its own name.",
+                    source="manual_dml_timeseries",
+                    key=("dk_failed", type(exc).__name__, str(exc)),
+                    category=RuntimeWarning,
                 )
 
         if covariance_type == "failed":
@@ -813,15 +832,16 @@ def _assert_placebo_permutation_possible(
         share = f"{short_segment_fraction:.2%} of"
         if short_segment_fraction < 0.0001:
             share = f"a {short_segment_fraction:.2e} fraction of"
-        warnings.warn(
+        warn_the_reader(
             f"block permutation with block_size={block_size} cannot move "
             f"{share} the treatment rows: they sit in segments "
             "too short to hold two blocks, so the placebo distribution holds them at "
             "their observed values and the refutation p-value is biased toward 1. Read "
             "placebo_frozen_fraction alongside the p-value, and lower block_size or "
             "widen gap_tolerance if the frozen share is large.",
-            UserWarning,
-            stacklevel=3,
+            source="block_permutation",
+            key=("frozen_blocks", block_size, share),
+            stacklevel=4,
         )
 
 
@@ -840,7 +860,7 @@ def empirical_permutation_p(placebo_effects: np.ndarray, observed_effect: float)
     not cosmetic: a permuted treatment is no longer predictable from the controls, so
     ``var(T_res)`` - the second stage's whole denominator - inflates, and every placebo
     theta is shrunk toward zero by arithmetic. Comparing thetas therefore measures a
-    narrower distribution than the null it stands for. See ml4t/agent-workspace#1120.
+    narrower distribution than the null it stands for.
 
     Parameters
     ----------
@@ -1019,20 +1039,17 @@ def run_dml_analysis(
             raise ValueError(f"Outcome '{outcome_col}' has near-zero variance")
 
         if hac_maxlags is None and horizon is None:
-            # `warnings` is imported at module scope. A local `import warnings` here made
-            # the name local to the whole function, so any other warnings.warn in
-            # run_dml_analysis raised UnboundLocalError whenever this branch was not
-            # taken - which is every caller that passes a horizon.
-            warnings.warn(
-                "run_dml_analysis: no horizon or hac_maxlags given; the second-stage "
-                "HAC bandwidth falls back to the horizon-blind cube-root rule, which "
-                "under-lags overlapping labels of horizon >= ~10 and overstates the "
-                "t-statistic. Pass the outcome horizon in observation periods: read the "
-                "horizon with resolve_label_horizon(case_study_id, label, setup) - not the "
-                "CV buffer, which can be longer - and convert it against the panel's own "
-                "cadence. embargo_from_buffer without observed_step applies per-unit "
-                "defaults instead, which read 24H as one period on an eight-hour panel.",
-                stacklevel=2,
+            warn_the_reader(
+                "no horizon or hac_maxlags given; the second-stage HAC bandwidth falls "
+                "back to the horizon-blind cube-root rule, which under-lags overlapping "
+                "labels of horizon >= ~10 and overstates the t-statistic. Pass the outcome "
+                "horizon in observation periods: read the horizon with "
+                "resolve_label_horizon(case_study_id, label, setup) - not the CV buffer, "
+                "which can be longer - and convert it against the panel's own cadence. "
+                "embargo_from_buffer without observed_step applies per-unit defaults "
+                "instead, which read 24H as one period on an eight-hour panel.",
+                source="run_dml_analysis",
+                key=("hac_fallback", treatment_col, outcome_col),
             )
 
         _dml_started_at = datetime.now(UTC).isoformat()
@@ -1146,19 +1163,20 @@ def run_dml_analysis(
             # `run_resolved_causal_request` refuses the run before this matters. Direct
             # callers of `run_dml_analysis` - the chapter-15 notebooks - do not, and they
             # are the ones who would have read the verdict.
-            warnings.warn(
-                f"run_dml_analysis: the observed t-statistic is not finite "
+            warn_the_reader(
+                f"the observed t-statistic is not finite "
                 f"(covariance_type={dml.get('covariance_type')!r}), so the "
                 f"{len(placebo_t_stats)} placebo draws have nothing to be compared "
                 f"against. Reporting no refutation rather than a verdict computed "
                 f"against NaN.",
-                RuntimeWarning,
-                stacklevel=2,
+                source="run_dml_analysis",
+                key=("nonfinite_t", dml.get("covariance_type"), len(placebo_t_stats)),
+                category=RuntimeWarning,
             )
         elif len(placebo_effects) >= MIN_PLACEBO_DRAWS:
             # THE TEST IS ON THE T-STATISTIC, NOT ON THETA, and the difference is not
             # cosmetic: comparing thetas made this refutation anti-conservative on every
-            # run ever recorded (ml4t/agent-workspace#1120).
+            # run ever recorded.
             #
             # DML's second stage regresses the residualized outcome on the residualized
             # treatment, so var(T_res) is the estimator's whole denominator. Permuting the
@@ -1713,13 +1731,13 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
                 "treatment. One bar is a valid answer for a column built from quantities "
                 "carrying the row's own timestamp, and is how it is said."
             )
-        warnings.warn(
+        warn_the_reader(
             f"{study.case_study}: no construction window is declared for treatment "
             f"{treatment!r}, so the placebo block spans only the label buffer "
             f"({buffer_steps} bars). If the treatment is a rolling statistic, set "
             "`causal.treatment_window` in setup.yaml so the block can span it.",
-            UserWarning,
-            stacklevel=2,
+            source="resolve_placebo_block_size",
+            key=("no_treatment_window", study.case_study, treatment),
         )
     block_size = max(buffer_steps, treatment_window_steps or 1)
     block_size_basis = (
@@ -1871,8 +1889,8 @@ def _placebo_draws_json(refutation: dict) -> str | None:
 def _placebo_t_stats_json(refutation: dict) -> str | None:
     """Serialize the placebo t-statistics, or None when there are none.
 
-    These are the draws ``refutation_p`` is computed on since
-    ml4t/agent-workspace#1120. The thetas serialized above are still worth storing - a
+    These are the draws ``refutation_p`` is computed on since the t-statistic
+    correction. The thetas serialized above are still worth storing - a
     reader wants the effect scale - but a figure drawn from them no longer shows the
     distribution the p-value came from, because permuting the treatment inflates
     ``var(T_res)`` and shrinks every placebo theta toward zero by arithmetic. Two
@@ -1948,10 +1966,19 @@ def run_resolved_causal_request(
         return cached
 
     # Before the fit, not after it. The registry can already hold a current identity for
-    # this label that this run does not retire - the ordinary state whenever this module
-    # has been edited, since the spec carries a hash of the whole file - and the write
-    # refuses that. Asking now costs one read and names the hash to declare; asking at
-    # the write costs the fit and every placebo refit first. See #953.
+    # this label that this run does not retire, and the write refuses that. Asking now
+    # costs one read and names the hash to declare; asking at the write costs the fit and
+    # every placebo refit first - an hour on a panel of this size, spent to be told
+    # something the registry could have said before the first fold.
+    #
+    # The reason the state arises has changed, and the old wording here said the wrong
+    # one: it read "whenever this module has been edited, since the spec carries a hash of
+    # the whole file". `_causal_source_identity` no longer hashes the module - it returns
+    # the declared `CAUSAL_RUNNER_VERSION` - so an edit to this file moves no identity at
+    # all. What moves them is that integer being raised by hand, and then every
+    # resolver-based fit in every case study moves at once, which makes the pre-fit check
+    # matter more rather than less. `tests/test_causal_prefit_supersedes_check.py` pins it
+    # against the write-time rule, which it calls rather than restates.
     check_causal_supersedes(
         study.case_study,
         causal_hash,

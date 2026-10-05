@@ -52,18 +52,19 @@
 import datetime as _dt
 import json
 import sqlite3
-import warnings
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import polars as pl
-import torch  # ml4t.diagnostic loads cudart; torch must import first
+
+# ml4t.diagnostic loads cudart; torch must import first, so its bundled runtime wins symbol
+# resolution. Imported for that side effect alone, which ruff cannot see - without the noqa
+# a dead-import sweep deletes it and the notebook fails on the cudart load.
+import torch  # noqa: F401
 import yaml
 from matplotlib.colors import LinearSegmentedColormap
-
-warnings.filterwarnings("ignore")
 
 # %%
 from ml4t.diagnostic.evaluation import PortfolioAnalysis
@@ -89,9 +90,6 @@ from case_studies.research.workspace import open_study
 from case_studies.utils.backtest_explorer import BacktestExplorer
 from case_studies.utils.benchmark import load_benchmark_metrics, load_benchmark_returns
 from case_studies.utils.conformal import CALIBRATION_VERSION
-from case_studies.utils.external_benchmarks import (
-    align_to_strategy as align_external_benchmark,
-)
 from case_studies.utils.external_benchmarks import (
     align_to_strategy_monthly as align_external_benchmark_monthly,
 )
@@ -123,16 +121,13 @@ from case_studies.utils.strategy_analysis import (
     fmt_gate,
     gate1_validation_sharpe_geq_zero,
     gate2_holdout_diff_not_excludes_zero_negatively,
-    plot_concentration_curve,
-    plot_cost_decay,
-    plot_ic_vs_sharpe,
     rank_backtests_on_common_support,
     resolve_solvent_carrier,
     select_holdout_self_backtest,
 )
 from utils.paths import display_path, get_case_study_dir, get_output_dir
 from utils.reproducibility import set_global_seeds
-from utils.style import COLORS, add_message_title, ml4t_diverging
+from utils.style import COLORS, add_message_title, ml4t_diverging, show_with_alt
 
 # %% [markdown]
 # Papermill overrides names in the cell below and nowhere else. Without it the
@@ -338,8 +333,8 @@ if (
     # generation, so the pairs described a selected configuration the case study does not report.
     # The cohort call above is scoped to `LIVE_PREDICTIONS` and this one is not: the
     # pairs are selected from every registered prediction set. Stated rather than
-    # defaulted; narrowing it changes published numbers and is
-    # ml4t/agent-workspace#1006. `replace_all=False` keeps the write additive, which
+    # defaulted; narrowing it would change published numbers, so it is a separate
+    # decision. `replace_all=False` keeps the write additive, which
     # is what this notebook has always done.
     _paired_rows = populate_paired_metrics(
         CASE_STUDY,
@@ -672,7 +667,11 @@ ax.set_xlabel("Validation Sharpe")
 add_message_title(ax, "One family carries the upper tail of the baseline sweep")
 ax.invert_yaxis()
 ax.legend(loc="lower right", frameon=False)
-fig.show()
+show_with_alt(
+    fig,
+    "Validation Sharpe by model family, one row per family: a marker at the median with a bar "
+    "spanning the interquartile range, a cross at the family maximum, and a dashed line at zero.",
+)
 
 # %% [markdown]
 # Two statistics answer different questions here. The median says whether a
@@ -848,7 +847,11 @@ add_message_title(
     "Selection reads the peak of each sizing rule, not its average",
     subtitle="Strongest candidate under each rule, recomputed on the shared window",
 )
-fig.show()
+show_with_alt(
+    fig,
+    "One bar per sizing rule, each labelled with the Sharpe of the strongest candidate under that "
+    "rule, recomputed on the months the two rules share.",
+)
 
 # %% [markdown]
 # Two things are true of this comparison and the second does not retract the
@@ -1031,7 +1034,11 @@ add_message_title(
     if _above_zero < len(forest_metrics)
     else "Every risk-adjusted metric holds a lower bound above zero",
 )
-fig.show()
+show_with_alt(
+    fig,
+    "One row per risk-adjusted metric, each a point estimate on a horizontal line spanning its "
+    "interval, against a dashed line at zero.",
+)
 
 # %%
 strat_returns_path = CASE_DIR / "run_log" / "backtest" / TOP_HASH / "daily_returns.parquet"
@@ -1444,7 +1451,12 @@ add_message_title(
     subtitle="Validation months; the strategy is unchanged, only what it pays to trade",
 )
 ax.legend(loc="best", fontsize=8, frameon=False)
-fig.show()
+show_with_alt(
+    fig,
+    "Validation Sharpe against the per-leg cost charged, with a shaded bootstrap interval around "
+    "the path, a dashed line at zero, and the protocol's declared cost range shaded along the "
+    "horizontal axis.",
+)
 
 # %% tags=["results"]
 _crossed = cost_curve.filter(pl.col("sharpe_ci95_lo") <= 0).sort("cost_bps")
@@ -1565,7 +1577,11 @@ ax_liq.set_xticks(_x, _liq_features)
 ax_liq.set_ylabel("Mean rank-normalized feature")
 add_message_title(ax_liq, "The strategy holds smaller and harder-to-trade names")
 ax_liq.legend(frameon=False, ncol=3)
-fig_liq.show()
+show_with_alt(
+    fig_liq,
+    "Mean rank-normalized size, spread, turnover and idiosyncratic-volatility features, drawn as "
+    "one bar per feature for the long leg, the short leg and the universe.",
+)
 
 # %% [markdown]
 # Negative LME denotes smaller firms; positive Spread, LTurnover, and
@@ -1633,7 +1649,11 @@ for i in range(len(_turnover_pcts)):
         color = "white" if val < 0.5 else "black"
         ax_ext.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=9, color=color)
 fig_ext.colorbar(im, ax=ax_ext, label="Sharpe (validation, post-friction)", shrink=0.8)
-fig_ext.show()
+show_with_alt(
+    fig_ext,
+    "Heatmap of validation Sharpe over monthly turnover against one-way cost in basis points, "
+    "each cell annotated with its value and shaded on a diverging scale.",
+)
 
 # %% tags=["results"]
 print("Extended turnover × cost sensitivity (Sharpe ratios):")
@@ -1895,13 +1915,21 @@ for _ax in fig_roll.axes:
     _ax.xaxis.set_major_locator(mdates.YearLocator(2))
     _ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     _ax.tick_params(axis="x", rotation=35)
-fig_roll.show()
+show_with_alt(
+    fig_roll,
+    "One panel per common factor plus annualized alpha, each tracing its 36-month rolling "
+    "estimate over time against a dashed line at zero.",
+)
 
 # %%
 fig_attr = plot_attribution_waterfall(_reg, title="Most validation performance remains residual")
 fig_attr.axes[0].set_ylim(top=3.1)
 fig_attr.axes[0].legend(loc="upper left", frameon=False)
-fig_attr.show()
+show_with_alt(
+    fig_attr,
+    "One bar per common factor plus a residual bar, each sized by that term's contribution to "
+    "Sharpe, with a dashed line at the strategy's total Sharpe.",
+)
 
 # %% tags=["results"]
 _boot = compute_bootstrap_ci(

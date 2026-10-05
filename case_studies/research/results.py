@@ -355,25 +355,25 @@ class Result:
 def normalized_feature_artifacts(value: Any) -> Any:
     """`computation.feature_artifacts` as the set of inputs it names, whatever its shape.
 
-    Seven producers write this field and six of them write `mds.input_lineage["artifacts"]` -
-    `{role: {"sha256": <hex>, "size": <int>}}` - while the latent adapter writes
-    `case.input_data_spec["files"]`, a list of `{"role": ..., "sha256": "sha256:<hex>"}`
-    (ml4t/agent-workspace#891). The two are the same statement in different words. Measured on
-    `etfs` 2026-09-07, one latent and one linear run at `fwd_ret_21d`: the same three roles -
-    financial, label, model_based - carrying the same three sha256 values, rendered one way
-    with a prefix and no size and the other way with a size and no prefix.
+     Seven producers write this field and six of them write `mds.input_lineage["artifacts"]` -
+     `{role: {"sha256": <hex>, "size": <int>}}` - while the latent adapter writes
+     `case.input_data_spec["files"]`, a list of `{"role": ..., "sha256": "sha256:<hex>"}`
+    . The two are the same statement in different words. Measured on
+     `etfs` 2026-09-07, one latent and one linear run at `fwd_ret_21d`: the same three roles -
+     financial, label, model_based - carrying the same three sha256 values, rendered one way
+     with a prefix and no size and the other way with a size and no prefix.
 
-    So a candidate set spanning both families refused on `feature_artifacts` for two members
-    that were fitted on identical files, and the only way past it was to declare the field
-    comparable - which silences the check for the members it could legitimately compare.
+     So a candidate set spanning both families refused on `feature_artifacts` for two members
+     that were fitted on identical files, and the only way past it was to declare the field
+     comparable - which silences the check for the members it could legitimately compare.
 
-    The comparison asks whether two members were fitted on the same inputs. That is a question
-    about which files, by content, and not about how a producer serialized the answer, so it is
-    asked over `{role: <content hash>}`. `size` is dropped because a file's length is decided
-    by its content and adds nothing a sha256 has not already said.
+     The comparison asks whether two members were fitted on the same inputs. That is a question
+     about which files, by content, and not about how a producer serialized the answer, so it is
+     asked over `{role: <content hash>}`. `size` is dropped because a file's length is decided
+     by its content and adds nothing a sha256 has not already said.
 
-    Anything this does not recognize is returned unchanged, so an unfamiliar shape still
-    compares exactly rather than silently comparing equal to everything.
+     Anything this does not recognize is returned unchanged, so an unfamiliar shape still
+     compares exactly rather than silently comparing equal to everything.
     """
     if isinstance(value, dict) and all(isinstance(item, dict) for item in value.values()):
         return {
@@ -515,13 +515,23 @@ class PredictionResult(Result):
             try:
                 # The same digest `register_prediction_set` recorded: the frame's `label`
                 # column states which declaration a coverage check should apply to it and is
-                # not part of its content identity (ml4t/agent-workspace#887), so a labelled
+                # not part of its content identity, so a labelled
                 # artifact and the unlabelled one written before the column existed digest
                 # alike and neither reports incomplete.
                 from case_studies.utils.artifact_digest import published_prediction_digest
 
+                # `pl.read_parquet` and not `self.load`: the recorded digest describes the
+                # frame the writer registered, and `load` widens a `Date` decision-time
+                # column so every family presents one dtype. `value_digest` separates
+                # `Date` from `Datetime`, so verifying through `load` compares the
+                # normalized frame against a digest taken before normalization and reports
+                # every artifact those three families wrote as not matching.
                 if (
-                    _verified_digest(prediction_file, self.load, published_prediction_digest)
+                    _verified_digest(
+                        prediction_file,
+                        partial(pl.read_parquet, prediction_file),
+                        published_prediction_digest,
+                    )
                     != recorded_digest
                 ):
                     return f"{prediction_file} does not match its recorded digest"
@@ -544,10 +554,24 @@ class PredictionResult(Result):
         return None
 
     def load(self):
+        """Read this prediction set's artifact, with one decision-time dtype for every family.
+
+        The parquet is returned as written except for the timestamp column, which arrives on
+        `Date` from gbm, linear and tabular_dl and on `Datetime(us, 'UTC')` from deep_learning
+        and latent_factors - same decision times, every aware value at midnight, and a join on
+        (timestamp, symbol) across the two returns nothing. `_timestamps_as_utc` widens to the
+        aware form here rather than narrowing, because narrowing would silently discard the
+        time of day in an intraday case study. Read-only: widening moves `value_digest`, so the
+        artifact and every registered digest over it stay as they are, and
+        `normalize_prediction_columns` produces the identical engine frame either way (verified
+        on a 7.1M-row gbm artifact, 2026-09-14).
+        """
         import polars as pl
 
+        from case_studies.utils.registry.store import _timestamps_as_utc
+
         path = self.root / "run_log" / "predictions" / self.hash / "predictions.parquet"
-        return pl.read_parquet(path)
+        return _timestamps_as_utc(pl.read_parquet(path), widen_dates=True)
 
     def folds(self):
         """Return the per-fold metrics registered for this prediction set.
@@ -653,8 +677,8 @@ class ResultsCatalog:
         ``started_at`` closes that. With it, a row whose ``elapsed_s`` is still NULL is
         legible: a wall clock says how long this configuration has been going, and how that
         compares to its siblings. Without it the only recoverable timing is
-        ``created_at - started_at`` after the fact, which is what
-        ml4t/agent-workspace#1026 found the whole corpus reduced to.
+        ``created_at - started_at`` after the fact, which is what the whole
+        corpus was once reduced to.
 
         Like ``entry_point``, it is a **table column and not part of ``spec``**, so recording
         it moves no training hash. Nothing here may touch ``computation``.
@@ -688,7 +712,24 @@ class ResultsCatalog:
             # A table column, not part of `resolved`, so recording it moves no training hash.
             # `spec_json.provenance.entry_point` is a different field naming the runner module
             # (`case_studies.utils.linear`); this one names the notebook.
-            entry_point=self.study.entry_point,
+            #
+            # Falls back to the request's own `notebook_path` when the Study was not told. Those
+            # are the same fact declared in two places - `open_study(entry_point=...)` sets the
+            # column, `build_requests(notebook=...)` sets the provenance field - and a notebook
+            # that declares one and not the other is the common state rather than the exception:
+            # measured 2026-09-12 over the 53 notebooks calling `run_model_population`, 20 declare
+            # `entry_point`, 13 declare only `notebook`, and 20 declare neither. Without this the
+            # 13 register a NULL column while carrying the answer in the row they are writing.
+            # The column is NULL on 785 of the 1160 training rows across the nine production
+            # registries; only nasdaq100_microstructure and sp500_equity_option_analytics, whose
+            # notebooks all declare `entry_point`, are clean.
+            #
+            # The direction is fixed by the decision recorded in `tests/test_model_registry.py`
+            # (2026-08-25): the COLUMN is the half that survives when the migration finishes, and
+            # `json_extract(runtime_json, '$.notebook_path')` is the half that goes. So provenance
+            # fills the column, never the reverse. An explicit `entry_point` still wins, because a
+            # Study told which notebook it serves was told deliberately.
+            entry_point=self.study.entry_point or (runtime_provenance or {}).get("notebook_path"),
             runtime_provenance=runtime_provenance,
             # Defaulted here rather than at every call site: a caller that forgets it should
             # still leave a legible row, and "when the identity was registered" is within

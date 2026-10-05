@@ -19,7 +19,8 @@
 # **Docker image**: `ml4t`
 #
 # Each case study runs an FDR-controlled triage pass on its candidate
-# feature menu (Ch8 §8.5), classifying every feature as PROCEED, REVISE,
+# feature menu (Ch7 §7.3 sets the triage gates, §7.4 the FDR control),
+# classifying every feature as PROCEED, REVISE,
 # or STOP. This notebook reads those nine ledgers side by side and asks
 # whether feature-level survival predicts strategy-level survival once
 # the rest of the pipeline runs.
@@ -42,6 +43,7 @@ import polars as pl
 from IPython.display import Markdown, display
 
 from case_studies.utils.analytics import CASE_STUDY_IDS, SHORT_NAMES, load_triage_ledger
+from case_studies.utils.strategy_analysis import rank_one
 from utils.paths import REPO_ROOT, get_chapter_dir
 from utils.style import COLORS, show_with_alt
 
@@ -105,15 +107,18 @@ panel = pl.concat(
 #
 # A feature earns PROCEED by either of two independent routes, recorded in the
 # ledger's `note`: it clears Benjamini-Hochberg at the level above
-# (`fdr_significant`), or its IC is large enough and holds its sign across
-# enough folds (`stable_and_above_threshold`) without clearing BH. The second
+# (`fdr_significant`), or its IC clears that case study's own effect-size floor
+# and holds its sign across enough folds (`stable_and_above_threshold`) without
+# clearing BH. The floor is set per case study, from 0.003 to 0.01 in absolute
+# mean IC, so the second route is calibrated to each market rather than shared
+# across them. The second
 # route exists because BH over a menu of dozens of correlated features is a
 # blunt instrument at these sample sizes, and a feature can be worth carrying
 # forward on effect size and stability alone.
 #
 # PROCEED is therefore a union of the two routes, not a narrowing of the first.
-# A case study can and does show more PROCEED features than FDR-significant
-# ones, so the three counts below are drawn side by side rather than stacked -
+# A case study can show more PROCEED features than FDR-significant ones, so the
+# three counts below are drawn side by side rather than stacked -
 # stacking them would assert a nesting that does not hold.
 
 # %%
@@ -178,9 +183,13 @@ show_with_alt(
 )
 
 # %% [markdown]
-# The same triage protocol, applied to nine different markets, produces very
-# different survival rates. The summary below is computed from the table above
-# rather than typed, so it cannot drift from the ledgers as they are regenerated.
+# The nine case studies share the triage structure, and the two columns are
+# comparable to different degrees. The BH-FDR share is recomputed here from each
+# ledger's stored p-values at one `FDR_ALPHA`, so it is on a common scale. The
+# PROCEED share is read from each ledger's own decision, taken at that case
+# study's own effect-size floor and sign-consistency minimum, so it is not. The
+# summary below is computed from the table above rather than typed, so it cannot
+# drift from the ledgers as they are regenerated.
 
 # %% tags=["results"]
 _f = funnel.sort("pct_fdr_sig", descending=True)
@@ -289,8 +298,12 @@ show_with_alt(
 # %% tags=["results"]
 _paired = forward.filter(pl.col("holdout_sharpe").is_not_null())
 _absent = forward.filter(pl.col("holdout_sharpe").is_null())["cs_short"].to_list()
+# rank_one, not a one-key sort: the case study this picks is named in the sentence below,
+# so a tie on holdout Sharpe would publish whichever row the join happened to emit first.
 _best = (
-    _paired.sort("holdout_sharpe", descending=True).row(0, named=True) if _paired.height else None
+    rank_one(_paired, by="holdout_sharpe", name="cs_short").row(0, named=True)
+    if _paired.height
+    else None
 )
 display(
     Markdown(
@@ -320,10 +333,12 @@ display(
 # %% [markdown]
 # ## Takeaways
 #
-# - The same triage protocol yields very different survival rates across the
-#   nine markets. The numbers are in the computed summary above; what they show
-#   is that the protocol does not transfer a fixed pass rate from one asset class
-#   to the next, so a rate is only interpretable next to the market it came from.
+# - The nine case studies share the triage structure but not all of its
+#   parameters. The BH-FDR column is re-thresholded here at one alpha and can be
+#   compared across markets; the PROCEED column carries each case study's own
+#   effect-size floor, which spans a factor of three, so a difference in PROCEED
+#   rate is a difference in market and in floor together and cannot be assigned
+#   to either alone.
 # - PROCEED is a union of two routes, BH significance and effect-size-plus-fold-
 #   stability. Reading it as a stricter version of BH significance inverts the
 #   relationship and inflates how selective the screen appears.

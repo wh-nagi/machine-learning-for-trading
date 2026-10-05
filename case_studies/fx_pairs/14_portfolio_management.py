@@ -61,7 +61,6 @@ from case_studies.research import (
     BacktestResult,
     CandidateSet,
     OfficialPopulation,
-    PredictionResult,
     Result,
     candidate_set_supersedes,
     open_study,
@@ -73,9 +72,11 @@ from case_studies.research import (
     strategy_warmup_periods,
     superseded_members,
 )
+from case_studies.utils.backtest_presets import EngineBacktestConfig
 from case_studies.utils.sweep_config import (
     get_allocators,
     get_top_n_predictions,
+    top_n_cap,
 )
 from utils.paths import get_case_study_dir
 from utils.reproducibility import set_global_seeds
@@ -252,9 +253,13 @@ def _result_config(result: BacktestResult) -> tuple[str, str, str]:
 
 
 def _select_configuration_survivors(
-    ranked_results: Iterable[BacktestResult], limit: int
+    ranked_results: Iterable[BacktestResult], limit: int | None
 ) -> list[BacktestResult]:
-    """Keep the best baseline result for each distinct model configuration."""
+    """Keep the best baseline result for each distinct model configuration.
+
+    ``limit`` is the cap ``sweep_config.top_n_cap`` returns, so ``None`` keeps every distinct
+    configuration.
+    """
     survivors = []
     seen: set[tuple[str, str]] = set()
     for result in ranked_results:
@@ -353,7 +358,25 @@ if any(result.registry_record()["stage"] != "signal" for result in baseline_resu
 # the selection was made from, not the set that exists now.
 
 # %% tags=["results"]
-top_n = TOP_N_CONFIGS or get_top_n_predictions(CASE_STUDY_ID, "allocation")
+# Two names reach this width. `TOP_N_CONFIGS` is this notebook's own and predates the
+# override every other allocation notebook takes; `TOP_N_PREDICTIONS` is that shared one, and
+# before this it was read only by the narrowing guard above - so a launcher passing it got a
+# run that published under its own population name and still swept the declared width, with no
+# `Passed unknown parameter` line to show for it. Either name sets the width now, and giving
+# both different values raises rather than picking one.
+if TOP_N_CONFIGS and TOP_N_PREDICTIONS is not None and TOP_N_CONFIGS != TOP_N_PREDICTIONS:
+    raise ValueError(
+        f"TOP_N_CONFIGS={TOP_N_CONFIGS} and TOP_N_PREDICTIONS={TOP_N_PREDICTIONS} both set the "
+        "allocation width and disagree; pass one"
+    )
+if TOP_N_PREDICTIONS is None:
+    TOP_N_PREDICTIONS = TOP_N_CONFIGS or get_top_n_predictions(CASE_STUDY_ID, "allocation")
+top_n = TOP_N_PREDICTIONS
+# 0 asks for every configuration, the spelling `top_n_predictions.signal` uses in this
+# setup.yaml. `_select_configuration_survivors` already takes everything at 0, because its
+# `len(survivors) == limit` cannot hold after an append; the count check below compared that
+# against `min(0, ...)` and reported the selection incomplete.
+config_cap = top_n_cap(top_n)
 selected_baselines: dict[str, list[BacktestResult]] = {}
 candidate_sets: dict[str, CandidateSet] = {}
 
@@ -397,9 +420,12 @@ for label in baseline_labels:
         ranked_results = list(candidates.ranked_validation_sharpe())
         if any(not isinstance(result, BacktestResult) for result in ranked_results):
             raise TypeError("validation-Sharpe ranking returned a non-backtest result")
-    selected_baselines[label] = _select_configuration_survivors(ranked_results, top_n)
+    selected_baselines[label] = _select_configuration_survivors(ranked_results, config_cap)
     available_configs = {_result_config(result)[1:] for result in label_results}
-    if len(selected_baselines[label]) != min(top_n, len(available_configs)):
+    expected_configs = (
+        len(available_configs) if config_cap is None else min(config_cap, len(available_configs))
+    )
+    if len(selected_baselines[label]) != expected_configs:
         raise RuntimeError(f"configuration selection for {label} is incomplete")
 
 baseline_predictions = {result.registry_record()["prediction_hash"] for result in baseline_results}
@@ -622,6 +648,31 @@ def _non_allocation_projection(spec: dict[str, Any], *, drop_prices: bool) -> di
         metadata.pop("preset_path", None)
     if drop_prices:
         projected.get("input_identity", {}).pop("prices", None)
+    # The baseline was serialized by whatever engine version registered it and the allocation
+    # by the installed one, so a field `BacktestConfig` has since gained is present on one side
+    # and absent on the other while both describe the same strategy. `ml4t-backtest` 0.1.3 to
+    # 0.1.6 added `account.lock_notional_update_mode` and `position_sizing.share_rounding`, both
+    # previously implicit defaults the schema made explicit - measured 2026-09-14 across the nine
+    # registries, where the one leaderboard pair that differed differed in exactly these two and
+    # agreed on Sharpe. Every fx_pairs signal row predates them, so every allocation row computed
+    # after 2026-09-12 failed this check with a message saying a strategy field moved.
+    #
+    # Round-tripping both sides through the installed schema states the comparison in one
+    # vocabulary, so it answers what this notebook built rather than which engine wrote the row
+    # it is compared against, and it covers the next added field without naming it.
+    # `16_costs.py` and `19_strategy_analysis.py` already do this for the same two fields; this
+    # projection is the one that was missed. `ensure_backtest_spec` deliberately does NOT
+    # round-trip, because there the result is hashed and a dropped unknown key would move an
+    # identity; here it is compared and discarded. Metadata is merged back over the serialized
+    # view because the dataclass pins a schema and drops keys it does not know.
+    config = projected.get("backtest_config", {})
+    if EngineBacktestConfig is not None and config:
+        original_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        rebuilt = EngineBacktestConfig.from_dict(config).to_dict()
+        rebuilt_metadata = dict(rebuilt.get("metadata") or {})
+        rebuilt_metadata.update(original_metadata)
+        rebuilt["metadata"] = rebuilt_metadata
+        projected["backtest_config"] = rebuilt
     return projected
 
 

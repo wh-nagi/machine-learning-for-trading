@@ -21,7 +21,6 @@ import json
 import os
 import platform
 import shutil
-import subprocess
 import time
 import uuid
 import warnings
@@ -59,19 +58,24 @@ from case_studies.research.cv import (
 from case_studies.research.identity import ResolvedSpec
 from case_studies.research.models import ModelRun
 from case_studies.research.recovery import ExecutionAttempt, ExecutionLedger
-from case_studies.research.results import PredictionResult, Result, TrainingResult
+from case_studies.research.results import TrainingResult
 from case_studies.utils.artifact_digest import value_digest
 from case_studies.utils.derived_params import quantize_derived
 from case_studies.utils.folds import (
     FOLD_PREPARATION_VERSION,
-    fold_seed,
+    # Unreferenced here and load-bearing. `tests/test_fold_seed_coupling.py` asserts
+    # `gbm.fold_seed is fold_seed` for each of the six modules that seed a fold, so this
+    # import IS this module's declared address for the shared definition. gbm reaches the
+    # derivation through `_subsample_index` rather than calling it at a seeding line, so
+    # nothing in this file references the name and F401 reports it.
+    fold_seed,  # noqa: F401
     prepare_gbm_folds_from_mds,
     training_labels_for_split,
 )
-from case_studies.utils.registry import prediction_hash_from_parts, training_hash_from_spec
+from case_studies.utils.registry import training_hash_from_spec
 from case_studies.utils.registry.specs import canonical_json
-from case_studies.utils.runtime import cpu_seconds, resource_measurement
-from utils.modeling import RANDOM_SEED, seed_everything
+from case_studies.utils.runtime import cpu_seconds, resource_measurement, source_commit
+from utils.modeling import RANDOM_SEED
 
 if TYPE_CHECKING:
     from case_studies.research.workspace import Study
@@ -1327,15 +1331,7 @@ def _gbm_runtime_identity() -> dict[str, str]:
 def _gbm_runtime_provenance(
     study: Study, device: str, *, notebook: str | None = None
 ) -> dict[str, Any]:
-    try:
-        commit = subprocess.check_output(
-            ["git", "-C", str(study.release_root), "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        commit = "unknown"
+    commit = source_commit(study.release_root)
     lock_path = study.release_root / "uv.lock"
     record: dict[str, Any] = {
         "device": device,

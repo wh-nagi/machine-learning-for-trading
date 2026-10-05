@@ -6,10 +6,8 @@ artifacts for each case study's ``strategy_analysis.py`` notebook.
 Usage::
 
     from case_studies.utils.strategy_analysis import (
-        plot_ic_vs_sharpe,
         plot_sharpe_waterfall,
         plot_concentration_curve,
-        plot_cost_decay,
         plot_equity_drawdown,
         load_holdout_metrics,
         write_strategy_assessment,
@@ -23,7 +21,7 @@ import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -37,6 +35,7 @@ from case_studies.utils.notebook_contracts import (
     full_coverage_prediction_sql,
 )
 from case_studies.utils.uncertainty import STAGE_SEQUENCE
+from case_studies.utils.warning_policy import warn_the_reader
 
 # ---------------------------------------------------------------------------
 # Canonical rank-1 resolution (LABEL_RESTRICTIONS-aware)
@@ -50,8 +49,9 @@ from case_studies.utils.uncertainty import STAGE_SEQUENCE
 # forward returns as daily returns, inflating Sharpes (e.g. fwd_ret_10d
 # allocation Sharpe ~6.5) to non-credible levels. ret_to_expiry runs through
 # the HTM daily-MTM cohort path and is the only label with an honest cost
-# model for this CS. This is the only definition: ``20_strategy_synthesis/holdout.py``
-# imports it from here rather than keeping a copy in sync by comment.
+# model for this CS. This is the only definition in the tree, which
+# ``tests/test_carrier_routing_contract.py`` checks by reading every module: the retired
+# ``20_strategy_synthesis/holdout.py`` kept a second copy in sync by comment, and it drifted.
 LABEL_RESTRICTIONS: dict[str, frozenset[str]] = {
     "sp500_options": frozenset({"ret_to_expiry"}),
 }
@@ -65,10 +65,28 @@ LABEL_RESTRICTIONS: dict[str, frozenset[str]] = {
 # Ch18 htm_cost_cascade comparison, never as the deployed carrier). Without this
 # pin, full-universe allocation backtests registered by the standard sweep
 # (e.g. the 2026-05-31 L1-grid rollout) leak into rank-1 by raw Sharpe and
-# orphan the liquid-lineage holdout. This is the only definition; ``holdout.py``
-# imports it, and ``select_best_models`` applies it by going through
-# :func:`selectable_validation_candidates` rather than by repeating the filter.
+# orphan the liquid-lineage holdout. This is the only definition; the holdout selection
+# applies it by going through :func:`selectable_validation_candidates` rather than by
+# repeating the filter.
+#
+# nasdaq100_microstructure is the same arrangement one universe over. Its
+# ``setup.yaml`` declares ``backtest.sweep.universe_filter: cost_feasible`` and says
+# beside it that "the full-universe variant is NOT a canonical rank-1 / cohort / DSR
+# candidate; it lives only in the 17_costs.py full-vs-screened comparison". Nothing
+# enforced that: the sweep's pass 2 registers full-universe reference arms so
+# ``17_costs`` can price the screen, and this resolver ranked them beside the screened
+# rows by raw Sharpe. The entry is what makes the declaration true rather than stated.
+#
+# Measured 2026-09-13 before adding it: the registry held 96 full-universe signal rows
+# and the rank-1 was the same row either way - `gbm/default_multiclass` on
+# `fwd_dir_15m`, a cost-feasible slot configuration at Sharpe 2.416 - so this changes
+# no published value today. That is the point at which to close a hole, not after a
+# full-universe row has won and moved a chapter.
+#
+# ``test_declared_canonical_universe_is_pinned`` asserts the two stay together: a case
+# study that declares the key and is missing from here has an unenforced declaration.
 UNIVERSE_RESTRICTIONS: dict[str, str] = {
+    "nasdaq100_microstructure": "cost_feasible",
     "sp500_options": "liquid",
 }
 
@@ -138,7 +156,7 @@ def rank_returns_on_common_support(
         )
         # A path the engine stopped at ruin carries no Sharpe, by design: a ratio
         # of a mean to a dispersion describes a process that continues
-        # (ml4t/agent-workspace#920). The candidate stays on the frame so the
+        # . The candidate stays on the frame so the
         # caller can see it was compared, and sorts below every solvent one.
         #
         # Ruin is read off the *whole* series, not off the common-support slice.
@@ -197,10 +215,29 @@ class HoldoutSelfBacktest:
     ``reason`` is a sentence for the rendered page. It names the validation run that was
     searched for, so a reader can see the search was well formed and is not being told
     that something went wrong.
+
+    ``training_hash`` is the identity that produced the holdout being returned, and it is
+    here because a hash alone cannot answer the question that matters. The lookup matches
+    on the declared configuration plus three post-conditions, and none of them reads a
+    clock: a returned hash says "a registered holdout is a valid refit of the configuration
+    you asked about", never "the holdout was taken while that configuration was rank-1".
+    Those separate whenever the field kept growing after the window was spent.
+
+    The gap that makes concrete: neither this
+    lookup nor `18_holdout_predictions` could express *a holdout exists for this
+    configuration, produced by a generation that is no longer reproducible*. The notebook
+    derives the refit it would perform and compares; with the identity returned here, a
+    caller can make that comparison too instead of taking the hash on trust.
+
+    It is the registered identity and not a verdict on purpose. Deciding whether a
+    generation is superseded needs the ranking, and this lookup is called from inside
+    `resolve_canonical_rank1_lineage` - resolving the ranking here would re-enter it.
     """
 
     backtest_hash: str | None
     reason: str | None = None
+    training_hash: str | None = None
+    """The training identity behind the returned holdout, or None when nothing was found."""
 
     @property
     def found(self) -> bool:
@@ -223,9 +260,11 @@ def holdout_refit_status(training_spec_json: str | None) -> HoldoutRefitStatus:
         The run's CV declares the holdout fold. This is a holdout evaluation.
     ``not_out_of_sample``
         The run records a CV split and it is not the holdout. **This is a statement about
-        the record, not a finding about the fit.** `20_strategy_synthesis/holdout.py`'s
-        `generate_holdout` genuinely refits on a holdout fold and then registers the
-        predictions under the *validation* training identity, whose CV says ``validation`` -
+        the record, not a finding about the fit.** The retired
+        `20_strategy_synthesis/holdout.py::generate_holdout`, deleted on 2026-09-12,
+        genuinely refit on a holdout
+        fold and then registered the predictions under the *validation* training identity,
+        whose CV says ``validation`` - and the rows it wrote are still in the registries -
         so a row answering this way is either a validation-fitted model published over the
         holdout window or a real refit filed under the wrong identity, and the registry
         cannot tell them apart. Either way it may not be reported as a holdout result, and
@@ -340,9 +379,11 @@ class HoldoutGenerationsToRetire:
     Two different things produce this record and it cannot separate them. One is a
     validation-fitted model publishing over the holdout window, the defect `29f13165`
     fixed, which is not a holdout evaluation at all. The other is a genuine refit filed
-    under the validation training identity, which is what
-    `20_strategy_synthesis/holdout.py`'s `generate_holdout` does - it builds a holdout fold,
-    trains on it, and then registers the predictions against `candidate["training_hash"]`.
+    under the validation training identity, which is what the retired
+    `20_strategy_synthesis/holdout.py::generate_holdout`, deleted on 2026-09-12, did -
+    it built a holdout fold,
+    trained on it, then registered the predictions against `candidate["training_hash"]`.
+    Removing it removed the producer; the rows it already wrote are why this bucket stays.
 
     So this bucket is refused rather than deleted. A row in it may not be reported as a
     holdout result, because on the first reading nothing out of sample was measured and on
@@ -386,6 +427,104 @@ def holdout_generations_to_retire(
     )
 
 
+class HoldoutWindowSpent(RuntimeError):
+    """A second evaluation of a window this case study reports as unseen was refused."""
+
+
+def refuse_a_second_look(
+    retire: HoldoutGenerationsToRetire,
+    *,
+    this_configuration: str,
+    this_training_hash: str,
+    checkpoint: tuple[Any, Any],
+    retiring: Sequence[str] = (),
+) -> tuple[dict[str, Any], ...]:
+    """Refuse a second evaluation of a spent holdout window, unless it is named.
+
+    The default is refusal, and the override is per generation rather than per run. A
+    boolean would be set once and left set, and the guard would then be decorative; naming
+    the prediction set means each override is a statement about one window that somebody had
+    to look up. ``retiring`` is a sequence of prediction hashes the operator accepts
+    retiring, and the run proceeds only when it names exactly what is registered.
+
+    Returns the rows being retired, so the caller can put them in the render. A second look
+    that proceeds deliberately has to say so where a reader sees it, not only in the launch
+    line - the registry would otherwise show one evaluation of the window and a reader would
+    have no way to learn there had been two.
+
+    Only ``superseded`` is overridable. The other two buckets are not a decision anybody can
+    make by naming a hash:
+
+    * ``unattributable`` - the training runs record no CV split, so whether they were
+      refitted for the holdout cannot be established either way. Naming one asserts a fact
+      the registry does not hold.
+    * ``not_out_of_sample`` - the row is either a validation-fitted model published over the
+      window or a refit filed under its validation identity, and the registry cannot tell
+      those apart. An override here would not authorize a second look; it would authorize
+      reporting something that may never have been out of sample.
+    """
+    if retire.unattributable:
+        raise HoldoutWindowSpent(
+            "the holdout window carries prediction sets whose training runs record no CV "
+            "split, so whether they were refitted for the holdout cannot be established: "
+            + ", ".join(
+                f"{row['prediction_hash']} (training {row['training_hash']})"
+                for row in retire.unattributable
+            )
+            + ". Establish what produced them before registering another evaluation on the "
+            "same window. This is not what `retiring` is for: naming one of these would "
+            "assert something the registry does not record."
+        )
+    if retire.not_out_of_sample:
+        raise HoldoutWindowSpent(
+            "the holdout window carries prediction sets whose training runs declare a CV "
+            "split other than the holdout: "
+            + ", ".join(
+                f"{row['prediction_hash']} ({row['config_name']}, training {row['training_hash']})"
+                for row in retire.not_out_of_sample
+            )
+            + ". Each is either a validation-fitted model published over the window, which "
+            "is not an out-of-sample result, or a refit registered under its validation "
+            "training identity, and the registry cannot tell those apart. Resolve it "
+            "through the registry's own lifecycle, which records that the row was retired."
+        )
+
+    registered = {row["prediction_hash"] for row in retire.superseded}
+    named = dict.fromkeys(retiring)
+
+    unknown = [hash_ for hash_ in named if hash_ not in registered]
+    if unknown:
+        raise HoldoutWindowSpent(
+            f"the run authorizes retiring {', '.join(unknown)}, which this window does not "
+            "carry. An override that names something absent is either aimed at another case "
+            "study or has outlived the generation it was written for, and either way it "
+            "would sit in the launch line authorizing whatever arrives next. Registered "
+            "here: " + (", ".join(sorted(registered)) or "nothing") + "."
+        )
+
+    unnamed = [row for row in retire.superseded if row["prediction_hash"] not in named]
+    if unnamed:
+        kind, value = checkpoint
+        raise HoldoutWindowSpent(
+            "the holdout window already carries a refit of a different configuration: "
+            + ", ".join(
+                f"{row['prediction_hash']} ({row['config_name']}, training {row['training_hash']})"
+                for row in unnamed
+            )
+            + f". This run would evaluate {this_configuration} (training "
+            f"{this_training_hash}, checkpoint {kind}={value}) on the same window, which "
+            "would be a second configuration measured on a period this case study reports "
+            "as unseen. Deleting the earlier rows does not undo having observed their "
+            "result - the selection that produced this configuration may have been informed "
+            "by the earlier holdout number, and no deletion reaches that. To take the second "
+            "look deliberately, name what is being retired: "
+            "RETIRE_HOLDOUT_GENERATIONS:json="
+            + json.dumps(sorted(row["prediction_hash"] for row in unnamed))
+            + ". The run then records it where a reader sees it."
+        )
+    return retire.superseded
+
+
 # What a holdout refit is allowed to change, and nothing else. Everything outside this set
 # has to agree with the validation run, because the holdout is defined as *that configuration*
 # refitted on a later window - not as another run that happens to share its name.
@@ -402,22 +541,45 @@ def holdout_generations_to_retire(
 # This is a denylist rather than an allowlist on purpose: a field added to the specification
 # later is compared by default, so the check tightens as the spec grows instead of silently
 # ignoring the new field.
-_REFIT_MAY_CHANGE = frozenset(
-    {"cv", "expected_prediction_keys", "input_data_spec", "runtime_identity", "source_identity"}
-)
+# Fields a refit may differ in for reasons that are not the fold set: the CV specification it
+# was asked for, where its inputs came from, and the two identity stamps. The fold-derived
+# fields are NOT listed here - they come from `FOLD_DERIVED_FIELDS`, which is the declaration
+# of what a holdout refit is required to recompute.
+_REFIT_MAY_CHANGE = frozenset({"cv", "input_data_spec", "runtime_identity", "source_identity"})
 
 
 def _refit_comparable(training_spec_json: str | None) -> dict | None:
-    """A training specification reduced to what a refit must preserve."""
+    """A training specification reduced to what a refit must preserve.
+
+    The fold-derived fields are skipped by reading the same tuple the holdout deriver writes
+    them from, rather than by a list kept in step with it by hand. The hand-kept list matched
+    two of the three and compared `macro_context.resolved_fold_digest`, which
+    `_resolved_macro_digest` computes over `case.splits` - so it differs whenever a refit is
+    correct, and the one holdout that reached this check was rejected for changing a field it
+    was required to change.
+
+    Scoped to the named subfield, never to its container: the other five entries under
+    `macro_context` are the macro *configuration* - `series`, `policy`, `alignment`,
+    `availability_lag_days`, `version` - and a run that differs in any of them is not a refit
+    of this specification at all.
+    """
     if not training_spec_json:
         return None
+    # Imported in the function because `case_studies.research` pulls in the workspace on import
+    # and this module is reached from notebooks that open no study.
+    from case_studies.research.holdout import FOLD_DERIVED_FIELDS
+
     computation = dict(json.loads(training_spec_json).get("computation") or {})
     for key in _REFIT_MAY_CHANGE:
         computation.pop(key, None)
-    model = dict(computation.get("model") or {})
-    if model:
-        model.pop("effective_params_by_fold", None)
-        computation["model"] = model
+    for container, field in FOLD_DERIVED_FIELDS:
+        if container == "computation":
+            computation.pop(field, None)
+            continue
+        nested = dict(computation.get(container) or {})
+        if nested:
+            nested.pop(field, None)
+            computation[container] = nested
     return computation
 
 
@@ -603,8 +765,8 @@ def _resolve_holdout_self_backtest(
     # fitted on a superseded feature generation from being reported as the carrier's.
     matched = sorted(
         {
-            bh
-            for bh, spec_json, _, training_spec_json in candidates
+            (bh, holdout_training_hash)
+            for bh, spec_json, holdout_training_hash, training_spec_json in candidates
             if json.loads(spec_json).get("strategy", {}) == val_strategy
             and training_run_fitted_for_the_holdout(training_spec_json)
             and is_refit_of(training_spec_json, val_training_spec_json)
@@ -621,11 +783,13 @@ def _resolve_holdout_self_backtest(
         )
     if len(matched) > 1:
         raise ValueError(
-            f"holdout replay for {val_backtest_hash} is ambiguous: {matched} are all "
+            f"holdout replay for {val_backtest_hash} is ambiguous: "
+            f"{[bh for bh, _ in matched]} are all "
             f"{configuration[0]}/{configuration[1]} on {configuration[2]}, refitted for the "
             f"holdout at {checkpoint}, with one strategy spec"
         )
-    return HoldoutSelfBacktest(matched[0])
+    backtest_hash, holdout_training_hash = matched[0]
+    return HoldoutSelfBacktest(backtest_hash, training_hash=holdout_training_hash)
 
 
 def _refuse_a_selection_disagreement(
@@ -732,10 +896,12 @@ class NoSelectableCandidates(RuntimeError):
     a holdout already covers the current top-N, and an initialised registry with no
     eligible validation backtest is a legitimate "not yet", not an error. It used to catch
     `ValueError`, which is what the pool it built itself raised; routing it through the
-    canonical selector changed the type under it, and in
-    `20_strategy_synthesis/00_holdout_predictions.py` that call sits outside the
-    generation loop's handler, so one un-run case study would have stopped every case
-    study after it.
+    canonical selector changed the type under it. The caller that made this matter was
+    `20_strategy_synthesis/00_holdout_predictions.py`, which put the call outside its
+    generation loop's handler, so one un-run case study stopped every case study after
+    it. That notebook is retired with the rest of Chapter 20's holdout generation; the
+    distinction stays because a "not yet" reported as a failure is wrong wherever it is
+    read.
     """
 
 
@@ -758,9 +924,10 @@ def selectable_validation_candidates(
 ) -> list[dict[str, Any]]:
     """Every validation backtest this case study may select from, best Sharpe first.
 
-    One implementation, because holdout selection had two. ``holdout.select_best_models``
-    built its own pool out of ``BacktestExplorer.best`` per stage and this function's
-    caller built one in SQL, and the two were held together by a comment. They applied
+    One implementation, because holdout selection had two. The retired
+    ``20_strategy_synthesis/holdout.py::select_best_models`` built its own pool out of
+    ``BacktestExplorer.best`` per stage and this function's caller built one in SQL, and
+    the two were held together by a comment. They applied
     different eligibility filters - membership on the prediction side there, a
     retired-set exclusion on both sides here - and different orderings, so they could
     name different configurations for the single holdout use. Measured on ``fx_pairs``
@@ -780,6 +947,12 @@ def selectable_validation_candidates(
       resolves inside the pool it narrowed to;
     * **publication**: an identity is selectable only where the population its producer
       publishes still lists it, asked per member kind and on both sides of the join.
+    * **what the sweep refused**: a prediction set a sweep measured and dropped for covering
+      less than the cross-section its feature panels offered it. Read from the registry
+      rather than recomputed, because the check costs what the sweep's startup costs and
+      because two implementations of one rule is what let this resolver be the looser of the
+      two. Absence is not admission: a member no sweep has measured has no row and is left
+      where it is.
 
     Publication is the membership question, not the exclusion one, and the two are not
     the same set. A prediction that no population ever listed was retired by nobody, so
@@ -803,6 +976,9 @@ def selectable_validation_candidates(
     import sqlite3
 
     from case_studies.research.population import published_members_at
+    from case_studies.utils.notebook_contracts import (
+        predictions_the_sweep_refused,
+    )
     from utils.paths import get_case_study_dir
 
     case_dir = get_case_study_dir(case_study)
@@ -967,6 +1143,34 @@ def selectable_validation_candidates(
             continue
         candidates = [row for row in candidates if row[key] in published]
 
+    # What the sweep measured and refused. `full_coverage_prediction_sql` above is the bar this
+    # query can express, and it counts decision days: a family that scores every day for half
+    # the universe ties the day count and ranks beside families that scored all of it. The
+    # sweep charges every member against the feature panel it was offered and drops the ones
+    # that fall short, and until it recorded that answer the two rules disagreed with the
+    # resolver on the looser side - measured on nasdaq100_microstructure 2026-09-13, where
+    # pinning the label made the carrier a 67.4%-coverage prediction set with an IC of
+    # -0.00125 that the sweep had already stopped backtesting.
+    #
+    # Only what a sweep POSITIVELY recorded as short is dropped here. A member nothing has
+    # measured has no row and is left exactly where it is, so a registry swept before the
+    # record existed keeps the pool it has today and this can never empty a pool on its own.
+    refused = predictions_the_sweep_refused(case_dir)
+    if refused:
+        before_refusals = len(candidates)
+        candidates = [row for row in candidates if row["prediction_hash"] not in refused]
+        if before_refusals and not candidates:
+            named = "; ".join(
+                f"{member} {reason.splitlines()[0]}" for member, reason in sorted(refused.items())
+            )
+            raise NoSelectableCandidates(
+                f"Every one of the {before_refusals} live validation backtests for "
+                f"{case_study} stands on a prediction set the sweep measured and dropped for "
+                f"covering less than the cross-section its feature panels offered it: {named}. "
+                "Selecting one of these would carry the case study on a prediction the sweep "
+                "will not backtest. Re-run the fitting stages rather than ranking them."
+            )
+
     if admitted is not None:
         admitted_before = len(candidates)
         candidates = [row for row in candidates if row["backtest_hash"] in admitted]
@@ -1129,12 +1333,24 @@ def resolve_canonical_rank1_lineage(
     When a conformal candidate is present at any calibration version, every
     candidate - conformal or not - is re-ranked on exact common timestamp
     support, because a conformal allocator abstains until it is calibrated and
-    books zeros over the abstention. Holdout match is by
-    training_hash on the rank-1's prediction set. Use this in every strategy_analysis notebook
-    rather than hardcoding hashes - hardcoded hashes go stale every time the
-    sweep is rebuilt, and queries that forget LABEL_RESTRICTIONS surface the
-    diagnostic-variant rows (sp500_options' fwd_ret_10d Sharpe ≈ 9.7) as
-    bogus rank-1 candidates.
+    books zeros over the abstention.
+
+    The holdout is NOT matched on the rank-1's training hash, which is what this
+    sentence used to say. `_resolve_holdout_self_backtest` joins on the declared
+    configuration - checkpoint, family, config name, label - because a correctly
+    produced holdout carries a new training identity refitted on the holdout fold,
+    so matching on the validation identity could only ever find a holdout scored
+    from the validation-fitted model. Three post-conditions then bind it: the
+    strategy spec must equal the validation run's, the training run must be fitted
+    for the holdout, and `is_refit_of` must hold against the validation training
+    spec, which is what rejects a holdout fitted on a superseded feature
+    generation. The old sentence made the check read as a name match, which is
+    weaker than what runs and is the reading an auditor would act on.
+
+    Use this in every strategy_analysis notebook rather than hardcoding hashes -
+    hardcoded hashes go stale every time the sweep is rebuilt, and queries that
+    forget LABEL_RESTRICTIONS surface the diagnostic-variant rows (sp500_options'
+    fwd_ret_10d Sharpe ≈ 9.7) as bogus rank-1 candidates.
 
     ``admitted``, when given, is the set of backtest hashes a case study has frozen as
     the field this selection may choose from - a ``CandidateSet``'s members. It is applied
@@ -1163,8 +1379,8 @@ def resolve_canonical_rank1_lineage(
     # it could resolve a carrier on a label the pool excludes - the carrier is then not in
     # the pool, and the notebook reports it missing. The default is the declared
     # restriction, which is what every canonical run wants. The pool itself is
-    # `selectable_validation_candidates`, which `holdout.select_best_models` also ranks,
-    # so the two cannot name different carriers for the single holdout use.
+    # `selectable_validation_candidates`, which is the only ranking there is, so nothing
+    # can name a different carrier for the single holdout use.
     candidates = selectable_validation_candidates(case_study, admitted=admitted, labels=labels)
     val = candidates[0]
     # The field is already in its final order, common-support re-ranking included, so the
@@ -1586,109 +1802,6 @@ def load_holdout_metrics(case_study: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def plot_ic_vs_sharpe(
-    explorer,
-    *,
-    highlight_sources: list[str] | None = None,
-    ew_sharpe: float | None = None,
-    ax: plt.Axes | None = None,
-) -> plt.Figure:
-    """IC vs equal-weight baseline Sharpe scatter with annotations.
-
-    Parameters
-    ----------
-    explorer : BacktestExplorer
-    highlight_sources : list[str], optional
-        Model sources to highlight (e.g. model_analysis recommendations).
-    ew_sharpe : float, optional
-        Equal-weight benchmark Sharpe (drawn as horizontal line).
-    ax : plt.Axes, optional
-
-    Returns
-    -------
-    plt.Figure
-    """
-    # Load all equal-weight baseline backtests
-    all_bt = explorer.best(stage="signal", top_n=9999)
-    if all_bt.is_empty():
-        fig, ax = plt.subplots()
-        ax.text(0.5, 0.5, "No signal backtests", ha="center", va="center")
-        return fig
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(10, 7))
-    else:
-        fig = ax.figure
-
-    ic = all_bt["ic_mean"].to_numpy()
-    sharpe = all_bt["sharpe"].to_numpy()
-    sources = all_bt["source"].to_list()
-    families = all_bt["family"].to_list()
-
-    # Base scatter (all points, light gray)
-    ax.scatter(ic, sharpe, c="lightgray", s=20, alpha=0.5, zorder=1, label="_all")
-
-    # Highlight recommended models
-    if highlight_sources:
-        mask = np.array([s in highlight_sources for s in sources])
-        if mask.any():
-            # Color by family
-            family_colors = _family_color_map()
-            highlighted_families = [families[i] for i in range(len(families)) if mask[i]]
-            colors = [family_colors.get(f, "#333333") for f in highlighted_families]
-            ax.scatter(
-                ic[mask],
-                sharpe[mask],
-                c=colors,
-                s=60,
-                alpha=0.8,
-                edgecolors="black",
-                linewidths=0.5,
-                zorder=3,
-            )
-            # Add family legend
-            seen = set()
-            for f in highlighted_families:
-                if f not in seen:
-                    ax.scatter([], [], c=family_colors.get(f, "#333333"), s=60, label=f)
-                    seen.add(f)
-
-    # Annotate top 3
-    top_idx = np.argsort(sharpe)[-3:]
-    for idx in top_idx:
-        label = sources[idx].split("/")[-1]
-        ax.annotate(
-            label,
-            (ic[idx], sharpe[idx]),
-            textcoords="offset points",
-            xytext=(8, 4),
-            fontsize=8,
-            alpha=0.8,
-        )
-
-    # EW benchmark line
-    if ew_sharpe is not None:
-        ax.axhline(
-            ew_sharpe,
-            color="red",
-            linestyle="--",
-            alpha=0.5,
-            label=f"EW baseline ({ew_sharpe:.2f})",
-        )
-
-    ax.set_xlabel("Information Coefficient (IC)")
-    ax.set_ylabel("Signal-Stage Sharpe")
-    ax.set_title("Signal Quality vs Strategy Performance")
-    ax.legend(loc="upper left", frameon=False, fontsize=9)
-
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Figure 2: Sharpe Progression Waterfall (Locked Lineage)
-# ---------------------------------------------------------------------------
-
-
 def plot_sharpe_waterfall(
     lineage: dict[str, dict],
     *,
@@ -1806,13 +1919,11 @@ def plot_sharpe_waterfall(
                 zorder=4,
             )
         if skipped_ci_stages:
-            import warnings
-
-            warnings.warn(
-                "plot_sharpe_waterfall: dropped CIs not bracketing the "
-                f"point estimate for stages={skipped_ci_stages}; rerun "
-                "uncertainty backfill to refresh.",
-                stacklevel=2,
+            warn_the_reader(
+                f"dropped CIs not bracketing the point estimate for "
+                f"stages={skipped_ci_stages}; rerun uncertainty backfill to refresh.",
+                source="plot_sharpe_waterfall",
+                key=("waterfall_ci", tuple(skipped_ci_stages)),
             )
 
     # value labels - always above the upper edge so they don't overlap a CI bar
@@ -1977,105 +2088,6 @@ def plot_concentration_curve(
 # ---------------------------------------------------------------------------
 
 
-def plot_cost_decay(
-    explorer,
-    *,
-    protocol_cost_bps: float | None = None,
-    ax: plt.Axes | None = None,
-) -> plt.Figure:
-    """Net Sharpe vs total cost with breakeven annotation.
-
-    Parameters
-    ----------
-    explorer : BacktestExplorer
-    protocol_cost_bps : float, optional
-        The assumed cost from setup.yaml.
-    ax : plt.Axes, optional
-
-    Returns
-    -------
-    plt.Figure
-    """
-    costs_df = explorer.cost_sensitivity()
-    if costs_df.is_empty():
-        fig, ax = plt.subplots()
-        ax.text(0.5, 0.5, "No cost sensitivity data", ha="center", va="center")
-        return fig
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(10, 5))
-    else:
-        fig = ax.figure
-
-    # Best Sharpe per cost level
-    best_per_cost = (
-        costs_df.sort("sharpe", descending=True).group_by("cost_bps").first().sort("cost_bps")
-    )
-
-    cost_bps = best_per_cost["cost_bps"].to_numpy()
-    sharpe = best_per_cost["sharpe"].to_numpy()
-
-    ax.plot(cost_bps, sharpe, "o-", color="#2196F3", linewidth=2, markersize=8)
-    ax.fill_between(cost_bps, sharpe, alpha=0.1, color="#2196F3")
-    ax.axhline(0, color="black", linewidth=0.5, linestyle="-")
-
-    # Estimate breakeven via interpolation
-    if sharpe[0] > 0 and sharpe[-1] < 0:
-        from scipy.interpolate import interp1d
-
-        f = interp1d(sharpe, cost_bps)
-        breakeven = float(f(0))
-        ax.axvline(
-            breakeven,
-            color="#F44336",
-            linestyle="--",
-            alpha=0.7,
-            label=f"Breakeven: {breakeven:.0f} bps",
-        )
-    elif sharpe[-1] >= 0:
-        breakeven = float(cost_bps[-1])
-        ax.annotate(
-            f"Still positive at {breakeven:.0f} bps",
-            xy=(breakeven, sharpe[-1]),
-            fontsize=9,
-            color="#4CAF50",
-        )
-    else:
-        breakeven = None
-
-    # Protocol cost annotation
-    if protocol_cost_bps is not None:
-        ax.axvline(
-            protocol_cost_bps,
-            color="#4CAF50",
-            linestyle=":",
-            alpha=0.7,
-            label=f"Protocol: {protocol_cost_bps:.0f} bps",
-        )
-
-        if breakeven is not None and protocol_cost_bps > 0:
-            headroom = breakeven / protocol_cost_bps
-            ax.annotate(
-                f"Headroom: {headroom:.1f}×",
-                xy=(protocol_cost_bps, sharpe[0] * 0.9),
-                fontsize=10,
-                fontweight="bold",
-                color="#4CAF50",
-            )
-
-    ax.set_xlabel("Total Cost (bps per leg)")
-    ax.set_ylabel("Net Sharpe Ratio")
-    ax.set_title("Cost Sensitivity: Strategy Viability Under Friction")
-    ax.legend(loc="upper right", frameon=False)
-
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Figure 5: 2-Panel Equity / Drawdown
-# ---------------------------------------------------------------------------
-
-
 def plot_equity_drawdown(
     daily_returns_path: Path,
     *,
@@ -2100,7 +2112,9 @@ def plot_equity_drawdown(
     plt.Figure
     """
     if ax is None:
-        fig, (ax_eq, ax_dd) = plt.subplots(2, 1, figsize=(12, 7), sharex=True, height_ratios=[2, 1])
+        fig, (ax_eq, ax_dd) = plt.subplots(
+            2, 1, figsize=(12, 7), sharex=True, height_ratios=[2, 1], layout="tight"
+        )
     else:
         ax_eq, ax_dd = ax
         fig = ax_eq.figure
@@ -2215,7 +2229,6 @@ def load_strategy_assessment(
         Assessment dictionary, or empty dict if not found.
     """
     import sqlite3
-    import warnings
 
     from utils.paths import get_case_study_dir
 
@@ -2239,12 +2252,13 @@ def load_strategy_assessment(
                 ).fetchone()[0]
                 con.close()
                 if n == 0:
-                    warnings.warn(
+                    warn_the_reader(
                         f"strategy_assessment.json for '{case_study}' is STALE: "
                         f"champion {champion_source}/{primary_label} is not in the "
                         f"registry. Regenerate by running "
                         f"case_studies/{case_study}/*_strategy_analysis.py.",
-                        stacklevel=2,
+                        source="load_assessment",
+                        key=("stale_assessment", case_study, champion_source, primary_label),
                     )
     return assessment
 
@@ -2452,9 +2466,8 @@ def rank_one(frame: pl.DataFrame, *, by: str, name: str) -> pl.DataFrame:
     """The top row of *frame* by *by*, with *name* deciding a tie.
 
     A one-key ``sort(by, descending=True).head(1)`` hands a tie to whatever order the frame
-    arrived in, so the row it returns is not a function of the data - the defect class
-    ml4t/agent-workspace#333 is about, where a visible precaution (the sort) leaves one
-    dimension of the answer free.
+    arrived in, so the row it returns is not a function of the data - the class of defect
+    where a visible precaution (the sort) leaves one dimension of the answer free.
 
     Exact ties in these quantities are not hypothetical. Measured across the nine live
     registries on 2026-09-11, 14 (case study, stage) pairs hold at least one exactly repeated

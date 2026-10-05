@@ -24,14 +24,38 @@
 
 name: Tests
 
-# One run per ref, and a burst collapses to the newest tree. Merging eight pull requests in an
-# evening previously started eight full matrices on `main`, each testing a tree the next merge
-# superseded minutes later, and each mailing a failure notice. Cancelling the superseded ones
-# keeps the invariant the push trigger exists for - what is on `main` has been tested - while
-# testing the tip rather than every intermediate state. Pull-request runs collapse the same way
-# when a branch is pushed to repeatedly.
+# One run per pull request, and one per commit on `main`.
+#
+# A pull request still collapses to its newest push: a branch pushed to repeatedly should
+# test the tip and nothing before it.
+#
+# `main` is keyed by commit, not by ref, and the two cancellations that produces want
+# opposite treatment. Two runs exist for one commit - the `push` run and the run
+# `Docker Publish` triggers on finishing - and they test the same tree, so collapsing
+# them is pure saving; measured on ten consecutive merges on 2026-09-12, the push run was
+# cancelled 11 s to 3 min in, every time, by the run that replaced it. Cancelling ACROSS
+# commits is where the coverage went. Keying by ref did both, and the second one cost
+# more than the first saved: merges landing 10 to 30 minutes apart against jobs needing
+# 20 to 46 minutes meant the six slowest never finished at all. By 01:00 on 2026-09-13
+# `cs-etfs`, `cs-nasdaq100_microstructure`, `cs-sp500_equity_option_analytics`,
+# `cs-sp500_options`, `ch11-12` and `ch16-17` had last reported five merges back, and
+# `main` runs the full matrix precisely so that failures outside a merged diff stay
+# visible - which those six had stopped providing.
+#
+# `github.sha` is the right key on both event types, which is measured rather than read
+# off the docs. On a `workflow_run` event it is the default branch tip at event time, and
+# it is what gets tested: the checkout in run 34725716888 fetched
+# `+02e91fa71948...:refs/remotes/origin/main`, matching that run's `head_sha`. When two
+# merges land inside one Docker Publish, both triggered runs are stamped with the later
+# commit - runs 34717628030 and 34717636693 are both `e0ea7054` - so they still share a
+# group and still collapse, which is the same-tree case this wants collapsed.
+#
+# The cost is a full matrix per merge during a burst, in runner minutes that are free on
+# a public repo and wall-clock that gates nothing: `main`'s run blocks no merge. A late
+# complete answer beats a prompt absent one. `.github/workflows/ci-job-lag.yml` reports
+# when a job stops reporting, whichever way this setting goes.
 concurrency:
-  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 on:
@@ -433,6 +457,23 @@ jobs:
           # notebook_provenance.py --since diffs against the base or the previous
           # tip, and neither is in a shallow clone.
           fetch-depth: 0
+          # On `workflow_run` the default resolves to the branch tip at FETCH time: the
+          # log of the 08:08Z guards job on 2026-09-15 reads
+          # `git rev-parse refs/remotes/origin/main` then
+          # `git checkout --force -B main refs/remotes/origin/main`. The check-run is
+          # stamped on `github.sha`, the default-branch tip at EVENT time, and these two
+          # differ whenever `main` moves while the job waits on the concurrency group -
+          # which is not a corner case here, since that job waited 35 minutes. So the
+          # result gets published against a commit whose tree was never read, and the
+          # direction that hurts is the stamped commit dirty and the fetched one clean.
+          #
+          # Pin to `github.sha` and not to `github.event.workflow_run.head_sha`: the
+          # latter is the upstream Docker Publish commit, which is a third sha again, so
+          # pinning there would fix the checkout and leave the same mismatch pointing the
+          # other way. What has to hold is that the tree read is the tree the result
+          # claims. Empty is actions/checkout's own default, so `pull_request` and `push`
+          # resolve exactly as before.
+          ref: "${{ github.event_name == 'workflow_run' && github.sha || '' }}"
       - uses: astral-sh/setup-uv@v6
         with:
           version: "latest"
@@ -490,6 +531,24 @@ jobs:
           source .venv/bin/activate
           python .github/scripts/check_constant_subscripts.py --selftest
           python .github/scripts/check_constant_subscripts.py
+      # Alt text is what a reader who cannot see the figure is handed instead of it, so
+      # alt text naming a chart the cell never draws tells that reader something false
+      # rather than something less. Nothing else here can see it: a prose rewrite that
+      # swaps "heatmap" for "grouped bars" changes no code, so ruff, the formatter and
+      # the notebook tests all stay green (ml4t/agent-workspace#1164).
+      #
+      # This is the machine-decidable third of that clause, not the whole of it. The
+      # wider prose sweep it comes from reports 1,237 violations over this repository,
+      # 603 of them one rule about comment blocks in code cells, so gating on the sweep
+      # would red every open PR; these three rules report zero. Stdlib-only AST over the
+      # jupytext sources, ~4 s. `--selftest` first: two cases that must fire and eleven
+      # that must not, the eleven being real sentences from this repository that earlier
+      # forms of the rule wrongly reported.
+      - name: A figure's title, description and prose all describe the figure its cell draws
+        run: |
+          source .venv/bin/activate
+          python .github/scripts/check_notebook_prose.py --selftest
+          python .github/scripts/check_notebook_prose.py
       - name: Notebook output hygiene
         run: |
           source .venv/bin/activate
@@ -507,10 +566,30 @@ jobs:
       # a gate that only fires on the path we believe is the only path is how that
       # happened. On a push the base is the previous tip, so the scope is exactly
       # what the push introduced.
+      #
+      # It must also fire on `workflow_run`, and that is not a completeness tidy.
+      # Every commit on `main` gets two Tests runs - this `push` run, and the run
+      # `Docker Publish` triggers on finishing - sharing one concurrency group with
+      # cancel-in-progress. The `push` run is the only one whose event carries a
+      # previous tip, and it is routinely cancelled partway by the run that replaces
+      # it, while the `workflow_run` run skipped this step entirely. Measured
+      # 2026-09-15 over the last ten commits on `main`: nine read
+      # `guards=[success, cancelled]` - the cancelled one is this step's run and the
+      # successful one is the run that skipped it. The tenth, `b6a7627c`, is the only
+      # commit where the step actually ran, and it caught a stale render on that push.
+      # So the gate described above as covering merges had not covered a merge in ten.
+      # On `workflow_run` there is no previous tip to diff, so it checks everything,
+      # which is the same fallback a first push already takes.
       - name: Notebooks this change touched were executed from their current .py
-        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        if: github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_run'
         run: |
           source .venv/bin/activate
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            # No previous tip on this event, so there is no honest narrower scope.
+            echo "workflow_run: no previous tip - checking every notebook"
+            python .github/scripts/notebook_provenance.py check
+            exit $?
+          fi
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             # What does this branch add on top of the base: merge-base diff.
             python .github/scripts/notebook_provenance.py check \
@@ -614,10 +693,24 @@ jobs:
           uv export --frozen --extra live --extra dev --no-emit-project --no-hashes \
             --format requirements-txt \
             | grep -iE '^[a-z0-9._-]+==' > /tmp/locked-constraints.txt
+          #
+          # `ipykernel` is here for a capability rather than an import. This venv had
+          # `jupytext` and `papermill` and no kernelspec at all, so `find_kernel_specs()`
+          # returned an empty dict and any test that executes a notebook failed at the sync
+          # with `KeyError: Please choose a kernel name among dict_keys([])`. A job that
+          # installs a notebook runner and cannot run a notebook can only host tests that
+          # stop short of doing it.
+          #
+          # `ruff` is here for the same reason. `notebook_provenance.py`'s unused-import
+          # tier shells out to `python -m ruff` to normalise both sides of a comparison,
+          # so without it `tests/test_notebook_import_sync.py` cannot exercise the tier at
+          # all - and a missing ruff exits 1, exactly as a lint finding does, so the first
+          # version of that job reported three assertion failures rather than a missing
+          # dependency. It is a single small wheel and it is not a lint step here.
           uv pip install --constraint /tmp/locked-constraints.txt \
             pytest pytest-timeout numpy pandas polars pyyaml python-dotenv plotly gymnasium requests \
-            scipy statsmodels scikit-learn matplotlib hmmlearn pyarrow nest-asyncio \
-            ml4t-diagnostic jupytext papermill ml4t-backtest ml4t-data ml4t-engineer databento
+            scipy statsmodels scikit-learn matplotlib hmmlearn pyarrow nest-asyncio ruff \
+            ml4t-diagnostic jupytext papermill ipykernel ml4t-backtest ml4t-data ml4t-engineer databento
       - name: Run download-logic unit tests
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -970,9 +1063,42 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
+          # `ci` is a tag in the fixture repository, advanced deliberately. It is not that
+          # repository's default branch, which is what all ten sites read until now: one
+          # push there changed the inputs of every open pull request at once, and three
+          # separate sessions each spent time establishing that a red check was not theirs
+          # (2026-09-04, 09-11, 09-13).
+          #
+          # To adopt a new fixture: move the tag, then watch one `main` run.
+          #
+          #     git -C <fixture checkout> tag -f ci <sha> && git push -f origin refs/tags/ci
+          #
+          # Nothing in this repository has to change - that is the point of a tag over a
+          # sha, which would need a bump commit here for every fixture change, and the
+          # fixture took 26 commits in the first thirteen days of September.
+          #
+          # The tag's history is the record of which fixture generation a window of pull
+          # requests read, and each job prints the commit it actually got in the step
+          # below, so a move that breaks something is attributable to the move.
+          #
+          # A fixture change and the code that needs it still land separately, in either
+          # order: move the tag first and the old code must still pass against the new
+          # fixture, land the code first and it must still pass against the old one. That
+          # is unchanged by pinning - what changes is that it happens when someone decides
+          # it does.
+          ref: ci
           path: test-data
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
+
+      - name: Record the fixture this job read
+        if: steps.reach.outputs.have_key
+        run: |
+          # tee, not a plain redirect: the summary is where a reader looks, and the log is
+          # where this is greppable and where a broken command would be visible at all. A
+          # step whose whole output goes somewhere no API exposes cannot be checked.
+          printf '%s\n' "test-data $(git -C test-data rev-parse HEAD)" \
+            "$(git -C test-data log -1 --format='%cs %s')" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: astral-sh/setup-uv@v6
         if: steps.reach.outputs.have_key
         with:
@@ -1085,6 +1211,7 @@ jobs:
             tests/test_artifact_specs.py \
             tests/test_backtest_presets.py \
             tests/test_etf_baseline_parity.py \
+            tests/test_fixture_population_backtests.py::test_the_shipped_fixtures_publish_what_they_are_known_to \
             tests/test_sp500_options_research.py::test_official_population_is_snapshotted_before_option_execution \
             tests/test_us_firm_research_workflow.py::test_open_study_writes_canonical_results_to_output_dir \
             -m "not production_extract" \
@@ -1108,7 +1235,14 @@ jobs:
           print(f"{len(cases)} tests ran against the test-data checkout, none skipped")
           PY
   # ---------------------------------------------------------------------------
-  # The 35 test files that need the modelling environment.
+  # The test files that need the modelling environment, one per line below.
+  #
+  # The count is deliberately not repeated here. It used to be, it said 47 against a
+  # 46-entry list, and the same number three lines into
+  # .github/ci/unit-test-quarantine.txt had already been corrected once - two copies of
+  # one count, and the one nobody was looking at was the wrong one. That file's header
+  # carries the number and a one-line awk that recomputes it; the guard below is what
+  # holds this list and that file in agreement.
   #
   # These ran in NO job. .github/ci/unit-test-quarantine.txt excluded them from
   # test-unit's sweep for needing torch, and said they "belong in a job that runs
@@ -1187,7 +1321,8 @@ jobs:
     # outcome this job must never have.
     if: always()
     runs-on: ubuntu-latest
-    # The 26 files measured on 2026-08-24 ran in 3m21s; the list now contains 36.
+    # The 26 files measured on 2026-08-24 ran in 3m21s. No count here either; the
+    # quarantine file's header carries it.
     # --timeout=900 bounds a hung test but not a hung
     # import, collection or image pull, which would otherwise fall through to
     # GitHub's six-hour default.
@@ -1277,6 +1412,8 @@ jobs:
             tests/test_gbm_identity.py \
             tests/test_gbm_runtime.py \
             tests/test_insight_chapter.py \
+            tests/test_insight_selection_reads_the_fold_geometry.py \
+            tests/test_insight_selection_reads_the_live_generation.py \
             tests/test_latent_epoch_ic_over_dates.py \
             tests/test_latent_factors_identity.py \
             tests/test_latent_factors_no_leak.py \
@@ -1293,15 +1430,13 @@ jobs:
             tests/test_sae_batch_size.py \
             tests/test_sdf_checkpoint_numbering.py \
             tests/test_sdf_macro_context.py \
+            tests/test_sequence_batch_gather.py \
             tests/test_sequence_dataset.py \
             tests/test_sequence_identity_roundtrip.py \
             tests/test_sequence_holdout_rekey.py \
             tests/test_smoke_configs.py \
             tests/test_tabular_dl.py \
             tests/test_tabular_dl_adapter.py \
-            tests/test_holdout_expected_keys.py \
-            tests/test_holdout_force_regenerates.py \
-            tests/test_holdout_selection_is_single_sourced.py \
             tests/test_tabular_dl_identity.py \
             tests/test_tabular_dl_runtime.py \
             tests/test_latent_convergence_guard.py \
@@ -1374,11 +1509,19 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
-          ref: main   # upstream went private ~2026-08: explicit ref skips the
-                      # default-branch API lookup (404 anon); the deploy key still fetches
+          ref: ci
           path: test-data
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
+
+      - name: Record the fixture this job read
+        if: steps.reach.outputs.have_key
+        run: |
+          # tee, not a plain redirect: the summary is where a reader looks, and the log is
+          # where this is greppable and where a broken command would be visible at all. A
+          # step whose whole output goes somewhere no API exposes cannot be checked.
+          printf '%s\n' "test-data $(git -C test-data rev-parse HEAD)" \
+            "$(git -C test-data log -1 --format='%cs %s')" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Six chapter jobs download checkpoints from HuggingFace while the notebook
       # runs: ch04, ch22 and ch23 (all-MiniLM-L6-v2), ch10 (finbert-tone,
@@ -1462,10 +1605,10 @@ jobs:
       - name: Seed case study intermediates
         if: steps.reach.outputs.have_key
         run: |
-          mkdir -p $ML4T_OUTPUT_DIR
+          mkdir -p "$ML4T_OUTPUT_DIR"
           if [ -d test-data/intermediates ]; then
-            cp -r test-data/intermediates/* $ML4T_OUTPUT_DIR/
-            echo "Seeded $(du -sh $ML4T_OUTPUT_DIR | cut -f1) of intermediates"
+            cp -r test-data/intermediates/* "$ML4T_OUTPUT_DIR"/
+            echo "Seeded $(du -sh "$ML4T_OUTPUT_DIR" | cut -f1) of intermediates"
           fi
           # Ch20 outputs go to repo dir (get_chapter_dir doesn't redirect)
           if [ -d test-data/intermediates/ch20_synthesis/output ]; then
@@ -1488,12 +1631,24 @@ jobs:
           MATRIX_FILTER: ${{ matrix.filter }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           HF_HOME: /hf-cache
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           FILTER="${TEST_FILTER_INPUT:-$MATRIX_FILTER}"
           mkdir -p "$ML4T_OUTPUT_DIR"
           # actions/cache creates the path on a hit and leaves it absent on a miss,
           # and docker would then create the bind source itself as root-owned.
           mkdir -p "$HOME/.cache/huggingface"
+          # The cache is the braces and this is the belt: a cache miss, an ISO-week key
+          # rollover, or ch10 (which has no cache entry) still downloads, and an
+          # unauthenticated download is rate limited per IP across a shared runner pool.
+          # Passed only when the secret exists, so the container never sees HF_TOKEN=""
+          # and huggingface_hub is not asked to interpret an empty credential.
+          hf_auth=()
+          if [ -n "${HF_TOKEN:-}" ]; then
+            hf_auth=(-e HF_TOKEN)
+          else
+            echo "::notice::HF_TOKEN is not set; HuggingFace downloads in this job are anonymous and rate limited per IP."
+          fi
           docker run --rm \
             -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
             -v "$ML4T_OUTPUT_DIR:$ML4T_OUTPUT_DIR" \
@@ -1501,7 +1656,7 @@ jobs:
             -w "$GITHUB_WORKSPACE" \
             -e PYTHONPATH -e ML4T_DATA_PATH -e ML4T_OUTPUT_DIR \
             -e MPLBACKEND -e PLOTLY_RENDERER \
-            -e FRED_API_KEY -e HF_HOME \
+            -e FRED_API_KEY -e HF_HOME "${hf_auth[@]}" \
             "${{ steps.image.outputs.ref }}" \
             python -m pytest tests/test_chapter_notebooks.py \
               -v --tb=short \
@@ -1585,11 +1740,19 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
-          ref: main   # upstream went private ~2026-08: explicit ref skips the
-                      # default-branch API lookup (404 anon); the deploy key still fetches
+          ref: ci
           path: test-data
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
+
+      - name: Record the fixture this job read
+        if: steps.reach.outputs.have_key
+        run: |
+          # tee, not a plain redirect: the summary is where a reader looks, and the log is
+          # where this is greppable and where a broken command would be visible at all. A
+          # step whose whole output goes somewhere no API exposes cannot be checked.
+          printf '%s\n' "test-data $(git -C test-data rev-parse HEAD)" \
+            "$(git -C test-data log -1 --format='%cs %s')" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Resolve the image this commit declares
         id: image
@@ -1618,10 +1781,10 @@ jobs:
       - name: Seed case study intermediates
         if: steps.reach.outputs.have_key
         run: |
-          mkdir -p $ML4T_OUTPUT_DIR
+          mkdir -p "$ML4T_OUTPUT_DIR"
           if [ -d test-data/intermediates ]; then
-            cp -r test-data/intermediates/* $ML4T_OUTPUT_DIR/
-            echo "Seeded $(du -sh $ML4T_OUTPUT_DIR | cut -f1) of intermediates"
+            cp -r test-data/intermediates/* "$ML4T_OUTPUT_DIR"/
+            echo "Seeded $(du -sh "$ML4T_OUTPUT_DIR" | cut -f1) of intermediates"
           fi
 
       - name: Run pipeline (${{ matrix.case-study }})
@@ -1715,11 +1878,19 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
-          ref: main   # upstream went private ~2026-08: explicit ref skips the
-                      # default-branch API lookup (404 anon); the deploy key still fetches
+          ref: ci
           path: test-data
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
+
+      - name: Record the fixture this job read
+        if: steps.reach.outputs.have_key
+        run: |
+          # tee, not a plain redirect: the summary is where a reader looks, and the log is
+          # where this is greppable and where a broken command would be visible at all. A
+          # step whose whole output goes somewhere no API exposes cannot be checked.
+          printf '%s\n' "test-data $(git -C test-data rev-parse HEAD)" \
+            "$(git -C test-data log -1 --format='%cs %s')" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Run py312 notebooks
         if: steps.reach.outputs.have_key
@@ -1811,11 +1982,19 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
-          ref: main   # upstream went private ~2026-08: explicit ref skips the
-                      # default-branch API lookup (404 anon); the deploy key still fetches
+          ref: ci
           path: test-data
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
+
+      - name: Record the fixture this job read
+        if: steps.reach.outputs.have_key
+        run: |
+          # tee, not a plain redirect: the summary is where a reader looks, and the log is
+          # where this is greppable and where a broken command would be visible at all. A
+          # step whose whole output goes somewhere no API exposes cannot be checked.
+          printf '%s\n' "test-data $(git -C test-data rev-parse HEAD)" \
+            "$(git -C test-data log -1 --format='%cs %s')" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Resolve the image this commit declares
         id: image
@@ -1996,11 +2175,19 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
-          ref: main   # upstream went private ~2026-08: explicit ref skips the
-                      # default-branch API lookup (404 anon); the deploy key still fetches
+          ref: ci
           path: test-data
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
+
+      - name: Record the fixture this job read
+        if: steps.reach.outputs.have_key
+        run: |
+          # tee, not a plain redirect: the summary is where a reader looks, and the log is
+          # where this is greppable and where a broken command would be visible at all. A
+          # step whose whole output goes somewhere no API exposes cannot be checked.
+          printf '%s\n' "test-data $(git -C test-data rev-parse HEAD)" \
+            "$(git -C test-data log -1 --format='%cs %s')" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Run Ch02 database benchmark notebooks
         if: steps.reach.outputs.have_key

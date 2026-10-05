@@ -51,11 +51,10 @@ silently reuse a partial state because the result would be misleading
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from .specs import backtest_hash_from_parts, canonical_json, training_hash_from_spec
+from .specs import backtest_hash_from_parts, training_hash_from_spec
 from .store import (
     _backtest_dir,
     _case_dir,
@@ -66,7 +65,27 @@ from .store import (
 
 @dataclass(frozen=True)
 class PredictionCoverage:
-    """Exact expected-versus-actual prediction coverage evidence."""
+    """Exact expected-versus-actual prediction coverage evidence.
+
+    ``expected`` is the family's own target. ``_prepare_expected_keys`` builds it from the
+    fold inputs the adapter prepared, after the model's own eligibility filtering, so
+    ``complete`` here means "this run produced what it set out to produce". It does not and
+    cannot mean "this run covered the declared universe": the declared universe never enters
+    the comparison. A sequence model that narrows its own target scores ``complete`` here and
+    50.9% on :func:`notebook_contracts.measure_prediction_cross_sections`, from the same
+    predictions - measured on ``sp500_equity_option_analytics``, where all 140 members ruled
+    inadmissible carry a row here reading ``complete`` with ``n_missing = 0``.
+
+    ``status`` is stored, but a stored row can only ever read ``complete``: registration
+    raises on a partial evaluation and ``allow_partial`` defaults to False everywhere in
+    production, so the non-complete evaluations are refused before the row is written.
+    Readers should test the counts rather than the verdict, which is what
+    :func:`notebook_contracts.incompletely_registered_predictions` does - though on the
+    corpus as it stands that is a change of what is read and not of what can be seen. Every
+    count and digest here is computed against the same ``expected_keys``, so they agree with
+    ``status`` on all 6,480 rows today; they can disagree with it only on a row written by
+    something that stores a shortfall instead of refusing it.
+    """
 
     expected_key_digest: str
     actual_key_digest: str
@@ -224,7 +243,7 @@ def require_comparable_key_digests(digests, *, what: str, expected_keys=None) ->
 
     Two digests taken under different renderings are unequal whatever their key sets, and
     nothing about the inequality says so - which is how a rendering change turns into a
-    silent mis-grouping rather than an error (ml4t/agent-workspace#1065). A consumer that
+    silent mis-grouping rather than an error. A consumer that
     groups predictions by their eligibility digest reports more distinct contracts than
     exist and tells a reader that two checkpoints scored on identical rows are not
     comparable.
@@ -571,7 +590,7 @@ def backtest_run_status(
             # A NULL sharpe means "no metric pass has run here" everywhere except one
             # case: a path the engine stopped at ruin registers every ranking metric as
             # NULL on purpose, so that nothing sorts a bankrupt account against a solvent
-            # one (ml4t/agent-workspace#920). Reading that as incomplete would re-run the
+            # one. Reading that as incomplete would re-run the
             # backtest on every pass and never converge, so `ruin` is what separates
             # them. `ruin` is absent from a registry written before that column existed,
             # in which case a NULL sharpe still means unmeasured.

@@ -21,10 +21,8 @@ import importlib.metadata
 import json
 import os
 import platform
-import subprocess
 import time
 import uuid
-import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,7 +46,7 @@ from case_studies.research.models import ModelRun
 from case_studies.utils.artifact_digest import value_digest
 from case_studies.utils.folds import fold_seed
 from case_studies.utils.registry import clear_prediction_sets, compute_fold_metrics_from_predictions
-from case_studies.utils.runtime import cpu_seconds
+from case_studies.utils.runtime import cpu_seconds, source_commit
 
 if TYPE_CHECKING:
     from case_studies.research.workspace import Study
@@ -123,15 +121,7 @@ def _tabm_runtime_identity() -> dict[str, str]:
 
 
 def _tabm_runtime_provenance(study: Study, *, notebook: str | None = None) -> dict[str, Any]:
-    try:
-        commit = subprocess.check_output(
-            ["git", "-C", str(study.release_root), "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        commit = "unknown"
+    commit = source_commit(study.release_root)
     record: dict[str, Any] = {
         "entry_point": "case_studies.utils.tabular_dl",
         "packages": _tabm_runtime_identity(),
@@ -742,11 +732,18 @@ def _cached_research_run(study: Study, spec: dict[str, Any], context: TabMResear
         return None
     diagnostics = training.root / "run_log" / "training" / training.hash / "diagnostics"
     required = {
-        "all_predictions.parquet",
         "learning_curves.parquet",
         "result.json",
         "training_log.parquet",
     }
+    # `all_predictions.parquet` is the sweep's every-epoch, every-fold dump. Nothing
+    # below reads it - only `best_epoch_predictions.parquet` and `result.json` are
+    # used - so it was required for its readability alone. That cost 3.8 GB in one
+    # case study, which is what put the v3.1 reader bundles past GitHub's release
+    # asset limit, so the bundles ship without it and a run that lacks it stays
+    # reusable. It is still verified when it is there, because a run that carries a
+    # corrupt one is a run that did not finish writing.
+    optional = {"all_predictions.parquet"}
     present = {path.name for path in diagnostics.iterdir()} if diagnostics.is_dir() else set()
     # `best_epoch_predictions.parquet` was written as `predictions.parquet` until 2026-09-01, and
     # every cached run from before then carries the old name. Accepting either keeps those runs
@@ -763,7 +760,7 @@ def _cached_research_run(study: Study, spec: dict[str, Any], context: TabMResear
     if not diagnostics.is_dir() or required - present or best_epoch is None:
         return None
     try:
-        for name in (required - {"result.json"}) | {best_epoch}:
+        for name in ((required | (optional & present)) - {"result.json"}) | {best_epoch}:
             pl.read_parquet(diagnostics / name)
         selected = pl.read_parquet(diagnostics / best_epoch)
         if "model_id" not in selected.columns or {"config", "epoch"} & set(selected.columns):

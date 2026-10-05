@@ -96,6 +96,7 @@ import json
 import re
 import sqlite3
 import sys
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -739,7 +740,7 @@ def _undeclared_heads(case_study: str, registry: Path, notebooks: list[Path]) ->
             if len(attributed) == 1:
                 notebook_name, where = attributed[0], f"{attributed[0]} freezes it"
             else:
-                notebook_name = "-"
+                notebook_name = _UNATTRIBUTED
                 where = (
                     f"frozen by one of {attributed}"
                     if attributed
@@ -951,6 +952,115 @@ def _default_artifacts_root() -> Path:
     return Path.home() / "ml4t" / "artifacts" / "case_studies"
 
 
+def undeclared_fix(finding: Finding) -> str:
+    """How to declare an undeclared generation, for a notebook that has already run.
+
+    The launch-time form, not the source edit. Editing the notebook's SUPERSEDES_* mapping
+    declares the same thing, but every freezing notebook that has run is stamped, so the
+    edit returns STALE and owes a full re-render - costed at 44.15 h across the five
+    `us_equities_panel` notebooks that freeze the twelve live generations
+    (ml4t/agent-workspace#1175).
+
+    `:json=` and not `-p`. Papermill's `-p` is scalar-only: `_resolve_type` returns
+    True/False/None/int/float and otherwise the bare string, so `-p SUPERSEDES_SETS
+    '{"x": "live"}'` injects a str and `SUPERSEDES_SETS.get(...)` raises AttributeError at
+    the freeze, after the fit - strictly worse than the re-render it was meant to avoid.
+    `nb-run.sh`'s `KEY:json=VALUE` passes a one-key YAML document (`papermill -y`), which
+    arrives as a mapping. The parameter is on `notebook_provenance.PRODUCTION_SAFE_PARAMETERS`,
+    so a run carrying it still publishes rather than going to a scratch copy.
+    """
+    declaration = json.dumps({finding.label: finding.remedy})
+    return (
+        f"fix: pass {finding.parameter}:json='{declaration}' to nb-run.sh when you launch "
+        f"{finding.notebook.removesuffix('.py')}, adding it to any parameters the launch "
+        "already carries. Editing the notebook's SUPERSEDES_* mapping declares the same "
+        "thing, but the paired .ipynb is stamped, so the edit returns STALE and owes a "
+        "full re-render; only edit the source for a notebook that has not run yet."
+    )
+
+
+# What `_undeclared_heads` records when it cannot attribute a generation to a notebook.
+_UNATTRIBUTED = "-"
+
+
+def launch_parameters(notebook_findings: Sequence[Finding]) -> list[str]:
+    """Every parameter ONE launch of one notebook needs, spelled as `nb-run.sh` takes them.
+
+    Per-finding fix lines are wrong for any notebook that owes more than one entry, and
+    most that owe any owe two. Papermill injects a parameter by REPLACING the notebook's
+    binding, so a launch carrying `SUPERSEDES_SETS:json='{"a": "live"}'` drops every other
+    key the notebook declared, and each of those becomes undeclared - refused at the same
+    freeze the fix was meant to clear, after the same fit.
+
+    Measured against `us_equities_panel` on 2026-09-14: `07_gbm` owes six `SUPERSEDES_SETS`
+    entries (two behind, four undeclared) plus the scalar `SUPERSEDES_POPULATION`, and
+    `08_tabular_dl`, `09_dl_nlinear`, `10_dl_lstm`, `13a_pca` and `13b_ipca` owe two each.
+    Following the one-key lines literally leaves every one of them carrying a single key.
+
+    A mapping carries every key the notebook declares, not only the refused ones, for the
+    same reason. `"live"` is the right value for a key that is already current too: it
+    resolves to the tip, which is what that key already names.
+
+    `SUPERSEDES_CAUSAL` is excluded. `causal_supersedes` offers a declaration only when it
+    is a current causal identity, so the sentinel is never one and is always withheld.
+    """
+    by_parameter: dict[str, list[Finding]] = {}
+    for finding in notebook_findings:
+        if finding.parameter == _CAUSAL_NAME or finding.status in {"unresolved", "no-registry"}:
+            continue
+        by_parameter.setdefault(finding.parameter, []).append(finding)
+    parameters = []
+    for parameter, group in sorted(by_parameter.items()):
+        labelled = sorted({f.label for f in group if f.label})
+        if labelled:
+            mapping = json.dumps({label: SUPERSEDES_LIVE for label in labelled})
+            parameters.append(f"{parameter}:json='{mapping}'")
+        else:
+            parameters.append(f"{parameter}={SUPERSEDES_LIVE}")
+    return parameters
+
+
+def launch_line(case_study: str, notebook: str, parameters: Sequence[str]) -> str:
+    return f"  nb-run.sh {case_study} {notebook.removesuffix('.py')} " + " ".join(parameters)
+
+
+def _print_launch_lines(findings: Sequence[Finding], stream) -> None:
+    """One runnable command per notebook that owes anything, after the per-finding detail.
+
+    The per-finding lines say what is wrong with one entry. This says what to type, and it
+    is not the concatenation of those lines: a notebook owing several entries needs them in
+    ONE mapping, because papermill replaces the notebook's binding rather than merging into
+    it. `launch_parameters` explains the measurement.
+    """
+    owing: dict[tuple[str, str], list[Finding]] = {}
+    for finding in findings:
+        if finding.notebook == _UNATTRIBUTED:
+            # `_undeclared_heads` writes this when it cannot say which notebook freezes a
+            # generation. There is no launch to name, and pooling such findings under one
+            # command would put entries from different notebooks in one mapping. Their
+            # per-finding detail still prints; only the command is withheld.
+            continue
+        owing.setdefault((finding.case_study, finding.notebook), []).append(finding)
+    lines = []
+    for (case_study, notebook), group in sorted(owing.items()):
+        if not any(f.refused_at_the_freeze or f.status == "undeclared" for f in group):
+            continue
+        parameters = launch_parameters(group)
+        if parameters:
+            lines.append(launch_line(case_study, notebook, parameters))
+    if not lines:
+        return
+    print(
+        "\nThe launch each of these needs. Every entry a notebook declares is in its "
+        "mapping, not only the refused ones: papermill REPLACES the binding rather than "
+        "merging into it, so a mapping carrying one key makes every other key undeclared "
+        "and refused at the same freeze.\n",
+        file=stream,
+    )
+    for line in lines:
+        print(line, file=stream)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--case-study", default=None, help="check one instead of all")
@@ -1065,8 +1175,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  {finding.case_study}: {finding.label}\n"
                 f"      {finding.detail}\n"
-                f'      fix: declare "{finding.label}": "{finding.remedy}" in the freezing '
-                "notebook's SUPERSEDES_* mapping, in the worktree you are about to launch",
+                f"      {undeclared_fix(finding)}",
                 file=sys.stderr,
             )
 
@@ -1079,6 +1188,23 @@ def main(argv: list[str] | None = None) -> int:
             f"      {finding.detail}",
             file=sys.stderr,
         )
+
+    # Printed before the first early return, so every path that refuses a run also says
+    # what to type. `--require-declarations` returns two lines down and used to return
+    # without it, which is the path that most needs it: it is the one that stops a chain.
+    # The refused-literal block below prints them last, where they read best, but it is
+    # reached only when there are refused literals and `--allow-stale-supersedes` was not
+    # passed - and `--require-declarations` returns above it. Every other path that owes a
+    # command prints one here instead, including the undeclared-only warning, which refuses
+    # nothing and is exactly when a reader can act on it cheaply.
+    returns_above_the_stale_block = bool(undeclared) and args.require_declarations
+    stale_block_prints_them = (
+        bool(stale) and not args.allow_stale_supersedes and not returns_above_the_stale_block
+    )
+    launch_printed = False
+    if (undeclared or stale) and not stale_block_prints_them:
+        _print_launch_lines(findings, sys.stderr)
+        launch_printed = True
 
     if undeclared and args.require_declarations:
         print(
@@ -1141,6 +1267,8 @@ def main(argv: list[str] | None = None) -> int:
                 "above.",
                 file=sys.stderr,
             )
+        if not launch_printed:
+            _print_launch_lines(findings, sys.stderr)
         print(
             "\nFix it now - you are about to pay for the run that re-renders the notebook "
             "you have to clear. If you know this run's membership is unchanged, so the "

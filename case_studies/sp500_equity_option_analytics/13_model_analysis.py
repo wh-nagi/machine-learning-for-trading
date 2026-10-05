@@ -69,7 +69,6 @@
 """Compare model families for the S&P 500 equity and option case study."""
 
 import sqlite3
-import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -108,9 +107,7 @@ from case_studies.utils.notebook_contracts import (
 )
 from case_studies.utils.notebook_render import conformal_coverage_diagnostic
 from utils.paths import get_case_study_dir
-from utils.style import COLORS, FIGSIZE
-
-warnings.filterwarnings("ignore")
+from utils.style import COLORS, FIGSIZE, show_with_alt
 
 # %% tags=["parameters"]
 CASE_STUDY = "sp500_equity_option_analytics"
@@ -152,11 +149,16 @@ POPULATIONS = {model: f"{CASE_STUDY}-{model}-validation-v1" for model in POPULAT
 # in every clean clone and every CI run. So canonical opens `Study.at`: the read-only form, one
 # root, no activation.
 #
-# A preview run is the case where that rewrite is the point. It reads and reports on the rows a
-# smoke chain registered in its own workspace, which live under `.preview/<case>` and nowhere
-# else, so the analysis has to follow `ML4T_OUTPUT_DIR` there rather than answer from the
-# canonical directory. `activate()` links `config`, `labels` and `features` into that directory,
-# and `CASE_DIR` below is whichever of the two roots the tier resolved.
+# A run given a workspace is the case where that rewrite is the point. It reads and reports on
+# the rows registered in that workspace and nowhere else, so the analysis has to follow
+# `ML4T_OUTPUT_DIR` there rather than answer from the released directory. `activate()` links
+# `config`, `labels` and `features` into that directory, and `CASE_DIR` below is whichever root
+# the tier and the workspace resolved.
+#
+# `WORKSPACE` is read at both tiers. Read on the preview branch only, it left a canonical run
+# that passed one reporting on the published registry while its caller believed it was reading
+# the workspace it asked for - the read-side half of #1100. A preview still requires a
+# workspace, because a preview has nowhere else of its own.
 #
 # What a preview cannot have is a published population: `_refuse_preview_activation` stops a
 # reduced run from creating one, by design. The resolution below already distinguishes that from
@@ -164,13 +166,13 @@ POPULATIONS = {model: f"{CASE_STUDY}-{model}-validation-v1" for model in POPULAT
 # needs no branch of its own here - it takes the same path as a fixture or a clean clone.
 
 # %%
-if EXECUTION_TIER == "preview":
-    if not WORKSPACE:
-        raise ValueError("preview execution requires WORKSPACE")
+if EXECUTION_TIER == "preview" and not WORKSPACE:
+    raise ValueError("preview execution requires WORKSPACE")
+if WORKSPACE or EXECUTION_TIER == "preview":
     study = open_study(
         CASE_STUDY,
-        execution_tier="preview",
-        workspace=WORKSPACE,
+        execution_tier=EXECUTION_TIER,
+        workspace=WORKSPACE or None,
         entry_point="13_model_analysis",
     )
     CASE_DIR = get_case_study_dir(CASE_STUDY)
@@ -1323,7 +1325,7 @@ if "pca" in lf_extras:
     var_ratios = [e["explained_variance_ratio"] for e in lf_extras["pca"]]
     mean_var = np.mean(var_ratios, axis=0)
 
-    fig, axes = plt.subplots(1, 2, figsize=FIGSIZE["dual_h_tall"])
+    fig, axes = plt.subplots(1, 2, figsize=FIGSIZE["dual_h_tall"], layout="tight")
     axes[0].bar(range(1, len(mean_var) + 1), mean_var, color=COLORS["blue"])
     axes[0].set_xlabel("Component")
     axes[0].set_ylabel("Variance Explained")
@@ -1341,7 +1343,13 @@ if "pca" in lf_extras:
         fontweight="semibold",
     )
     fig.tight_layout(rect=(0, 0, 1, 0.92))
-    fig.show()
+    show_with_alt(
+        fig,
+        "Two panels. Left: a bar per retained principal component, height the share of "
+        "validation variance that component explains, averaged over folds. Right: the same "
+        "shares accumulated left to right as a line with a marker per component, against a "
+        "dashed reference line at one half.",
+    )
 
 # %% [markdown]
 # **Interpretation**: The scree plot shows how variance concentrates
@@ -1384,7 +1392,7 @@ if "ipca" in lf_extras:
         n_top = min(10, n_chars)
         panel_count = min(3, n_factors)
         size_key = {1: "single_tall", 2: "dual_h_tall", 3: "triple_h_tall"}[panel_count]
-        fig, axes = plt.subplots(1, panel_count, figsize=FIGSIZE[size_key])
+        fig, axes = plt.subplots(1, panel_count, figsize=FIGSIZE[size_key], layout="tight")
         if panel_count == 1:
             axes = [axes]
         for k, ax in enumerate(axes):
@@ -1400,7 +1408,12 @@ if "ipca" in lf_extras:
             ax.invert_yaxis()
         fig.suptitle("IPCA: Top Characteristics per Factor")
         fig.tight_layout()
-        fig.show()
+        show_with_alt(
+            fig,
+            "One horizontal bar panel per IPCA factor. Each panel lists the characteristics "
+            "with the largest absolute loading on that factor, longest at the top, drawn blue "
+            "where the loading is positive and red where it is negative.",
+        )
 
 # %% [markdown]
 # **Interpretation**: The $\Gamma$ matrix reveals which of the 48
@@ -1432,7 +1445,7 @@ for model_name in ["cae", "sae"]:
             loss_curves.append((fold["fold_id"], epochs, [losses[str(e)] for e in epochs]))
     if not loss_curves:
         continue
-    fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+    fig, ax = plt.subplots(figsize=FIGSIZE["single"], layout="tight")
     for fold_id, epochs, values in loss_curves:
         ax.plot(epochs, values, alpha=0.6, label=f"Fold {fold_id}")
     ax.set_xlabel("Epoch")
@@ -1440,7 +1453,11 @@ for model_name in ["cae", "sae"]:
     ax.set_title(f"{model_name.upper()} loss converges across available folds", loc="left")
     ax.legend(loc="upper right")
     fig.tight_layout()
-    fig.show()
+    show_with_alt(
+        fig,
+        "One line per walk-forward fold, training loss on the vertical axis against epoch on "
+        "the horizontal, with a legend naming the folds.",
+    )
 
 # %% [markdown]
 # **Interpretation**: The loss curves show convergence behavior for the
@@ -1495,6 +1512,9 @@ import sqlite3
 
 from case_studies.utils.registry.store import IDENTITY_VERSION as CAUSAL_IDENTITY_VERSION
 from case_studies.utils.registry.store import current_causal_identities
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
+
+apply_notebook_warning_policy()
 
 _db_path = CASE_DIR / "run_log" / "registry.db"
 causal_rows = []

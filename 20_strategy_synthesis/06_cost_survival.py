@@ -62,8 +62,6 @@ MAX_CASE_STUDIES = 0
 
 # %%
 CS_LIST = CASE_STUDY_IDS[:MAX_CASE_STUDIES] if MAX_CASE_STUDIES else CASE_STUDY_IDS
-DEFERRED_V31_CASE_STUDIES = {"nasdaq100_microstructure"}
-ACTIVE_CS_LIST = [cs for cs in CS_LIST if cs not in DEFERRED_V31_CASE_STUDIES]
 
 # %% [markdown]
 # ## Load Cost Sweep Results from Registry
@@ -74,20 +72,29 @@ ACTIVE_CS_LIST = [cs for cs in CS_LIST if cs not in DEFERRED_V31_CASE_STUDIES]
 # the signal, allocation, and risk-overlay stages --
 # so the breakeven measured here is the cost survival of the strategy the
 # chapter actually deploys, not of whichever allocator happened to be best
-# at zero cost. NASDAQ-100 is excluded from the v3.0 cross-case cost surface:
-# its bounded active scope has no corrected cost grid for its selection, so that broad
-# regeneration is deferred to v3.1 rather than mixed with historical timing.
+# at zero cost.
+#
+# A case study can hold cost-sensitivity backtests and still draw no curve here, because
+# the sweep has to sit on the carrier's own training lineage *and* run the carrier's own
+# strategy. The loader reports which check dropped each one, printed below the load, so an
+# absence from the charts can be read rather than guessed at.
 
 # %%
-costs_df = load_carrier_cost_curves(ACTIVE_CS_LIST)
-print("Deferred to v3.1: NASDAQ-100 timing-corrected broad carrier cost grid")
+loaded = load_carrier_cost_curves(CS_LIST)
+costs_df = loaded.curves
+_exclusions = loaded.exclusion_lines()
 
 if costs_df.is_empty():
+    # The reasons go into the refusal rather than after it. Every case study being excluded is
+    # the state that most needs them - a clean clone with no registries reaches it - and the
+    # loader has already established each one.
     msg = "No Ch18 cost-sensitivity backtests found for any deployed carrier"
-    raise RuntimeError(msg)
+    raise RuntimeError("\n".join([msg, *_exclusions]) if _exclusions else msg)
 
 n_cs = costs_df["case_study"].n_unique()
 print(f"Loaded {len(costs_df)} carrier cost-sweep entries across {n_cs} case studies")
+for _line in _exclusions:
+    print(_line)
 costs_df.head(5)
 
 # %% [markdown]
@@ -306,7 +313,6 @@ for bar, row in zip(bars, summary.iter_rows(named=True), strict=False):
 # Headroom so the breakeven annotation on the widest bar (FX) is not clipped.
 ax.set_xlim(right=max(summary["drag_pct"]) * 1.28)
 
-fig.tight_layout()
 show_with_alt(
     fig,
     "Horizontal bars giving the percentage of gross Sharpe consumed by each case "
@@ -347,7 +353,6 @@ ax.set_title("Breakeven Cost Thresholds — Higher Is More Robust")
 legend_handles = [Patch(facecolor=freq_colors[f], label=f) for f in freq_order if f in freq_colors]
 ax.legend(handles=legend_handles, loc="lower right", title="Cadence")
 
-fig.tight_layout()
 show_with_alt(
     fig,
     "Horizontal bars of the breakeven per-leg cost for each case study, ordered "
@@ -401,7 +406,6 @@ for cs_id in best_alloc_map:
     if _c is not None:
         ax.axvline(_c, color="gray", alpha=0.25, linewidth=0.8, linestyle=":")
 
-fig.tight_layout()
 show_with_alt(
     fig,
     "Line chart of Sharpe against per-leg cost in basis points, one line per "
@@ -470,24 +474,21 @@ display(
 # The S&P 500 Options case study was validated using executable-label
 # backtesting, pricing straddle entries and exits at actual bid/ask quotes rather
 # than at an assumed bps cost. That case study has no selected configuration cost sweep, so it
-# does not appear in any table above; the figures below are quoted from its own
-# evaluation and are not computed here.
+# does not appear in any table above.
 #
-# Its own evaluation carries the numbers; the shape of them is what belongs here. The median
-# round-trip spread on those straddles is a large double-digit percentage of the premium, and
-# every executable Sharpe in the sweep is negative. Decomposing one prediction across three
-# labels separates where that goes: priced at the mid and unhedged the Sharpe is strongly
-# positive, delta-hedging at the mid takes most of it, and pricing the same trades at the quotes
-# a desk would actually get turns it negative. Ranking on signal and spread jointly recovers
-# part of the gap and does not close it.
+# It is described here for the structure of its cost problem rather than for its numbers, which
+# its own evaluation and §18.8 carry. A single-name option's dominant execution cost is the
+# bid-ask spread on the premium rather than a commission proportional to notional, so the cost
+# scales with how wide the quote is and not with how much is traded. That is why its evaluation
+# decomposes one prediction across three labels - priced at the mid and unhedged, delta-hedged
+# at the mid, and priced at the quotes a desk would actually get - which separates the signal's
+# contribution from the execution's, and why ranking on signal and spread jointly is a different
+# strategy from ranking on signal alone rather than a refinement of it.
 #
-# The ML signal is real - the IC is positive - but the average spread impact per trade is many
-# times the per-period signal it has to pay for. A generic bps cost sweep
-# misrepresents this case study because the cost is predominantly the
-# bid-ask spread, not commission. The teaching point is that strategy
-# design must jointly optimize for signal quality and execution costs:
-# single-stock option spreads are the binding constraint, not model
-# quality.
+# A generic bps cost sweep misrepresents this case study for the same reason: it models a cost
+# that is proportional to notional. The teaching point is that strategy design has to optimize
+# for signal quality and execution cost together, because for this instrument the spread is what
+# the signal has to pay for.
 
 # %% [markdown]
 # ## Cadence–Frequency–Cost Regime
@@ -580,7 +581,6 @@ if not summary.is_empty():
         framealpha=0.9,
     )
 
-    fig.tight_layout()
     show_with_alt(
         fig,
         "Log-log scatter of breakeven cost against assumed relative turnover, one "
@@ -608,8 +608,8 @@ display(
             for r in _reg.iter_rows(named=True)
         )
         + ".\n\nThe cadences present here span a narrow part of the range the "
-        "chart is drawn for. The high-frequency corner is empty: NASDAQ-100 is "
-        "excluded pending a corrected carrier cost grid, and the other "
+        "chart is drawn for. The high-frequency corner is empty: NASDAQ-100's "
+        "cost sweep ran a different strategy from its carrier, and the other "
         "sub-daily case studies have no cost sweep. Nothing here tests whether "
         "turnover or signal strength sets the breakeven, because the case "
         "studies that would separate them are the ones missing."
@@ -639,10 +639,19 @@ display(
 #
 # ## Known Limitations
 #
-# - Only case studies with a selected configuration cost sweep appear. NASDAQ-100 is excluded by
-#   `DEFERRED_V31_CASE_STUDIES` pending a corrected cost grid, and the rest have
-#   no sweep because their registries are being rebuilt. The loaded count is
-#   printed at the top.
+# - Only case studies whose *carrier* has a cost sweep appear. The loaded count and
+#   one line per absent case study are printed at the top, so which check dropped a
+#   case study is read off the run rather than reconstructed by hand. A case study can
+#   hold cost-sensitivity backtests and still be absent, because the sweep has to sit
+#   on the deployed carrier's own training lineage and run the carrier's own strategy.
+#   Three are absent and each fails a different check. ETFs' carrier lineage carries no
+#   cost sweep at all. S&P 500 Options has eight cost rows on its carrier's lineage,
+#   all of them an `equal_weight_top_k` + `score_weighted` series rather than the
+#   carrier. NASDAQ-100 has 24 on its carrier's lineage, all of them `equal_weight_top_k`
+#   - the instrument its pass-1 ranking uses - while its carrier is a
+#   `slot_persistent_signal_exit` strategy. All three absences are properties of what
+#   was swept rather than of this chapter: a carrier with no cost sweep of its own has
+#   no cost curve to draw.
 # - The sweep applies one proportional per-leg cost to every trade. Real costs
 #   vary with size, with the instrument, and with the state of the book, and the
 #   spread realism section is where that assumption is checked rather than

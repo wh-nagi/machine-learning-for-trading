@@ -7,6 +7,7 @@ import importlib.util
 import sqlite3
 import stat
 import tarfile
+import urllib.error
 from contextlib import closing
 from pathlib import Path
 
@@ -165,3 +166,145 @@ def test_a_bundle_shipping_an_uncheckpointed_log_is_refused(tmp_path: Path) -> N
         )
 
     assert (existing / "sentinel").read_text() == "keep"
+
+
+def _split(path: Path, size: int) -> list[Path]:
+    """Split a file the way the release upload does, into .part00, .part01, ..."""
+    data = path.read_bytes()
+    parts = []
+    for index in range(0, len(data), size):
+        part = path.with_name(f"{path.name}.part{index // size:02d}")
+        part.write_bytes(data[index : index + size])
+        parts.append(part)
+    return parts
+
+
+def test_a_split_bundle_reassembles_into_the_byte_identical_tarball(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle over GitHub's 2 GB asset limit ships in parts, and must survive the trip."""
+    archive = _build_bundle(tmp_path)
+    expected = archive.read_bytes()
+    parts = _split(archive, max(1, archive.stat().st_size // 3))
+    assert len(parts) > 2, "the fixture must actually split to test reassembly"
+
+    def fake_download(url: str, dest: Path, desc: str) -> bool:
+        source = archive.parent / Path(url).name
+        if not source.is_file():
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(source.read_bytes())
+        return True
+
+    monkeypatch.setattr(download_artifacts, "download_file", fake_download)
+    monkeypatch.setattr(download_artifacts, "BASE_URL", str(archive.parent))
+
+    combined = tmp_path / "out" / "etfs.tar.gz"
+    assert download_artifacts._fetch_parts("etfs", len(parts), combined)
+    assert combined.read_bytes() == expected
+    assert _sha256(combined) == _sha256(archive)
+    # The parts are scratch and must not be left behind next to the tarball.
+    assert list(combined.parent.iterdir()) == [combined]
+
+
+def test_a_missing_part_fails_the_download_and_leaves_no_partial_tarball(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _build_bundle(tmp_path)
+    parts = _split(archive, max(1, archive.stat().st_size // 3))
+    parts[-1].unlink()
+
+    def fake_download(url: str, dest: Path, desc: str) -> bool:
+        source = archive.parent / Path(url).name
+        if not source.is_file():
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(source.read_bytes())
+        return True
+
+    monkeypatch.setattr(download_artifacts, "download_file", fake_download)
+    monkeypatch.setattr(download_artifacts, "BASE_URL", str(archive.parent))
+
+    combined = tmp_path / "out" / "etfs.tar.gz"
+    assert not download_artifacts._fetch_parts("etfs", len(parts), combined)
+    assert not combined.exists()
+    assert not list(combined.parent.iterdir())
+
+
+def test_a_held_back_case_study_is_fetched_from_the_release_that_still_has_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not every bundle is rebuilt in every release, and the URL has to follow the bundle."""
+    seen: list[str] = []
+
+    def record(url: str, dest: Path, desc: str) -> bool:
+        seen.append(url)
+        return False
+
+    held = "v3.0.0-artifacts"
+    assert held != download_artifacts.RELEASE_TAG
+    monkeypatch.setitem(download_artifacts.ARTIFACT_RELEASE, "crypto_perps_funding", held)
+    monkeypatch.setattr(download_artifacts, "download_file", record)
+    monkeypatch.setattr(download_artifacts, "REPO_ROOT", tmp_path)
+
+    assert not download_artifacts.download_case_study("etfs")
+    assert not download_artifacts.download_case_study("crypto_perps_funding")
+
+    assert seen[0].endswith(f"/{download_artifacts.RELEASE_TAG}/etfs.tar.gz")
+    assert seen[1].endswith(f"/{held}/crypto_perps_funding.tar.gz")
+
+
+def test_every_published_checksum_names_a_release_that_serves_it(tmp_path: Path) -> None:
+    """A part count or a checksum for a case study nobody can reach is a dead entry."""
+    for cs_id in download_artifacts.ARTIFACT_PARTS:
+        assert cs_id in download_artifacts.ARTIFACT_SHA256
+    for cs_id in download_artifacts.ARTIFACT_RELEASE:
+        assert cs_id in download_artifacts.ARTIFACT_SHA256
+    for cs_id in download_artifacts.ARTIFACT_SHA256:
+        assert cs_id in download_artifacts.CASE_STUDIES
+    # v3.1 serves every case study the script offers. Iterating ARTIFACT_RELEASE above proves
+    # nothing while it is empty, so state the condition that makes it empty: a case study the
+    # script lists with no checksum is one --cs would accept and then refuse to download.
+    assert set(download_artifacts.ARTIFACT_SHA256) == set(download_artifacts.CASE_STUDIES)
+
+
+def test_a_refused_fetch_falls_back_to_gh_against_the_release_that_holds_the_asset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An anonymous fetch of a private asset is refused, and the retry must not switch release."""
+    cs_id = "crypto_perps_funding"
+    held = "v3.0.0-artifacts"
+    assert held != download_artifacts.RELEASE_TAG
+    monkeypatch.setitem(download_artifacts.ARTIFACT_RELEASE, cs_id, held)
+    dest = tmp_path / f"{cs_id}.tar.gz"
+    calls: list[list[str]] = []
+
+    def refuse(request, *args, **kwargs):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        dest.write_bytes(b"payload")
+        return None
+
+    monkeypatch.setattr(download_artifacts, "_get_github_token", lambda: None)
+    monkeypatch.setattr(download_artifacts.urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(download_artifacts.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(download_artifacts.subprocess, "run", fake_run)
+
+    url = f"{download_artifacts._base_url(cs_id)}/{cs_id}.tar.gz"
+    assert download_artifacts.download_file(url, dest, cs_id)
+
+    argv = calls[0]
+    assert argv[:3] == ["gh", "release", "download"]
+    assert argv[3] == held
+
+
+def test_the_failure_hint_names_the_releases_that_were_read() -> None:
+    held = "v3.0.0-artifacts"
+    assert held != download_artifacts.RELEASE_TAG
+    one = download_artifacts.release_hint(download_artifacts.RELEASE_TAG)
+    both = download_artifacts.release_hint(download_artifacts.RELEASE_TAG, held)
+    assert download_artifacts.RELEASE_TAG in both and held in both
+    assert held not in one
+    assert "artifacts release (" in one and "artifacts releases (" in both

@@ -68,13 +68,13 @@ def _resolver_db(path: Path, *, backtest_hash: str) -> None:
                 backtest_hash TEXT PRIMARY KEY, prediction_hash TEXT, stage TEXT, spec_json TEXT
             );
             CREATE TABLE backtest_metrics (backtest_hash TEXT PRIMARY KEY, sharpe REAL);
-            CREATE TABLE fold_metrics (prediction_hash TEXT, ic REAL);
+            CREATE TABLE fold_metrics (prediction_hash TEXT, ic REAL, ic_std REAL);
             CREATE TABLE prediction_metrics (
                 prediction_hash TEXT PRIMARY KEY, ic_mean REAL, ic_n_days REAL
             );
             INSERT INTO training_runs VALUES ('train_us', 'owner_config', 'gbm', 'fwd_ret_1m', NULL);
             INSERT INTO prediction_sets VALUES ('pred_us', 'train_us', 'validation');
-            INSERT INTO fold_metrics VALUES ('pred_us', 0.02);
+            INSERT INTO fold_metrics (prediction_hash, ic) VALUES ('pred_us', 0.02);
             INSERT INTO prediction_metrics VALUES ('pred_us', 0.02, 250);
             """
         )
@@ -103,10 +103,7 @@ def test_carrier_pins_are_single_sourced_and_well_formed() -> None:
         )
 
     repo = Path(__file__).parents[1]
-    for relative in (
-        "20_strategy_synthesis/holdout.py",
-        "20_strategy_synthesis/01_aggregate_synthesis.py",
-    ):
+    for relative in ("20_strategy_synthesis/01_aggregate_synthesis.py",):
         tree = ast.parse((repo / relative).read_text())
         assignments = [
             node
@@ -156,51 +153,48 @@ def test_the_carrier_restriction_has_no_second_implementation() -> None:
 
 
 def test_the_selection_restrictions_are_declared_once() -> None:
-    """`holdout.py` must import each selection restriction, not declare its own copy.
+    """One declaration of each selection restriction in the whole tree.
 
-    `case_studies/utils/strategy_analysis.py` and `20_strategy_synthesis/holdout.py`
-    each used to declare `LABEL_RESTRICTIONS` and `UNIVERSE_RESTRICTIONS`, under a
-    "keep these in sync" comment where a mechanism should be. A comment is not a
-    mechanism: the same arrangement one directory over - `_CARRIER_PIN_PREDICATES`
-    hand-copying a carrier choice under a "keep in sync" note - had been out of sync
-    across a whole registry rebuild with nothing failing. A drift check was the earlier
-    answer here and it only ever asked whether two values agreed today; there is now one
-    value, and this asks that the second declaration has not come back.
+    `case_studies/utils/strategy_analysis.py` and the retired
+    `20_strategy_synthesis/holdout.py` each used to declare `LABEL_RESTRICTIONS` and
+    `UNIVERSE_RESTRICTIONS`, under a "keep these in sync" comment where a mechanism should
+    be. A comment is not a mechanism: the same arrangement one directory over -
+    `_CARRIER_PIN_PREDICATES` hand-copying a carrier choice under a "keep in sync" note -
+    had been out of sync across a whole registry rebuild with nothing failing.
 
-    Read by parsing rather than by importing, because `holdout.py`'s module scope reaches
-    lightgbm and torch, which this job does not install.
-    `tests/test_holdout_selection_is_single_sourced.py` asserts the runtime identity in
-    the job that does.
+    That earlier check read the two named files. `holdout.py` is deleted, so the question
+    is asked of every module instead, which is the property that was wanted all along: a
+    second copy anywhere is a restriction a case study declares and the holdout selection
+    does not read, and naming the file it may appear in is guessing where.
+
+    Read by parsing rather than by importing, because the property is a source-level one -
+    whether a module DECLARES the name or imports it - and an imported module cannot tell
+    those apart. Importing `01_aggregate_synthesis.py` would also run a notebook.
     """
-    tree = ast.parse(
-        (Path(__file__).parents[1] / "20_strategy_synthesis" / "holdout.py").read_text()
+    repo = Path(__file__).parents[1]
+    sources = sorted(
+        path
+        for root in ("case_studies", "20_strategy_synthesis", "utils", "tests")
+        for path in (repo / root).rglob("*.py")
     )
-    imported = {
-        alias.asname or alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        and node.module == "case_studies.utils.strategy_analysis"
-        for alias in node.names
-    }
+    assert sources, "found no modules to read; the search roots are wrong"
+
     for name in ("LABEL_RESTRICTIONS", "UNIVERSE_RESTRICTIONS"):
-        declared = [
-            node
-            for node in ast.walk(tree)
+        declaring = [
+            path.relative_to(repo).as_posix()
+            for path in sources
+            for node in ast.walk(ast.parse(path.read_text()))
             if isinstance(node, (ast.Assign, ast.AnnAssign))
             and any(
                 isinstance(target, ast.Name) and target.id == name
                 for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
             )
         ]
-        assert not declared, (
-            f"20_strategy_synthesis/holdout.py declares its own {name} again. One "
-            "declaration, in case_studies/utils/strategy_analysis.py, imported here - a "
-            "second copy is a restriction a case study declares and the holdout selector "
-            "does not read."
-        )
-        assert name in imported, (
-            f"20_strategy_synthesis/holdout.py neither declares nor imports {name}, so "
-            "whatever it applies to holdout selection is not what the case study declared."
+        assert declaring == ["case_studies/utils/strategy_analysis.py"], (
+            f"{name} is declared in {declaring}. One declaration, in "
+            "case_studies/utils/strategy_analysis.py, imported everywhere else - a second "
+            "copy is a restriction a case study declares and the selection that spends its "
+            "holdout does not read."
         )
 
 
@@ -307,3 +301,56 @@ def test_pbo_with_two_combinations_is_not_reportable() -> None:
         "status": "insufficient combinations (2 < 10)",
         "n_combinations": 2,
     }
+
+
+def test_declared_canonical_universe_is_pinned() -> None:
+    """A case study that declares a canonical universe must also pin rank-1 to it.
+
+    ``backtest.sweep.universe_filter`` says which universe a case study's sweep treats
+    as canonical, and several readers honour it: ``17_costs`` pools only runs carrying
+    it, ``20_strategy_analysis`` rebuilds derived tables off it. Rank-1 selection is the
+    one that decides what the case study reports, and it reads
+    ``UNIVERSE_RESTRICTIONS`` instead.
+
+    The two are separate by design - a case study may sweep one universe and still rank
+    across everything - but a declaration with no entry here is a rule nobody applies.
+    Both case studies that declare the key also register full-universe rows on purpose
+    (sp500_options for the Ch18 HTM cost cascade, nasdaq100_microstructure for the
+    full-versus-screened comparison), which is exactly the population that leaks into
+    rank-1 by raw Sharpe when the pin is absent.
+
+    Read from each ``setup.yaml`` rather than from a list typed here, so a tenth case
+    study declaring the key fails this rather than joining silently.
+    """
+    import yaml
+
+    from case_studies.utils.strategy_analysis import UNIVERSE_RESTRICTIONS
+
+    case_studies_dir = Path(__file__).parents[1] / "case_studies"
+    declared: dict[str, str] = {}
+    for setup_path in sorted(case_studies_dir.glob("*/config/setup.yaml")):
+        setup = yaml.safe_load(setup_path.read_text()) or {}
+        universe = ((setup.get("backtest") or {}).get("sweep") or {}).get("universe_filter")
+        # "full" and "none" name the unrestricted universe, which is not a restriction.
+        if universe and str(universe).lower() not in ("full", "none"):
+            declared[setup_path.parents[1].name] = str(universe)
+
+    assert declared, "no case study declares backtest.sweep.universe_filter; the fixture moved"
+
+    missing = sorted(name for name in declared if name not in UNIVERSE_RESTRICTIONS)
+    assert not missing, (
+        f"{missing} declare backtest.sweep.universe_filter and have no UNIVERSE_RESTRICTIONS "
+        "entry, so rank-1 selection ranks their full-universe rows beside the screened ones "
+        "by raw Sharpe and the declaration applies to nothing."
+    )
+
+    disagreeing = {
+        name: (value, UNIVERSE_RESTRICTIONS[name])
+        for name, value in declared.items()
+        if UNIVERSE_RESTRICTIONS[name] != value
+    }
+    assert not disagreeing, (
+        f"the declared canonical universe and the rank-1 pin disagree: {disagreeing}. "
+        "The pin decides what the case study reports and the declaration decides what its "
+        "sweep and cost pool read, so two values means two different strategies."
+    )

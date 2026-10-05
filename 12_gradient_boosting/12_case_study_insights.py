@@ -75,11 +75,13 @@ from case_studies.utils.analytics import (
     SHORT_NAMES,
 )
 from case_studies.utils.insight_chapter import (
+    SYMMETRY_TABLE_SCHEMA,
     collect_fold_ic_per_cs,
     collect_gbm_checkpoint_trajectories,
     collect_grid_per_cs,
     collect_multi_label_per_cs,
     collect_rank1_per_cs,
+    discover_symmetry_pairs,
     load_gbm_feature_importance,
     parse_gbm_config,
     plot_cross_cs_forest,
@@ -311,12 +313,12 @@ show_with_alt(
 # Aggregate: which loss achieves the highest of the three on each CS?
 loss_top_per_cs = (
     loss_best.sort("ic_mean_daily", descending=True, nulls_last=True)
-    .group_by("short_name")
+    .group_by("short_name", maintain_order=True)
     .first()
-    .group_by("loss")
+    .group_by("loss", maintain_order=True)
     .len()
     .rename({"len": "n_cs_with_highest_ic"})
-    .sort("n_cs_with_highest_ic", descending=True)
+    .sort(["n_cs_with_highest_ic", "loss"], descending=[True, False])
 )
 print(
     "Loss function achieving the highest IC per case study (count across regression-primary CSs):"
@@ -347,7 +349,7 @@ display(
 # %%
 depth_pivot = (
     grid_regression.filter(pl.col("leaves").is_not_null())
-    .group_by(["short_name", "leaves"])
+    .group_by(["short_name", "leaves"], maintain_order=True)
     .agg(pl.col("ic_mean_daily").max().alias("ic"))
     .sort(["short_name", "leaves"])
 )
@@ -390,7 +392,7 @@ show_with_alt(
 
 # %%
 depth_spread = (
-    depth_pivot.group_by("short_name")
+    depth_pivot.group_by("short_name", maintain_order=True)
     .agg(
         min_ic=pl.col("ic").min(),
         max_ic=pl.col("ic").max(),
@@ -436,7 +438,7 @@ print(
 # %%
 # Ordered by the iteration of each case study's peak IC, ties by peak magnitude.
 peak_table = (
-    ckpt_df.group_by("short_name")
+    ckpt_df.group_by("short_name", maintain_order=True)
     .agg(
         pl.col("iteration")
         .filter(pl.col("ic_mean") == pl.col("ic_mean").max())
@@ -510,7 +512,7 @@ display(
 # %%
 gbm_fold = collect_fold_ic_per_cs(gbm_rank1)
 gbm_fold_summary = (
-    gbm_fold.group_by(["case_study", "short_name"])
+    gbm_fold.group_by(["case_study", "short_name"], maintain_order=True)
     .agg(
         n_folds=pl.col("ic").count(),
         median=pl.col("ic").median(),
@@ -1043,13 +1045,25 @@ HORIZON_DAYS = {
 
 # %% [markdown]
 # Only panels with at least two mapped horizons enter the log-scale comparison.
+#
+# The sibling figure in Chapter 13 also drops cells whose scored folds cover only part of
+# the case study's modelling grid, because joining a partial-grid point to a full-grid one
+# on a shared IC axis reads as one quantity moving with horizon. `gbm_horizon` carries the
+# same `covers_fold_grid` column and this cell does not filter on it, because no gbm or
+# linear run can be partial: `us_equities_panel/12_dl_weekly` is the only notebook in the
+# corpus with a non-zero `MAX_FOLDS`, and it is a deep-learning notebook. Give any gbm or
+# linear notebook a fold reduction and this cell needs Chapter 13's retain-and-report
+# split before it is read again.
 
 # %%
 plot_horizon = gbm_horizon.with_columns(
     horizon_days=pl.col("label").replace_strict(HORIZON_DAYS, default=None).cast(pl.Float64),
 ).filter(pl.col("horizon_days").is_not_null())
 multi_cs = (
-    plot_horizon.group_by("short_name").len().filter(pl.col("len") >= 2)["short_name"].to_list()
+    plot_horizon.group_by("short_name", maintain_order=True)
+    .len()
+    .filter(pl.col("len") >= 2)["short_name"]
+    .to_list()
 )
 plot_horizon = plot_horizon.filter(pl.col("short_name").is_in(multi_cs))
 
@@ -1101,7 +1115,7 @@ if plot_horizon.height > 0:
 
 # %%
 horizon_ranges = (
-    plot_horizon.group_by("short_name")
+    plot_horizon.group_by("short_name", maintain_order=True)
     .agg(
         n_horizons=pl.len(),
         min_ic=pl.col("ic_mean_daily").min(),
@@ -1135,19 +1149,24 @@ display(
 #   score is also a useful *binary classifier*. Computed on the fly here
 #   from raw OOF predictions.
 #
-# Restricted to the registered binary-label pairs below. Ternary direction
-# labels (including NASDAQ-100 `fwd_dir_15m`, Crypto `fwd_dir_8h_3c`, and US
-# Firms `fwd_class_1m`) need a multiclass score and remain out of scope. This
-# mirrors Ch11 §6b for the linear family.
+# The pairs are discovered from the registry rather than listed here. A case study
+# qualifies when this family has registered validation predictions for a
+# `fwd_ret_<horizon>` label and for a `fwd_dir_<horizon>` or `fwd_class_<horizon>`
+# label at the same horizon, and the direction label's own surface is binary. A
+# ternary label needs a multiclass score and is out of scope, so it is skipped by
+# measuring its domain and naming it, not by being absent from a list: the previous
+# hand-written literal had lost `us_firm_characteristics` and reported a full count
+# of itself, and the comment that stood here called `fwd_class_1m` ternary when its
+# domain is {0, 1}. This mirrors Ch11 §6b for the linear family.
 
 # %%
-SYMMETRY_PAIRS: dict[str, list[tuple[str, str]]] = {
-    "crypto_perps_funding": [("fwd_ret_8h", "fwd_dir_8h")],
-    "sp500_equity_option_analytics": [
-        ("fwd_ret_5d", "fwd_dir_5d"),
-        ("fwd_ret_10d", "fwd_dir_10d"),
-    ],
-}
+SYMMETRY_PAIRS, SYMMETRY_SKIPS = discover_symmetry_pairs(CASE_STUDY_IDS, FAMILY)
+for line in SYMMETRY_SKIPS:
+    print(f"  skipped {line}")
+print(
+    f"{sum(len(pairs) for pairs in SYMMETRY_PAIRS.values())} matched label pairs across "
+    f"{len(SYMMETRY_PAIRS)} case studies"
+)
 
 
 # %% [markdown]
@@ -1227,6 +1246,7 @@ sym_rows = []
 for cs, pairs in SYMMETRY_PAIRS.items():
     for reg_lbl, dir_lbl in pairs:
         cls_ic = cls_lo = cls_hi = cls_t = cls_cfg = None
+        cls_auc = cls_auc_lo = cls_auc_hi = None
         cls_selected = direction_rank1.filter(
             (pl.col("case_study") == cs) & (pl.col("label") == dir_lbl)
         )
@@ -1237,6 +1257,13 @@ for cs, pairs in SYMMETRY_PAIRS.items():
             cls_hi = top.get("ic_ci_hi")
             cls_t = top.get("ic_t_hac")
             cls_cfg = top["config_name"]
+            # The classifier's AUC against its own direction label. It is the third
+            # column of the book's Table 12.4 and sits in the same prediction_metrics
+            # row as the IC above; until 2026-09-18 the selector did not read it, so
+            # this notebook published a table it could not reproduce from its own output.
+            cls_auc = top.get("auc_mean_daily")
+            cls_auc_lo = top.get("auc_ci_lo")
+            cls_auc_hi = top.get("auc_ci_hi")
         reg_selected = gbm_horizon.filter(
             (pl.col("case_study") == cs) & (pl.col("label") == reg_lbl)
         )
@@ -1255,6 +1282,9 @@ for cs, pairs in SYMMETRY_PAIRS.items():
                 "cls_score_ic_lo": cls_lo,
                 "cls_score_ic_hi": cls_hi,
                 "cls_score_ic_t": cls_t,
+                "cls_score_auc": cls_auc,
+                "cls_score_auc_lo": cls_auc_lo,
+                "cls_score_auc_hi": cls_auc_hi,
                 "reg_config": (b or {}).get("reg_config"),
                 "reg_score_auc": (b or {}).get("reg_score_auc"),
                 "n_b": (b or {}).get("n"),
@@ -1265,18 +1295,18 @@ for cs, pairs in SYMMETRY_PAIRS.items():
 # The combined table keeps both metric directions and their selected identities visible.
 
 # %%
-sym_df = pl.DataFrame(
-    sym_rows,
-    schema_overrides={
-        "cls_score_ic": pl.Float64,
-        "cls_score_ic_lo": pl.Float64,
-        "cls_score_ic_hi": pl.Float64,
-        "cls_score_ic_t": pl.Float64,
-        "reg_score_auc": pl.Float64,
-        "n_b": pl.Int64,
-    },
+
+# A full schema, not schema_overrides. Discovery can legitimately return nothing - every
+# declared pair skipped, or a registry with no classification runs for this family - and a
+# frame built from an empty list with partial overrides has no string columns at all, so
+# the selection below raises ColumnNotFoundError and the skip reasons this section exists
+# to print never reach the reader. An empty frame with the right columns renders as an
+# empty table, which is the correct answer.
+sym_df = pl.DataFrame(sym_rows, schema=SYMMETRY_TABLE_SCHEMA)
+print(
+    "Direction A (GBM classification score → IC), the classifier's own AUC, "
+    "and Direction B (GBM regression score → AUC):"
 )
-print("Direction A (GBM classification score → IC) and Direction B (GBM regression score → AUC):")
 sym_df.select(
     "short_name",
     "reg_label",
@@ -1285,10 +1315,19 @@ sym_df.select(
     pl.col("cls_score_ic_lo").round(4).alias("A_lo"),
     pl.col("cls_score_ic_hi").round(4).alias("A_hi"),
     pl.col("cls_score_ic_t").round(2).alias("A_t"),
+    pl.col("cls_score_auc").round(4).alias("native_auc"),
+    pl.col("cls_score_auc_lo").round(4).alias("native_lo"),
+    pl.col("cls_score_auc_hi").round(4).alias("native_hi"),
     pl.col("reg_score_auc").round(4).alias("B_auc"),
 )
 
 # %%
+if sym_df.is_empty():
+    raise RuntimeError(
+        "no declared regression/direction pair qualified, so there is nothing to compare. "
+        f"Skipped: {'; '.join(SYMMETRY_SKIPS) or 'nothing'}"
+    )
+
 fig, axes = plt.subplots(1, 2, figsize=(13, 4.0))
 labels_y = [f"{r['short_name']} · {r['dir_label']}" for r in sym_df.iter_rows(named=True)]
 y = np.arange(sym_df.height)
@@ -1334,6 +1373,15 @@ show_with_alt(
 # %%
 direction_a_positive = sym_df.filter(pl.col("cls_score_ic") > 0).height
 direction_b_valid = sym_df.filter(pl.col("reg_score_auc").is_not_null())
+native_valid = sym_df.filter(pl.col("cls_score_auc").is_not_null())
+native_clears = native_valid.filter(pl.col("cls_score_auc_lo") > 0.5).height
+# A count over the pairs that happen to be present is not a count over the corpus, so the
+# skipped candidates are named in the same sentence rather than left to the log above.
+skip_note = (
+    f", with {len(SYMMETRY_SKIPS)} candidate pair(s) skipped ({'; '.join(SYMMETRY_SKIPS)})"
+    if SYMMETRY_SKIPS
+    else ", with no candidate pair skipped"
+)
 max_auc_distance = (
     float((direction_b_valid["reg_score_auc"] - 0.5).abs().max())
     if not direction_b_valid.is_empty()
@@ -1342,8 +1390,11 @@ max_auc_distance = (
 display(
     Markdown(
         f"**Computed metric symmetry.** Direction A is positive in {direction_a_positive} of "
-        f"{sym_df.height} matched cells. Direction B is available in {direction_b_valid.height} "
-        f"cells, with maximum absolute distance from chance of {max_auc_distance:.4f}."
+        f"{sym_df.height} matched cells, discovered from the registry rather than declared"
+        f"{skip_note}. The classifier's own AUC clears one half on "
+        f"{native_clears} of {native_valid.height} cells. Direction B is available in "
+        f"{direction_b_valid.height} cells, with maximum absolute distance from chance of "
+        f"{max_auc_distance:.4f}."
     )
 )
 
@@ -1398,7 +1449,7 @@ def _load_linear_importance(cs: str, training_hash: str) -> dict[str, float]:
         return {}
     return dict(
         pl.DataFrame(rows)
-        .group_by("feature")
+        .group_by("feature", maintain_order=True)
         .agg(pl.col("abs_coef").mean())
         .filter(pl.col("abs_coef") > ZERO_TOL)
         .sort("abs_coef", descending=True)
@@ -1416,7 +1467,9 @@ def _feature_ranks(
     linear_imp: dict[str, float],
 ) -> tuple[dict[str, int], dict[str, int]]:
     gbm_imp = dict(
-        gbm_imp_df.group_by("feature").agg(pl.col("importance").mean().alias("imp")).iter_rows()
+        gbm_imp_df.group_by("feature", maintain_order=True)
+        .agg(pl.col("importance").mean().alias("imp"))
+        .iter_rows()
     )
     # Ties break by feature name rather than by set iteration order: gain importances tie
     # readily, and with per-process string hashing the same registries produced different
@@ -1524,11 +1577,16 @@ else:
     if len(rank_shift_summary) == 1:
         axes = [axes]
     for ax, entry in zip(axes, rank_shift_summary, strict=False):
-        s = entry["_shifts"].sort("rank_shift", descending=True)
+        # `rank_shift` is an integer and features tie on it readily, so head/tail would
+        # otherwise pick an arbitrary member of a tied block: which feature names the
+        # panel draws would change between executions on identical data.
+        s = entry["_shifts"].sort(["rank_shift", "feature"], descending=[True, False])
         n_show = min(15, s.height)
         top_promotions = s.head(n_show // 2)
         bot_promotions = s.tail(n_show - top_promotions.height)
-        plot_set = pl.concat([top_promotions, bot_promotions]).sort("rank_shift", descending=False)
+        plot_set = pl.concat([top_promotions, bot_promotions]).sort(
+            ["rank_shift", "feature"], descending=[False, True]
+        )
         y = np.arange(plot_set.height)
         colors = [
             COLORS["blue"] if v > 0 else COLORS["amber"] for v in plot_set["rank_shift"].to_list()
@@ -1603,7 +1661,7 @@ def feature_rank_stability(cs: str) -> dict | None:
     if gbm_imp_df.is_empty():
         return None
     top_features = (
-        gbm_imp_df.group_by("feature")
+        gbm_imp_df.group_by("feature", maintain_order=True)
         .agg(pl.col("importance").mean().alias("mean_imp"))
         .sort(["mean_imp", "feature"], descending=[True, False])
         .head(10)["feature"]
@@ -1611,7 +1669,7 @@ def feature_rank_stability(cs: str) -> dict | None:
     )
     sub = (
         gbm_imp_df.filter(pl.col("feature").is_in(top_features))
-        .group_by(["feature", "fold_id"])
+        .group_by(["feature", "fold_id"], maintain_order=True)
         .agg(pl.col("importance").mean())
     )
     pivot = sub.pivot(index="feature", on="fold_id", values="importance").drop_nulls()

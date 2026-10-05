@@ -108,6 +108,10 @@ EXECUTION_TIER = "canonical"
 WORKSPACE: str | None = None
 PREVIEW_LABELS: list[str] = []
 PREVIEW_MAX_BASELINE_ROWS = 0
+# None means the width `setup.yaml` declares; an int overrides it. Declared here because
+# papermill only binds a name the parameters cell already holds - a run that passes
+# TOP_N_PREDICTIONS to a notebook without it sweeps the declared width and exits 0.
+TOP_N_PREDICTIONS = None
 
 # The allocation population is immutable under its name, so a run whose members have moved has
 # to say which generation it retires. Anything upstream that changes a backtest identity moves
@@ -117,6 +121,24 @@ PREVIEW_MAX_BASELINE_ROWS = 0
 # the population on record. Empty for a first snapshot.
 ALLOCATION_POPULATION = "cme_futures-allocation-validation-v1"
 SUPERSEDES_ALLOCATION_POPULATION: str = ""
+
+# The per-label candidate sets this notebook freezes are immutable under their names too, and
+# for the same reason as the population above: `CandidateSet.create` refuses a changed member
+# list under a name that already exists. Nothing reached that argument before, so any run whose
+# membership moved - which a wider sweep does by construction - stopped at the freeze after the
+# fit, with no parameter able to answer it.
+#
+# Each name maps to the generation this run retires. `"live"` names the lineage and looks the
+# generation up, which is the form that does not decay: naming the head instead is correct only
+# until the next publish, because `create` accepts the head and nothing else. The declaration is
+# resolved through `candidate_set_supersedes` rather than offered straight, so a reader's clean
+# clone - which has no generation to replace, and often no `candidate_sets` table at all -
+# publishes generation one instead of being refused. An unchanged re-run never reads it: a set's
+# hash is computed from its members and its contract, so the existing name binding answers.
+SUPERSEDES_CANDIDATE_SETS: dict[str, str] = {
+    "cme_futures-allocation-fwd_ret_5d-v1": "live",
+    "cme_futures-allocation-fwd_ret_21d-v1": "live",
+}
 
 # %% [markdown]
 # ## Select signal configurations by validation Sharpe
@@ -163,13 +185,22 @@ universe
 # `shortlist_signal_configurations` refuses - correctly, since silently returning fewer is the
 # quiet shrinking that strictness exists to prevent. The preview therefore declares its own
 # width, and is held to it just as strictly.
+#
+# `TOP_N_PREDICTIONS` overrides both, which is how a sweep runs wider than the shipped
+# declaration. It is held to its width the same way: a number the pool cannot fill raises here
+# rather than quietly shrinking. A sweep that wants every configuration passes `0`, the
+# spelling `top_n_predictions.signal` uses one line above the declaration this overrides. That
+# is not the same request as a number large enough to be sure: 999 against a population of 50
+# is indistinguishable from a population that shrank to 50, and stays a refusal.
 
 # %%
-shortlist_size = (
-    get_top_n_predictions("cme_futures", "allocation")
-    if EXECUTION_TIER == "canonical"
-    else PREVIEW_MAX_BASELINE_ROWS
-)
+if TOP_N_PREDICTIONS is None:
+    TOP_N_PREDICTIONS = (
+        get_top_n_predictions("cme_futures", "allocation")
+        if EXECUTION_TIER == "canonical"
+        else PREVIEW_MAX_BASELINE_ROWS
+    )
+shortlist_size = TOP_N_PREDICTIONS
 allocators = get_allocators("cme_futures")
 if not allocators:
     raise ValueError("the configured allocator population is empty")
@@ -236,7 +267,9 @@ execution = run_official_backtest_requests(
     ),
 )
 candidate_sets = (
-    create_label_candidate_sets(study, execution, stage="allocation")
+    create_label_candidate_sets(
+        study, execution, stage="allocation", supersedes_by_set=SUPERSEDES_CANDIDATE_SETS
+    )
     if EXECUTION_TIER == "canonical"
     else {}
 )

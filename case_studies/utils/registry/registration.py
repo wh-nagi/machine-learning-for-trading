@@ -8,6 +8,7 @@ import os
 import shutil
 import sqlite3
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -156,7 +157,7 @@ def _input_artifact_shas(spec: dict | str | None) -> dict[str, str]:
     """The whole-file sha256 a training spec pins per input artifact.
 
     Three shapes, because the producers write three and reading only one left 119 of the
-    1,156 registered runs vintage-checked by nothing at all (ml4t/agent-workspace#1137):
+    1,156 registered runs vintage-checked by nothing at all:
 
     - ``computation.input_data_spec.artifacts``, what ``gbm``, ``linear`` and ``tabular_dl``
       build from ``mds.input_lineage``.
@@ -165,7 +166,7 @@ def _input_artifact_shas(spec: dict | str | None) -> dict[str, str]:
       (``case_studies/utils/deep_learning.py``), so the same mapping ends up one level down.
       A nesting slip, not a different contract.
     - ``computation.input_data_spec.files``, a list of ``{role, sha256}`` with a ``sha256:``
-      prefix, which is what the latent adapter records (ml4t/agent-workspace#891).
+      prefix, which is what the latent adapter records.
 
     Reading all three is what makes ``_enforce_input_artifact_vintage`` cover the population
     it claims to. Measured across the nine live registries before the widening landed: the
@@ -244,7 +245,7 @@ def _enforce_input_artifact_vintage(db, spec: dict) -> None:
     disk, and nothing compares the two. Regenerate a stage-03 or stage-04 artifact and the
     next run registers against a vintage no prior member of that population was fitted
     under - and it is silent, so the mixture is found later by comparing the registry to the
-    disk by hand, if at all (ml4t/agent-workspace#987).
+    disk by hand, if at all.
 
     The state this catches is reachable and was reached. On 2026-09-07 `fx_pairs` held 138
     training runs pinning one `model_based` sha while no file on disk carried it; a
@@ -287,16 +288,16 @@ def input_artifact_vintage_conflicts(
 ) -> list[ArtifactVintageConflict]:
     """The refusals :func:`_enforce_input_artifact_vintage` would raise, as values.
 
-    Separated from the raise so the same question can be asked BEFORE a chain is queued.
-    The refusal costs a launch rather than a fit - ``register_training_run`` runs ahead of
-    the fit on every path - but it still stops the chain ten seconds in, and until
-    ``scripts/check_input_artifact_vintage.py`` existed the only warning was that stop
-    (ml4t/agent-workspace#1123).
+     Separated from the raise so the same question can be asked BEFORE a chain is queued.
+     The refusal costs a launch rather than a fit - ``register_training_run`` runs ahead of
+     the fit on every path - but it still stops the chain ten seconds in, and until
+     ``scripts/check_input_artifact_vintage.py`` existed the only warning was that stop
+    .
 
-    The pre-flight has to ask THIS function rather than its own version of the comparison.
-    A check that re-implements the rule can disagree with it, and a pre-flight that passes
-    where registration refuses is worse than no pre-flight: it is a green light for a chain
-    that will not run.
+     The pre-flight has to ask THIS function rather than its own version of the comparison.
+     A check that re-implements the rule can disagree with it, and a pre-flight that passes
+     where registration refuses is worse than no pre-flight: it is a green light for a chain
+     that will not run.
     """
     conflicts: list[ArtifactVintageConflict] = []
     registered = _registered_artifact_shas(db, label=label)
@@ -495,7 +496,7 @@ def _with_prediction_label(predictions, label: str | None):
     record of which label produced them, so a caller checking a variant's predictions against
     the case study's primary label got a small, plausible, entirely spurious gap - two
     sessions on `crypto_perps_funding`, invisible in the direction that makes the observed
-    frame a subset of the declaration (ml4t/agent-workspace#887). `coverage.py` has refused a
+    frame a subset of the declaration. `coverage.py` has refused a
     frame whose own `label` disagrees since that was found; the column it reads was never
     written.
 
@@ -1241,6 +1242,7 @@ def register_prediction_set(
     case_dir: Path | None = None,
     expected_keys=None,
     allow_partial: bool = False,
+    retiring: Sequence[str] = (),
 ) -> str:
     """Register a prediction set. Returns prediction_hash.
 
@@ -1273,6 +1275,11 @@ def register_prediction_set(
         use the binary label. Required when ``task_type="classification"``.
     case_dir : Path, optional
         Override case study directory.
+    retiring : sequence of str, optional
+        For ``split="holdout"`` only: prediction hashes the operator accepts retiring from
+        the window. Empty, the default, means a window already carrying another
+        configuration's evaluation refuses this one. See
+        :func:`case_studies.utils.strategy_analysis.refuse_a_second_look`.
     """
     from .metrics import compute_prediction_fold_metrics
 
@@ -1289,7 +1296,7 @@ def register_prediction_set(
     db = _open_registry(case_dir)
     try:
         parent = db.execute(
-            "SELECT identity_version, execution_tier, spec_json FROM training_runs "
+            "SELECT identity_version, execution_tier, spec_json, config_name FROM training_runs "
             "WHERE training_hash = ?",
             (training_hash,),
         ).fetchone()
@@ -1297,7 +1304,39 @@ def register_prediction_set(
         db.close()
     if parent is None:
         raise ValueError(f"unknown training_hash {training_hash}")
-    identity_version, execution_tier, parent_spec_json = parent
+    identity_version, execution_tier, parent_spec_json, parent_config_name = parent
+
+    # A holdout window carries one evaluation. Here rather than in a notebook, because the
+    # question is about what the registry is being asked to hold and every path that holds
+    # something arrives through this call: five of the nine holdout notebooks wrote this
+    # check out for themselves and four never did, which is not a judgement any of the four
+    # made - `fx_pairs` now carries two generations on one window, registered a week apart,
+    # and the notebook that registered the second had no check to fire. A guard copied into
+    # nine notebooks is a guard that is in five of them.
+    #
+    # Re-registering THIS generation is not a second look and is not refused:
+    # `holdout_generations_to_retire` puts a row equal to `this_generation` in no bucket, so
+    # a holdout notebook re-runs like any other stage. What refuses is a DIFFERENT
+    # configuration, or a different checkpoint of the same run, arriving at a window that has
+    # already been observed - and deleting the earlier row is the documented way past it,
+    # because retiring it through the registry's lifecycle records that a second look
+    # was taken, which is the fact the refusal exists to keep.
+    if split == "holdout":
+        from case_studies.utils.strategy_analysis import (
+            holdout_generations_to_retire,
+            refuse_a_second_look,
+        )
+
+        refuse_a_second_look(
+            holdout_generations_to_retire(
+                case_dir,
+                this_generation=(training_hash, (checkpoint_kind, checkpoint_value)),
+            ),
+            this_configuration=parent_config_name or "this run",
+            this_training_hash=training_hash,
+            checkpoint=(checkpoint_kind, checkpoint_value),
+            retiring=retiring,
+        )
 
     # After the parent lookup, not before it: the dispersion bound is a statement about a
     # converged fit, and only the parent row says whether this run claims to be one. The
@@ -1356,7 +1395,7 @@ def register_prediction_set(
             # And the same question one level down. A checkpoint registered under a changed
             # key rendering digests differently from its siblings whatever its keys, so a
             # consumer grouping a training run's checkpoints by eligibility splits one
-            # contract into two and nothing says why (ml4t/agent-workspace#1065). Refusing
+            # contract into two and nothing says why. Refusing
             # here is what makes the next rendering change arrive as an error naming its
             # cause rather than as a quiet mis-grouping in a notebook. The stored digest
             # is handed the keys it was taken over, so a row written before the rendering
@@ -1388,7 +1427,7 @@ def register_prediction_set(
         # column is a constant the registry already holds on the parent training run, so it
         # is data about the frame rather than part of its content identity - and excluding
         # it is what keeps every `artifact_digest` already recorded in the fleet valid
-        # (ml4t/agent-workspace#887). Coverage and `schema_json` above are computed on the
+        # . Coverage and `schema_json` above are computed on the
         # frame with the column removed, for the same reason and so that the artifact
         # written here passes its own immutability check when it is read back.
         published_predictions = _with_prediction_label(normalized_predictions, resolved_label)
@@ -2666,7 +2705,7 @@ def register_causal_run(
                     excluded.refutation_placebo_json, causal_runs.refutation_placebo_json
                 ),
                 -- Fill-once for the same reason, and separately: a row whose p-value was
-                -- computed on raw thetas (before ml4t/agent-workspace#1120) has no t-scale
+                -- computed on raw thetas, before the t-statistic correction, has no t-scale
                 -- draws to recover, so NULL here is what distinguishes it from a corrected
                 -- one. Erasing a filled value would lose that distinction.
                 refutation_placebo_t_json=COALESCE(

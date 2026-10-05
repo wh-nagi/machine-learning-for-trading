@@ -77,8 +77,6 @@
 # %%
 """Crypto perps funding: model-based features from a GJR-GARCH fit and a funding-regime HMM."""
 
-import warnings
-
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
@@ -92,6 +90,11 @@ from ml4t.diagnostic.metrics import compute_ic_hac_stats, cross_sectional_ic_ser
 
 from case_studies.research.holdout import build_holdout_cv
 from case_studies.utils.artifact_digest import value_digest
+from case_studies.utils.artifact_quality import (
+    label_universe,
+    quality_report,
+    render_quality_report,
+)
 from case_studies.utils.temporal import (
     filtered_state_probs,
     fit_hmm_restarts,
@@ -101,19 +104,24 @@ from case_studies.utils.temporal import (
     walk_forward_feature,
     write_model_based,
 )
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from data import load_crypto_perps
 from utils.artifact_specs import (
     load_setup_config,
     resolve_label_buffer,
     resolve_label_horizon,
 )
-from utils.cv_splits import generate_cv_splits, load_evaluation_config
+from utils.cv_splits import (
+    generate_cv_splits,
+    load_evaluation_config,
+    normalize_label_buffer,
+)
 from utils.modeling import load_modeling_dataset
 from utils.paths import get_case_study_dir
 from utils.reproducibility import set_global_seeds
 from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
-warnings.filterwarnings("ignore")
+apply_notebook_warning_policy()
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "crypto_perps_funding"
@@ -152,8 +160,13 @@ LABEL_BUFFER = resolve_label_buffer(CASE_STUDY_ID, PRIMARY_LABEL, _SETUP)
 LABEL_HORIZON = resolve_label_horizon(CASE_STUDY_ID, PRIMARY_LABEL, _SETUP)
 assert LABEL_BUFFER, f"No label buffer configured for {PRIMARY_LABEL}"
 # The Newey-West lag below is counted in decision timestamps, not in hours, so the
-# configured horizon is converted into settlement bars once, here.
-LABEL_HORIZON_BARS = round(pd.Timedelta(LABEL_BUFFER) / pd.Timedelta(hours=BAR_HOURS))
+# configured horizon is converted into settlement bars once, here. The conversion goes
+# through `normalize_label_buffer` because the configured string is "8H" and pandas
+# deprecated "H", so `pd.Timedelta` on the raw value writes a FutureWarning into the
+# page. The configured string itself is what registered training runs hash, so it stays
+# as declared. The helper is unit-aware rather than a `.lower()`: "21D" stays "21D".
+LABEL_BUFFER_DELTA = pd.Timedelta(normalize_label_buffer(LABEL_BUFFER))
+LABEL_HORIZON_BARS = round(LABEL_BUFFER_DELTA / pd.Timedelta(hours=BAR_HOURS))
 
 set_global_seeds(SEED)
 
@@ -284,8 +297,8 @@ holdout_end = pd.Timestamp(_evaluation["holdout_end"], tz="UTC")
 print(f"Walk-forward folds: {len(VALIDATION_FOLDS)}")
 for f in VALIDATION_FOLDS:
     embargo = f["test_start"] - f["train_end"]
-    label_endpoint = f["test_end"] + pd.Timedelta(LABEL_BUFFER)
-    assert embargo >= pd.Timedelta(LABEL_BUFFER)
+    label_endpoint = f["test_end"] + LABEL_BUFFER_DELTA
+    assert embargo >= LABEL_BUFFER_DELTA
     assert label_endpoint < holdout_start
     print(
         f"  Fold {f['fold']}: fitted on [{f['train_start']} to {f['train_end']}], "
@@ -300,8 +313,8 @@ for f in VALIDATION_FOLDS:
 # is appended rather than inferred downstream because **a holdout fit needs features, and a split
 # definition is not features**: `utils.modeling.append_holdout_fold_if_needed` adds the geometry
 # to a modeling dataset and produces no rows, so a stage that called it against an artifact
-# written without this found nothing in the holdout window at any fold. That is
-# ml4t/agent-workspace#971, and this is crypto's half of it.
+# written without this found nothing in the holdout window at any fold. This is crypto's half
+# of that defect.
 #
 # Its boundaries are not re-derived here. `build_holdout_cv` is what reconstructs a holdout fit
 # downstream, so it is asked for them: a second construction is a second thing to keep in step,
@@ -420,7 +433,7 @@ FOLDS_BY_DATE = sorted(active_folds, key=lambda item: item["test_start"])
 _bars = labels["timestamp"].unique().sort()
 _burnin_end = _bars[min(MIN_TRAIN_BARS, len(_bars) - 1)]
 
-fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+fig, ax = plt.subplots(figsize=FIGSIZE["single"], layout="tight")
 _top = len(FOLDS_BY_DATE)
 for start_ts, end_ts, color, name in (
     (_bars[0], _burnin_end, COLORS["recede"], f"burn-in, {MIN_TRAIN_BARS} settlements, no value"),
@@ -535,7 +548,7 @@ coverage = (
     .agg(pl.col("timestamp").min().alias("first"), pl.col("timestamp").max().alias("last"))
     .sort("first", descending=True)
 )
-fig, ax = plt.subplots(figsize=FIGSIZE["single_tall"])
+fig, ax = plt.subplots(figsize=FIGSIZE["single_tall"], layout="tight")
 _VALIDATION_BY_DATE = [f for f in FOLDS_BY_DATE if f["fold"] in VALIDATION_FOLD_IDS]
 for fold, color in zip(_VALIDATION_BY_DATE, (COLORS["recede"], COLORS["amber"]), strict=False):
     ax.axvspan(
@@ -751,7 +764,12 @@ def extract_symbol_garch(
     the schedule is the provenance, and the assertion after the loop checks it against
     ``refit_boundaries`` rather than against a fold.
     """
-    returns = close.pct_change().dropna()
+    # A return is kept only where the bar before it is one bar length back. The exchange
+    # published no bars for some contracts through two outages in 2022, and the change across
+    # one is days of movement, not one settlement's shock; the variance recursion would read it
+    # as the latter.
+    one_bar_back = close.index.to_series().diff() == pd.Timedelta(hours=BAR_HOURS)
+    returns = close.pct_change()[one_bar_back.to_numpy()].dropna()
     if len(returns) <= MIN_TRAIN_BARS:
         return pl.DataFrame(schema=GARCH_SCHEMA), None, []
     freeze_after = int((returns.index < holdout_start).sum())
@@ -1132,7 +1150,7 @@ regime_view = (
 )
 
 # %%
-fig, axes = plt.subplots(2, 1, figsize=FIGSIZE["dual_v"], sharex=True)
+fig, axes = plt.subplots(2, 1, figsize=FIGSIZE["dual_v"], sharex=True, layout="tight")
 _stamps = regime_view["timestamp"].to_list()
 axes[0].plot(
     _stamps, regime_view["xs_mean_funding_bps"].to_list(), color=COLORS["blue"], linewidth=0.7
@@ -1252,7 +1270,7 @@ display(
 display(duration_stability.select("fit_end", "calm_duration_bars", "stress_duration_bars").tail(8))
 
 # %%
-fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+fig, ax = plt.subplots(figsize=FIGSIZE["single"], layout="tight")
 _fit_ends = coefficient_stability["fit_end"].to_list()
 ax.fill_between(
     _fit_ends,
@@ -1292,7 +1310,7 @@ show_with_alt(
 )
 
 # %%
-fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+fig, ax = plt.subplots(figsize=FIGSIZE["single"], layout="tight")
 for column, name, color in (
     ("calm_duration_bars", "calm state", COLORS["blue"]),
     ("stress_duration_bars", "stressed state", COLORS["amber"]),
@@ -1714,7 +1732,7 @@ bar_fill = [COLORS["blue"] if flag else "none" for flag in plot_summary["fdr_sig
 interval = [1.96 * se for se in plot_summary["hac_se"]]
 
 # %%
-fig, ax = plt.subplots(figsize=FIGSIZE["single_tall"])
+fig, ax = plt.subplots(figsize=FIGSIZE["single_tall"], layout="tight")
 ax.barh(
     rows,
     plot_summary["mean_ic"].to_list(),
@@ -1794,6 +1812,93 @@ show_with_alt(
 # stand-alone rank correlation cannot see, and the model notebooks are where it is
 # tested. Every magnitude here is small in absolute terms, which is the expected shape
 # for a volatility-state feature screened as a directional signal on its own.
+
+# %% [markdown]
+# ## What the artifact holds, and what it owes
+#
+# Two questions about the file this stage just wrote. The first is what is in each column - nulls,
+# zeros, the distance from the body of the distribution to its tail, whether anything is constant.
+# A threshold crossed there asks for a sentence of explanation and settles nothing on its own.
+#
+# The second is the one a null count cannot reach, and it matters more here than in stage 03. **A
+# fitted feature is undefined until its model has an estimation window**, so this artifact is
+# *expected* to be shorter than the panel it was estimated on - and an expectation that something
+# is missing is exactly the condition under which nobody notices how much. Coverage is therefore
+# measured against the keys the labels declare, which is the same reference stage 03 answers to,
+# so the two shortfalls can be read side by side and the part this stage adds separated from the
+# part it inherited.
+#
+# What this stage is entitled to lose is the burn-in, and it loses it at the front of each
+# perpetual's history. The budget below is the longest burn-in any model here declares,
+# read from the schedule rather than typed in, because a value emitted before the slowest fit has
+# its window would be a value no model produced. Everything else - a key inside a
+# perpetual's own span, or one after its last fitted value - is inherited from
+# the premium shadow stage 03 answers to or is this stage's to answer for, and the check below says which.
+
+# %%
+BURNIN_BUDGET = MIN_TRAIN_BARS
+print(
+    f"burn-in budget {BURNIN_BUDGET} settlements = the minimum training history a fit is attempted on"
+)
+
+report = quality_report(
+    temporal,
+    name="model-based features",
+    key_columns=["symbol", "timestamp"],
+    expected=label_universe(CASE_DIR, keys=["symbol", "timestamp"]),
+    keys=["symbol", "timestamp"],
+    entity="symbol",
+    session="timestamp",
+    expected_missing={
+        "leading": (BURNIN_BUDGET + 1, "the minimum training history a fit is attempted on")
+    },
+)
+render_quality_report(report)
+
+# %% [markdown]
+# The burn-in declaration covers the front of each perpetual's history and nothing else,
+# so anything outside it is measured against what stage 03 actually offered. A fit needs rows to
+# estimate on, and a key whose window holds fewer than the burn-in requires could not have been
+# produced here whatever this stage did; a key that had them and carries no value is this stage's.
+# The first bar after each gap in the price bars is one of those: the change across a gap is not a
+# one-bar return, so the variance model is given none there and that bar carries no value.
+
+# %%
+ENTITY_COLS = "symbol" if isinstance("symbol", list) else ["symbol"]
+offered = pl.read_parquet(FEATURES_DIR / "financial.parquet", columns=["symbol", "timestamp"])
+sessions = (
+    label_universe(CASE_DIR, keys=["symbol", "timestamp"])
+    .select("timestamp")
+    .unique()
+    .sort("timestamp")
+    .with_row_index("i")
+)
+supply = offered.join(sessions, on="timestamp").select(*ENTITY_COLS, "i")
+# `quality_report` adds the `missing_*` keys only where there were missing keys to
+# classify, so their absence is the "nothing is missing" case and not an error.
+classified = report.get("missing_classified")
+outside = (
+    classified.filter(pl.col("where") != "leading").join(sessions, on="timestamp")
+    if classified is not None
+    else pl.DataFrame()
+)
+if outside.height:
+    depth = (
+        outside.join(supply, on=ENTITY_COLS, suffix="_src")
+        .filter(pl.col("i_src").is_between(pl.col("i") - BURNIN_BUDGET, pl.col("i") - 1))
+        .group_by([*ENTITY_COLS, "i"])
+        .len()
+    )
+    starved = outside.join(
+        depth.filter(pl.col("len") >= BURNIN_BUDGET), on=[*ENTITY_COLS, "i"], how="anti"
+    )
+    print(
+        f"outside the burn-in: {outside.height:,} missing keys, of which {starved.height:,} "
+        f"({starved.height / outside.height:.2%}) have fewer than the {BURNIN_BUDGET} rows a fit "
+        "reads behind them"
+    )
+else:
+    print("outside the burn-in: nothing missing")
 
 # %% [markdown]
 # ## Key takeaways

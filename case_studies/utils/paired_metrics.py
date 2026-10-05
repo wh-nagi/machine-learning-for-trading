@@ -35,10 +35,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable, Mapping
 from functools import cache
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import polars as pl
@@ -46,6 +44,7 @@ import polars as pl
 from case_studies.utils.analytics import DISPLAY_NAMES
 from case_studies.utils.backtest_explorer import BacktestExplorer
 from case_studies.utils.benchmark import load_benchmark_returns
+from case_studies.utils.notebook_contracts import degenerate_prediction_hashes
 from case_studies.utils.registry.registration import register_paired_metrics
 from case_studies.utils.strategy_analysis import (
     is_refit_of,
@@ -65,7 +64,7 @@ from case_studies.utils.uncertainty import (
 )
 from utils.paths import get_case_study_dir
 
-# Cross-stage rank-1 pooling stages — mirrors holdout.py::HOLDOUT_SELECTION_STAGES.
+# Cross-stage rank-1 pooling stages - mirrors strategy_analysis.SELECTION_STAGES.
 _PAIRED_STAGES = ("signal", "allocation", "risk_overlay")
 
 
@@ -96,8 +95,27 @@ def _min_paired_n(ppy: int) -> int:
 # LIMIT 1` free to pick whichever rung is higher in current data. The pin combines the universe
 # with `exit_at_max_days` so the rank-1 row is deterministic and HTM-coherent.
 #
-# nasdaq100_microstructure: the cost-feasible ensemble, chosen before the holdout was opened and
-# matched on those two design attributes, which any registry can satisfy.
+# nasdaq100_microstructure: the cost-feasible sweep on the primary label, matched on design
+# attributes any registry can satisfy and chosen before the holdout was opened.
+#
+# The pin used to name `family == "ensemble"` as well. The mean-forecast ensemble existed
+# because the per-model baseline on this case study was not worth reporting, and that is no
+# longer the case: measured 2026-09-14 on the cost-feasible pool, `deep_learning/nlinear` on
+# `fwd_ret_15m` reaches +2.300 against the ensemble's +0.566, so pinning to the ensemble
+# anchored every paired comparison to the weakest thing in the pool. The family clause is
+# gone; the ensemble rows stay in the registry and stay selectable, they are simply no
+# longer the only thing the pin can choose.
+#
+# The label is part of the pin and was not always, and it does more work now that family is
+# not. The pool spans four declared labels, so universe alone leaves `ORDER BY sharpe DESC
+# LIMIT 1` free to choose among them - `fwd_dir_15m` reaches +2.416, above the primary
+# label's best - and the rank-1 rung would move onto a label this case study is not featured
+# on with nothing announcing it. A pin that omits a dimension selects along it silently.
+#
+# `fwd_ret_15m` is what the book prints for this case study, in Table 11.6
+# (`NASDAQ-100 15m | fwd_ret_15m`), in Chapter 12's case-study table (`15 minutes | forward
+# return`) and in Chapter 13's (`15 minutes | NLinear`). `config/setup.yaml::labels.primary`
+# says the same, and `tests/test_rung_pin_label.py` asserts the two do not drift apart.
 RUNG_PINS: dict[str, dict] = {
     "sp500_options": {
         "predicate": (pl.col("universe_filter") == "liquid") & pl.col("exit_at_max_days").is_null(),
@@ -106,9 +124,11 @@ RUNG_PINS: dict[str, dict] = {
     },
     "nasdaq100_microstructure": {
         "predicate": (pl.col("universe_filter") == "cost_feasible")
-        & (pl.col("family") == "ensemble"),
+        & (pl.col("label") == "fwd_ret_15m"),
         "universe_filter": "cost_feasible",
         "exit_at_max_days": None,
+        # Mirrors the predicate for the SQL paths that cannot take a polars expression.
+        "label": "fwd_ret_15m",
     },
 }
 
@@ -127,11 +147,15 @@ def _best_for_rung(
 ) -> pl.DataFrame:
     """``explorer.best`` for a stage, fetching enough rows that the pin survives.
 
-    ``best()`` reads ``universe_filter`` out of ``spec_json`` in Python, *after* the SQL
-    ``LIMIT top_n``, and ``_apply_rung_restriction`` runs after that. For nasdaq the pinned
+    ``best()`` reads ``universe_filter`` out of ``spec_json`` in Python, and truncates to
+    ``top_n`` after that; ``_apply_rung_restriction`` runs later still. For nasdaq the pinned
     cost-feasible carrier sits below the full-universe in-sample maxima, so a small ``top_n``
     truncates it before the predicate is ever applied and the pin silently selects nothing -
     or, worse, the best surviving row that was never the carrier.
+
+    A pinned case study therefore asks for every row, which ``best`` now spells ``top_n=0``.
+    It was a literal million until ``sweep_config.top_n_cap`` gave 0 that meaning, and a cohort
+    past a million would have been truncated rather than refused.
 
     Ch20 solves this with the same widening (`_best_pinned`); the extraction into this module
     dropped it, which is why every pinned selection here has to go through this helper rather
@@ -139,7 +163,7 @@ def _best_for_rung(
     """
     return explorer.best(
         stage=stage,
-        top_n=1_000_000 if rung is not None else top_n,
+        top_n=0 if rung is not None else top_n,
         prediction_hashes=prediction_hashes,
     )
 
@@ -405,12 +429,7 @@ def _val_rank1_carrier(
     )
     if cand.is_empty() or "backtest_hash" not in cand.columns:
         return None
-    cand = _drop_retired_generations(cs, cand)
-    if "family" in cand.columns:
-        cand = cand.filter(pl.col("family") != "benchmark")
-    if label_restriction and "label" in cand.columns:
-        cand = cand.filter(pl.col("label").is_in(list(label_restriction)))
-    cand = _apply_rung_restriction(cand, rung)
+    cand = _eligible_candidates(cs, cand, label_restriction=label_restriction, rung=rung)
     if cand.is_empty():
         return None
     # Do NOT dedup by prediction_hash here — the walk needs every registered
@@ -559,8 +578,9 @@ def _holdout_lineage_for(
         # registry here references a validation identity, so there is nothing to join on.
         #
         # What prevents a retired carrier from reaching a holdout is upstream instead:
-        # `holdout.select_best_models` ranks over published members only, so a retrain created
-        # from here on descends from a live carrier by construction. Holdout rows written
+        # `strategy_analysis.resolve_canonical_rank1_lineage` ranks over published members
+        # only, so a retrain created from here on descends from a live carrier by
+        # construction. Holdout rows written
         # before that are stale artifacts of an earlier selection, and they are regenerated.
         clauses.append("p.prediction_hash NOT IN (SELECT value FROM json_each(?))")
         params.append(json.dumps(sorted(retired_hashes)))
@@ -949,6 +969,61 @@ def _drop_retired_generations(cs: str, cand):
     return cand
 
 
+def _drop_degenerate_predictions(cs: str, cand):
+    """Candidates whose prediction set selection refuses to consider.
+
+    A LASSO or ElasticNet fit that shrinks every coefficient to zero on a fold predicts a
+    constant there, so that fold ranks nothing and the pooled IC computed over it is biased
+    rather than a model result. ``degenerate_prediction_sql`` states the rule - both limbs of
+    it, the NULL IC of an all-tied fold and the denormal one of a fold constant only to display
+    precision - and
+    ``selectable_validation_candidates`` applies it, which is why the published carrier cannot
+    be one of these.
+
+    A pair is the other publication path and had no such filter. The sweep backtests the whole
+    declared population rather than a shortlist, so the registry does hold backtests on
+    degenerate sets: measured on us_equities_panel 2026-09-14, 15 of its prediction sets are
+    degenerate, four signal-stage backtests stand on two of them, and both sat at Sharpe 0.6062
+    against a 0.8977 leader - third and fourth in the stage, so ranking alone did not catch it
+    and gives no reason to expect it to as the sweep continues.
+
+    Applied wherever ``_drop_retired_generations`` is, for the same reason: every ranking in
+    this module sorts on ``sharpe`` over whatever the registry holds.
+    """
+    if cand is None or cand.is_empty() or "prediction_hash" not in cand.columns:
+        return cand
+    degenerate = degenerate_prediction_hashes(get_case_study_dir(cs))
+    if not degenerate:
+        return cand
+    return cand.filter(~pl.col("prediction_hash").is_in(list(degenerate)))
+
+
+def _eligible_candidates(
+    cs: str, cand, *, label_restriction: frozenset[str] | None, rung: dict | None
+):
+    """Every filter a ranking in this module owes its candidate pool, in one place.
+
+    The three rankings here - the carrier walk, pair #1, and the no-carrier leader - had this
+    chain written out three times, which is how the degeneracy filter came to be missing from
+    all of them while selection had it: a filter added to one copy is not added to the others,
+    and nothing reads as wrong at any single site.
+
+    Retirement and degeneracy are both facts about whether the row may be published at all.
+    The benchmark exclusion is about what a challenger is. The label and rung restrictions are
+    the case study's own scope. What is NOT here is the carrier pin, which pair #1 deliberately
+    does not apply.
+    """
+    cand = _drop_retired_generations(cs, cand)
+    cand = _drop_degenerate_predictions(cs, cand)
+    if cand is None or cand.is_empty():
+        return cand
+    if "family" in cand.columns:
+        cand = cand.filter(pl.col("family") != "benchmark")
+    if label_restriction and "label" in cand.columns:
+        cand = cand.filter(pl.col("label").is_in(list(label_restriction)))
+    return _apply_rung_restriction(cand, rung)
+
+
 def populate_paired_metrics(
     cs: str,
     explorer: BacktestExplorer | None = None,
@@ -969,19 +1044,27 @@ def populate_paired_metrics(
     case study. The per-CS selection config that Ch20 reads from module globals
     is passed in:
 
-    * ``label_restriction`` — ``holdout.LABEL_RESTRICTIONS.get(cs)`` (e.g.
+    * ``label_restriction`` - ``strategy_analysis.LABEL_RESTRICTIONS.get(cs)`` (e.g.
       sp500_options → ``frozenset({'ret_to_expiry'})``); None for most CSs.
-    * ``rung`` — ``{"predicate", "universe_filter", "exit_at_max_days"}`` for
-      the rung-pinned CSs (sp500_options, nasdaq100_microstructure); None else.
-      (us_firm_characteristics → ``config_name == 'default_huber'``); None else.
+    * ``rung`` - ``{"predicate", "universe_filter", "exit_at_max_days"}``, plus
+      ``label`` where the pin names one, for the rung-pinned CSs (sp500_options,
+      nasdaq100_microstructure); None else. A line naming
+      ``us_firm_characteristics -> config_name == 'default_huber'`` stood here
+      until 2026-09-14, dangling under this bullet and describing a pin deleted on
+      2026-08-25 for selecting that case study's weakest advanced configuration
+      (`20_strategy_synthesis/01_aggregate_synthesis.py:365`).
     * ``periods_per_year`` — the annualization factor. Defaults to the case
       study's own ``evaluation.periods_per_year`` declaration rather than to a
       cadence, so a caller that omits it gets its own scale instead of someone
       else's.
     * ``carrier`` — a ``resolve_canonical_rank1_lineage`` result, or ``NO_CARRIER``.
       With a lineage, pairs #2-6 use its validation and holdout backtests instead of
-      re-ranking the registry here. Pair #1 is unaffected: it is about the signal
-      leader, not the carrier. ``NO_CARRIER`` keeps the legacy ranking, which is not
+      re-ranking the registry here, and pair #1 is pinned to its validation backtest
+      too - the code below refuses rather than ranking when a carrier is supplied,
+      because a pair #1 registered under a backtest the case study does not report
+      leaves its carrier with no validation-to-benchmark evidence. This bullet said
+      pair #1 was unaffected until 2026-09-14, which had not been true since that
+      refusal landed. ``NO_CARRIER`` keeps the legacy ranking, which is not
       the canonical selection - it orders on raw Sharpe and applies neither the
       common-support re-ranking nor the restrictions the resolver holds - so a caller
       that can resolve the lineage should pass it. The rung-pinned case studies
@@ -1063,15 +1146,10 @@ def populate_paired_metrics(
     if cand.is_empty() or "backtest_hash" not in cand.columns:
         skip_pair1 = True
     if not skip_pair1:
-        cand = _drop_retired_generations(cs, cand)
-        if "family" in cand.columns:
-            cand = cand.filter(pl.col("family") != "benchmark")
-        if label_restriction and "label" in cand.columns:
-            cand = cand.filter(pl.col("label").is_in(list(label_restriction)))
         # NB: pair #1 (Ch20 Loop A) applies ONLY the rung restriction — no
         # carrier pin — unlike pairs #2-6 (Loop B), which apply both. Preserve
         # that asymmetry so carrier-pinned CSs (us_firm_characteristics) match.
-        cand = _apply_rung_restriction(cand, rung)
+        cand = _eligible_candidates(cs, cand, label_restriction=label_restriction, rung=rung)
         if cand.is_empty():
             skip_pair1 = True
     if not skip_pair1:
@@ -1164,12 +1242,7 @@ def populate_paired_metrics(
         return rows
     # Pair #1 filters this out and so must this pool: with no carrier passed the leader is
     # taken from the ranking below, and a superseded row still ranks.
-    cand = _drop_retired_generations(cs, cand)
-    if "family" in cand.columns:
-        cand = cand.filter(pl.col("family") != "benchmark")
-    if label_restriction and "label" in cand.columns:
-        cand = cand.filter(pl.col("label").is_in(list(label_restriction)))
-    cand = _apply_rung_restriction(cand, rung)
+    cand = _eligible_candidates(cs, cand, label_restriction=label_restriction, rung=rung)
     if cand.is_empty():
         _report(cs, rows, verbose)
         return rows

@@ -12,10 +12,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..runtime import worktree_marker
 from .specs import (
     IDENTITY_VERSION,
     _validate_spec,
-    canonical_json,
     training_hash_from_spec,
 )
 
@@ -189,8 +189,8 @@ CREATE TABLE IF NOT EXISTS causal_runs (
     refutation_p     REAL,
     refutation_n_successful INTEGER,
     refutation_placebo_json TEXT,
-    -- The placebo t-statistics behind refutation_p, which since
-    -- ml4t/agent-workspace#1120 is the statistic the test is computed on. The thetas
+    -- The placebo t-statistics behind refutation_p, which is the statistic the
+    -- test is computed on since the correction. The thetas
     -- above stay because they are still what a reader wants to see on the effect scale,
     -- but a figure drawn from them no longer shows the distribution the p-value came
     -- from: permuting the treatment inflates var(T_res) and shrinks every placebo theta
@@ -303,6 +303,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_cohort_unique
     ON cohort_metrics(cohort_type, COALESCE(stage, ''), label, COALESCE(family, ''));
 CREATE INDEX IF NOT EXISTS idx_cohort_leader ON cohort_metrics(leader_hash);
 
+-- What a sweep found when it measured a member's cross-sectional coverage. The sweep and the
+-- carrier resolver used to answer "which predictions are admissible" separately: the sweep
+-- through `prediction_members_in_force`, which charges every member against the feature panel
+-- it was offered, and the resolver through `full_coverage_prediction_sql`, whose `ic_n_days`
+-- bar counts decision days and cannot see a family that scored every day for half the
+-- universe. The resolver was the looser of the two, so a prediction the sweep refused to
+-- backtest could still carry the case study.
+--
+-- Recording the measurement makes them one object rather than two implementations that agree
+-- by inspection. Only members a sweep actually measured appear here; a member nothing has
+-- measured is absent, which is not the same as admitted and is what the readers treat it as.
+--
+-- The counts are stored beside the verdict because nothing else in the registry holds the
+-- declared denominator. `prediction_coverage.n_expected` is built by the model family's own
+-- adapter from its own prepared fold inputs, so it says the model produced what it set out to
+-- produce and cannot say how much of the declared universe that was. Measured on
+-- sp500_equity_option_analytics: all 140 predictions this table rules `admitted = 0` carry a
+-- `prediction_coverage` row reading `status = 'complete'` and `n_missing = 0`, whose
+-- `n_expected` values (125,119 / 126,458 / 126,478) are exactly the narrowed numerators here
+-- against `n_declared` of 246,641 / 248,460 / 249,373. Both are true of the same predictions,
+-- and only one of them answers "did this cover the cross-section its peers ranked".
+-- The five counts, in the order they narrow: `n_declared` is the (entity, session) pairs the
+-- label declares for the split; `n_delivered` is how many of those this prediction set
+-- carries; `n_offered` is how many of `n_declared` the input feature panel reached, so a
+-- family is charged for what it lost rather than for what it was never given, and is NULL
+-- when no panel was supplied; `n_delivered_offered` is how many of `n_offered` the set
+-- carries, and that over `n_offered` is the ratio the admissibility threshold applies to.
+-- `n_entities_declared` is the width of the declared cross-section. All five are NULL on a
+-- member no sweep has measured, because zero of zero is a measurement and absence is not.
+CREATE TABLE IF NOT EXISTS prediction_admissibility (
+    prediction_hash      TEXT PRIMARY KEY,
+    admitted             INTEGER NOT NULL,
+    reason               TEXT,
+    recorded_at          TEXT NOT NULL,
+    git_commit           TEXT,
+    n_declared           INTEGER,
+    n_delivered          INTEGER,
+    n_offered            INTEGER,
+    n_delivered_offered  INTEGER,
+    n_entities_declared  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_prediction_admissibility_admitted
+    ON prediction_admissibility(admitted);
+
 CREATE TABLE IF NOT EXISTS candidate_sets (
     set_hash                 TEXT PRIMARY KEY,
     name                     TEXT NOT NULL,
@@ -403,7 +448,7 @@ CREATE TABLE IF NOT EXISTS decision_artifacts (
 -- One declared edge per superseded input artifact: "the file registered runs pin as
 -- `supersedes_sha256` was deliberately replaced by `sha256`". A training run fits on
 -- whatever is on disk, so without a declaration a regenerated artifact silently mixes two
--- vintages into one population (ml4t/agent-workspace#987). `register_training_run` refuses
+-- vintages into one population. `register_training_run` refuses
 -- an undeclared change and `declare_artifact_supersession` is how an author declares one.
 CREATE TABLE IF NOT EXISTS artifact_supersessions (
     artifact_name      TEXT NOT NULL,
@@ -422,8 +467,15 @@ CREATE TABLE IF NOT EXISTS artifact_supersessions (
 
 
 def _git_hash() -> str | None:
+    """Return the short commit for the ``git_commit`` column, with a worktree marker.
+
+    Resolved against the process working directory, which is the notebook's own
+    directory, so it names the checkout the run executed in. The marker is what
+    separates a row whose source is addressable from one whose is not; see
+    :func:`case_studies.utils.runtime.worktree_marker`.
+    """
     try:
-        return (
+        commit = (
             subprocess.check_output(
                 ["git", "rev-parse", "--short", "HEAD"],
                 stderr=subprocess.DEVNULL,
@@ -434,6 +486,7 @@ def _git_hash() -> str | None:
         )
     except Exception:
         return None
+    return commit + worktree_marker()
 
 
 def _utc_now() -> str:
@@ -659,11 +712,11 @@ _BACKTEST_UNCERTAINTY_COLUMNS = (
 )
 
 # Written on every run by `compute_portfolio_metrics`: whether the path lost its
-# capital, and the index of the period where it did (ml4t/agent-workspace#920).
+# capital, and the index of the period where it did.
 _BACKTEST_RUIN_COLUMNS = ("ruin", "ruin_period")
 
 # Written on every run by `RiskTriggerLog.as_metrics`: how often each declared risk
-# control acted, NULL where none of that kind was declared (ml4t/agent-workspace#1051).
+# control acted, NULL where none of that kind was declared.
 _BACKTEST_RISK_TRIGGER_COLUMNS = (
     "risk_triggers",
     "risk_triggers_stop_loss",
@@ -847,6 +900,21 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
         if "artifact_digest" not in coverage_cols:
             db.execute("ALTER TABLE prediction_coverage ADD COLUMN artifact_digest TEXT")
 
+    if "prediction_admissibility" in tables:
+        admissibility_columns = {
+            "n_declared": "INTEGER",
+            "n_delivered": "INTEGER",
+            "n_offered": "INTEGER",
+            "n_delivered_offered": "INTEGER",
+            "n_entities_declared": "INTEGER",
+        }
+        existing_admissibility = {
+            row[1] for row in db.execute("PRAGMA table_info(prediction_admissibility)").fetchall()
+        }
+        for column, sql_type in admissibility_columns.items():
+            if column not in existing_admissibility:
+                db.execute(f"ALTER TABLE prediction_admissibility ADD COLUMN {column} {sql_type}")
+
     # Migration 2b: add runtime columns to backtest_runs
     if "backtest_runs" in tables:
         backtest_columns = {
@@ -916,8 +984,8 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
     ):
         db.execute("ALTER TABLE causal_runs ADD COLUMN refutation_placebo_json TEXT")
 
-    # The placebo t-statistics, which since ml4t/agent-workspace#1120 are what
-    # refutation_p is computed on. Additive and outside the causal computation
+    # The placebo t-statistics, which are what refutation_p is computed on
+    # since the correction. Additive and outside the causal computation
     # specification, so it moves no causal hash. A row written before this column existed
     # carries NULL, which is the truthful answer: that run's p-value was computed on raw
     # thetas and the draws behind it are not recoverable on the t scale.
@@ -1193,7 +1261,7 @@ def _save_json(path: Path, data: dict) -> None:
 _PREDICTION_TIME_COLUMNS = ("timestamp", "date", "datetime", "ts")
 
 
-def _timestamps_as_utc(predictions):
+def _timestamps_as_utc(predictions, *, widen_dates: bool = False):
     """Give a naive decision-time column an explicit UTC zone before it is written.
 
     `gbm`, `linear` and `tabular_dl` write `Datetime(_, 'UTC')`; `deep_learning` reaches
@@ -1211,6 +1279,19 @@ def _timestamps_as_utc(predictions):
     `value_digest` ignores the zone (it is time-unit sensitive and zone-insensitive), so
     an artifact rewritten through here keeps its digest and no immutable-artifact check
     moves. The time unit is deliberately left alone for the same reason.
+
+    `widen_dates` handles a third dtype the zone rule cannot see. A `pl.Date` column has
+    no zone at all, so the naive branch above skips it and a case study ends up holding
+    both dtypes: us_equities_panel has 688 prediction artifacts on `Date` (gbm, linear,
+    tabular_dl) and 42 on `Datetime(us, 'UTC')` (deep_learning, latent_factors), same
+    decision times, every aware value at midnight. `Date` never equals `Datetime`, so a
+    join on (timestamp, symbol) across those two families returns nothing.
+
+    Widening is read-only and the flag defaults off, because unlike the zone relabel it
+    is NOT digest-neutral: `value_digest` distinguishes `Date` from `Datetime` (measured
+    2026-09-14), so widening on the write path would re-key every artifact those three
+    families have already registered and every immutable-artifact check over them would
+    fail. Callers reading an artifact pass True; `register_prediction_set` must not.
     """
     if predictions is None:
         return predictions
@@ -1227,16 +1308,31 @@ def _timestamps_as_utc(predictions):
             and isinstance(predictions.schema[column], pl.Datetime)
             and predictions.schema[column].time_zone is None
         ]
-        if not naive:
+        dates = (
+            [
+                column
+                for column in _PREDICTION_TIME_COLUMNS
+                if column in predictions.columns and predictions.schema[column] == pl.Date
+            ]
+            if widen_dates
+            else []
+        )
+        if not naive and not dates:
             return predictions
         return predictions.with_columns(
-            pl.col(column).dt.replace_time_zone("UTC") for column in naive
+            *(pl.col(column).dt.replace_time_zone("UTC") for column in naive),
+            *(
+                pl.col(column).cast(pl.Datetime("us")).dt.replace_time_zone("UTC")
+                for column in dates
+            ),
         )
 
     # pandas is handled in place rather than converted. Both the legacy registration branch
     # and the pandas side of the versioned one hand the caller's own frame to the writer,
     # and `pl.from_pandas` on an arbitrary frame is a wider change than this needs. A naive
     # pandas column localizes to UTC the same way; an already-aware one is left alone.
+    # `widen_dates` has no pandas counterpart: there is no date dtype to widen, only
+    # datetime64 with or without a zone, which the naive branch below already covers.
     import pandas as pd
 
     if not isinstance(predictions, pd.DataFrame):

@@ -7,7 +7,6 @@ import json
 import os
 import platform
 import shutil
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -41,7 +40,7 @@ from case_studies.utils.latent_factors.versions import (
     LATENT_MODEL_VERSIONS,
 )
 from case_studies.utils.registry import prediction_hash_from_parts, training_hash_from_spec
-from case_studies.utils.runtime import cpu_seconds
+from case_studies.utils.runtime import cpu_seconds, source_commit
 from utils.modeling import RANDOM_SEED
 
 if TYPE_CHECKING:
@@ -122,15 +121,7 @@ def _runtime_identity() -> dict[str, str | None]:
 def _runtime_provenance(
     study: Study, device: str, *, notebook: str | None = None
 ) -> dict[str, Any]:
-    try:
-        commit = subprocess.check_output(
-            ["git", "-C", str(study.release_root), "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        commit = "unknown"
+    commit = source_commit(study.release_root)
     lock_path = study.release_root / "uv.lock"
     record: dict[str, Any] = {
         "device": device,
@@ -727,7 +718,10 @@ def _normalize_prediction_frame(frame: pl.DataFrame) -> pl.DataFrame:
     """
     from case_studies.utils.registry.store import _timestamps_as_utc
 
-    frame = _timestamps_as_utc(frame)
+    # `widen_dates` for the same reason the zone is normalized: the persisted side comes
+    # back through `PredictionResult.load`, which widens a `Date` column, and the
+    # reconstructed side carries whatever the context holds.
+    frame = _timestamps_as_utc(frame, widen_dates=True)
     rename = {
         old: new
         for old, new in {

@@ -63,7 +63,7 @@ WORKSPACE: str = ""
 PREVIEW_REDUCTIONS: dict = {}
 CONFIG_NAMES: list[str] = []
 POPULATION_NAME = ""
-SUPERSEDES_POPULATION: str = "e43679abc875"
+SUPERSEDES_POPULATION: str = "live"
 DEVICE: str = ""
 
 # %%
@@ -250,12 +250,12 @@ plan.select(
 # **population** - a named, immutable list of the prediction sets it produced - which is what
 # [`14_backtest`](14_backtest.ipynb) resolves rather than a query it composes itself.
 #
-# **There is one identity builder, and the runner owns it.** The previous version of this notebook
-# built its own lookup specification to decide whether a configuration was already fitted, and that
-# specification had to agree field for field with the one the runner registered under. It stopped
-# agreeing when the device became identity-bearing, and the failure was not a wasted cache lookup:
-# the model trained, registered under the fuller identity, and the notebook then reported its own
-# checkpoints incomplete. Nothing here derives an identity any more, so nothing here can disagree.
+# **There is one identity builder, and the runner owns it.** A notebook that built its own lookup
+# specification to decide whether a configuration was already fitted would have to agree with the
+# runner's field for field, and a field the runner later makes identity-bearing - the device, say -
+# would break that agreement silently: the model trains, registers under the fuller identity, and
+# the notebook reports its own checkpoints incomplete. Nothing here derives an identity, so nothing
+# here can disagree.
 #
 # **A second run fits nothing.** Every identity is re-derived from the inputs, the registry already
 # holds the matching rows and the saved weights, and `reused` in the line below counts what came
@@ -492,10 +492,7 @@ fig_cmp = go.Figure(
     )
 )
 fig_cmp.update_layout(
-    title=(
-        f"Peak-checkpoint daily IC by family, recomputed on the {COMMON_ROWS:,} rows "
-        f"({COMMON_DAYS:,} dates) all three share"
-    ),
+    title=f"Daily IC on {COMMON_ROWS:,} rows ({COMMON_DAYS:,} dates) all three families share",
     height=500,
     width=1000,
     margin=dict(t=70),

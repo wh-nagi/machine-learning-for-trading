@@ -58,7 +58,6 @@ from case_studies.research import (
     BacktestResult,
     CandidateSet,
     OfficialPopulation,
-    PredictionResult,
     Result,
     candidate_set_supersedes,
     open_study,
@@ -69,12 +68,12 @@ from case_studies.research import (
     run_backtests,
     superseded_members,
 )
+from case_studies.utils.backtest_presets import EngineBacktestConfig
 from case_studies.utils.strategy_analysis import selectable_validation_candidates
 from case_studies.utils.sweep_config import (
-    get_allocators,
     get_portfolio_risk_controls,
     get_position_risk_controls,
-    get_top_k_values_for,
+    get_top_n_predictions,
 )
 from utils.paths import get_case_study_dir
 from utils.reproducibility import set_global_seeds
@@ -88,10 +87,26 @@ SPLIT = "validation"
 TOP_K = 0
 TOP_N_PREDICTIONS = None
 MAX_RISK_VARIANTS = 0
+# How many parents per label the overlay grid sits on. `None` reads
+# `backtest.sweep.top_n_predictions.risk_overlay`, which every case study declares as 1, and one
+# is narrow on purpose: an overlay is a second search over the same validation folds, so the
+# question the book asks is whether a control improves the configuration the funnel already
+# chose. Until 2026-09-20 that 1 was a literal `min(eligible, ...)` below rather than a number
+# read from the declaration, which left this case study unable to answer at any other width
+# while four others could. A wider run changes the member list of every name published here, so
+# it is narrowing and widening alike that need `POPULATION_NAME`, asserted below.
+TOP_N_COMBOS = None
 SEED = 42
 RUN_SWEEP = True
 FORCE_REBACKTEST = False
 POPULATION_NAME = ""
+# `POPULATION_NAME` scopes what this notebook *writes*. The equal-weight baselines it reads are
+# written by `13_backtest` and carry the canonical name, so a scoped run that inherits the scope
+# on that lookup asks for a population no run ever wrote and stops with "resolved to 0 current
+# identities among 0 snapshots". Empty string reads the canonical baselines while the outputs
+# stay scoped, which is the shape a partial re-run needs; None means "same scope as the outputs".
+# `14_portfolio_management` gained the same parameter in #1109 and this is its sibling.
+BASELINE_POPULATION_NAME: str | None = None
 # `df20d72ab319` was the tip of `fx_pairs:risk-overlay-backtests` when it was written, and
 # `create` accepts the tip and nothing else, so the literal was correct exactly until this
 # notebook next published. `"live"` names the lineage and is resolved against it at run time.
@@ -162,20 +177,37 @@ study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER, workspace=WORKS
 # test suite exercises, then resolved no rows at all.
 include_preview = EXECUTION_TIER == "preview"
 
+
+def _resolve_baseline_scope(output_scope: str, input_scope: str | None) -> str:
+    return output_scope if input_scope is None else input_scope
+
+
+baseline_population_name = _resolve_baseline_scope(POPULATION_NAME, BASELINE_POPULATION_NAME)
+
 # The tier decides the namespace, so a canonical run may legitimately be narrowed -
 # but a narrowed run declares a different set of members than the canonical
 # population does, and a population is immutable once written. Such a run must
 # publish under its own name rather than register a partial snapshot of the risk overlay sweep
 # under the canonical one.
 if (
-    (TOP_K or TOP_N_PREDICTIONS is not None or MAX_RISK_VARIANTS or LABEL)
+    (
+        TOP_K
+        or TOP_N_PREDICTIONS is not None
+        or MAX_RISK_VARIANTS
+        or LABEL
+        or TOP_N_COMBOS is not None
+    )
     and not include_preview
     and not POPULATION_NAME
 ):
     raise ValueError(
-        "this run narrows the risk overlay sweep, so it cannot publish the canonical "
-        "population; pass POPULATION_NAME to give it its own"
+        "this run does not sweep the declared risk overlay population, so it cannot publish "
+        "the canonical one; pass POPULATION_NAME to give it its own"
     )
+if TOP_N_COMBOS is None:
+    TOP_N_COMBOS = get_top_n_predictions(CASE_STUDY_ID, "risk_overlay")
+if TOP_N_COMBOS < 1:
+    raise ValueError("the risk overlay needs at least one parent per label")
 catalog = study.predictions.table(include_preview=include_preview).filter(
     (pl.col("identity_status") == "current")
     & (pl.col("split") == SPLIT)
@@ -259,7 +291,7 @@ def _preview_leader(rows: pl.DataFrame, registered_allocations: pl.DataFrame) ->
     return result
 
 
-selected_by_label: dict[str, BacktestResult] = {}
+selected_by_label: dict[str, list[BacktestResult]] = {}
 candidate_sets: dict[str, CandidateSet] = {}
 if include_preview:
     # The labels come from what the upstream preview registered, the same rule the
@@ -279,14 +311,16 @@ if include_preview:
             "run 14_portfolio_management at the same reduction first"
         )
     for label in sorted(covered.get_column("label").unique()):
-        selected_by_label[label] = _preview_leader(
-            covered.filter(pl.col("label") == label), registered_allocations
-        )
+        selected_by_label[label] = [
+            _preview_leader(covered.filter(pl.col("label") == label), registered_allocations)
+        ]
 else:
     baselines = _open_backtests(
         OfficialPopulation.one(
             study,
-            name=research_name(CASE_STUDY_ID, "equal-weight-baselines", scope=POPULATION_NAME),
+            name=research_name(
+                CASE_STUDY_ID, "equal-weight-baselines", scope=baseline_population_name
+            ),
         )
     )
     allocations = _open_backtests(
@@ -344,10 +378,10 @@ else:
             ),
         )
         candidate_sets[label] = candidates
-        leader = min(eligible, key=lambda result: _eligible_order[result.hash])
-        if not isinstance(leader, BacktestResult):
+        leaders = sorted(eligible, key=lambda result: _eligible_order[result.hash])[:TOP_N_COMBOS]
+        if not all(isinstance(leader, BacktestResult) for leader in leaders):
             raise TypeError("strategy selection did not return a backtest")
-        selected_by_label[label] = leader
+        selected_by_label[label] = leaders
 
 pl.DataFrame(
     [
@@ -357,7 +391,8 @@ pl.DataFrame(
             "prediction_hash": result.registry_record()["prediction_hash"],
             "stage": result.registry_record()["stage"],
         }
-        for label, result in selected_by_label.items()
+        for label, results in selected_by_label.items()
+        for result in results
     ]
 )
 
@@ -431,35 +466,61 @@ def _non_risk_projection(spec: dict[str, Any]) -> dict[str, Any]:
         # `_HASH_EXCLUDED_METADATA` for that reason. Comparing it here makes the notebook
         # refuse its own siblings from any checkout but the one that registered the parents.
         metadata.pop("preset_path", None)
+    # The parent allocation row was serialized by whatever engine version registered it and the
+    # risk result by the installed one, so a field `BacktestConfig` has since gained is absent on
+    # one side and present on the other while both describe the same strategy. `ml4t-backtest`
+    # 0.1.3 to 0.1.6 added `account.lock_notional_update_mode` and
+    # `position_sizing.share_rounding`, both previously implicit defaults the schema made
+    # explicit: `NEAREST` is the rounding the engine already did, and `POSITION_LEGS` only bites
+    # under a `lock_notional` short cash policy. Every fx_pairs parent predates them, so this
+    # comparison reported a moved strategy field on two names for one behaviour.
+    #
+    # Round-tripping both sides through the installed schema states the comparison in one
+    # vocabulary, so it answers what this notebook built rather than which engine wrote the row it
+    # is compared against, and it covers the next added field without naming it.
+    # `14_portfolio_management.py`, `16_costs.py` and `19_strategy_analysis.py` already do this;
+    # this projection is the one that was missed. `ensure_backtest_spec` deliberately does NOT
+    # round-trip, because there the result is hashed and a dropped unknown key would move an
+    # identity; here it is compared and discarded. Metadata is merged back over the serialized
+    # view because the dataclass pins a schema and drops keys it does not know.
+    config = projected.get("backtest_config", {})
+    if EngineBacktestConfig is not None and config:
+        original_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        rebuilt = EngineBacktestConfig.from_dict(config).to_dict()
+        rebuilt_metadata = dict(rebuilt.get("metadata") or {})
+        rebuilt_metadata.update(original_metadata)
+        rebuilt["metadata"] = rebuilt_metadata
+        projected["backtest_config"] = rebuilt
     return projected
 
 
 risk_jobs = []
-for label, selected in selected_by_label.items():
-    arguments = _strategy_arguments(selected)
-    for control in position_controls:
-        risk = _risk_payload(control)
-        plan = plan_backtests(
-            study,
-            predictions=_catalog_row(selected),
-            signal=arguments["signal"],
-            allocation=arguments["allocation"],
-            risk=risk,
-            chapter="19",
-            execution_mode=arguments["execution_mode"],
-        )
-        if len(plan.members) != 1:
-            raise RuntimeError("a risk plan must contain exactly one backtest")
-        risk_jobs.append(
-            {
-                "label": label,
-                "selected": selected,
-                "arguments": arguments,
-                "risk": risk,
-                "risk_name": control["name"],
-                "backtest_hash": plan.expected_hashes[0],
-            }
-        )
+for label, selected_results in selected_by_label.items():
+    for selected in selected_results:
+        arguments = _strategy_arguments(selected)
+        for control in position_controls:
+            risk = _risk_payload(control)
+            plan = plan_backtests(
+                study,
+                predictions=_catalog_row(selected),
+                signal=arguments["signal"],
+                allocation=arguments["allocation"],
+                risk=risk,
+                chapter="19",
+                execution_mode=arguments["execution_mode"],
+            )
+            if len(plan.members) != 1:
+                raise RuntimeError("a risk plan must contain exactly one backtest")
+            risk_jobs.append(
+                {
+                    "label": label,
+                    "selected": selected,
+                    "arguments": arguments,
+                    "risk": risk,
+                    "risk_name": control["name"],
+                    "backtest_hash": plan.expected_hashes[0],
+                }
+            )
 
 planned_hashes = [job["backtest_hash"] for job in risk_jobs]
 if len(planned_hashes) != len(set(planned_hashes)):

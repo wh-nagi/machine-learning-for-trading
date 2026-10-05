@@ -4,11 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import json
-import sqlite3
-import subprocess
-from collections.abc import Iterable
-from copy import deepcopy
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -26,6 +22,7 @@ from case_studies.research import (
     Result,
     StateTransitionPolicy,
     Study,
+    candidate_set_supersedes,
     plan_backtests,
     require_resolved_requests_cover_the_catalog,
     run_backtests,
@@ -38,6 +35,8 @@ from case_studies.utils.artifact_digest import value_digest
 from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
 from case_studies.utils.backtest_runner import precompute_weights
 from case_studies.utils.registry import prediction_hash_from_parts
+from case_studies.utils.runtime import source_commit
+from case_studies.utils.sweep_config import top_n_cap
 from data import load_cme_futures
 from utils.modeling import load_configs
 from utils.paths import REPO_ROOT
@@ -182,9 +181,7 @@ def open_study(
             manifest={
                 "schema_version": 1,
                 "case_study": CASE_STUDY,
-                "baseline_source_commit": subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
-                ).strip(),
+                "baseline_source_commit": source_commit(REPO_ROOT),
                 "preview_only": True,
             },
         )
@@ -1014,14 +1011,36 @@ def _require_agreeing_feature_artifacts(members: Iterable[Result]) -> None:
             raise ValueError(f"candidate set members read different feature artifacts: {differing}")
 
 
-def _create_comparable_set(study: Study, name: str, members: list[Result]) -> CandidateSet:
-    """Create one set whose members are checked to share their feature artifacts."""
+def _create_comparable_set(
+    study: Study,
+    name: str,
+    members: list[Result],
+    *,
+    supersedes_by_set: Mapping[str, str] | None = None,
+) -> CandidateSet:
+    """Create one set whose members are checked to share their feature artifacts.
+
+    ``supersedes_by_set`` maps a set name to the generation this run retires, keyed by name
+    rather than passed as one value because a notebook freezes several sets and the checker in
+    ``scripts/check_supersedes_literals.py`` places a declaration by the name it states. The
+    declaration is resolved through :func:`case_studies.research.candidate_set_supersedes` rather
+    than offered straight, so a reader's clean clone - which has no generation to replace, and
+    often no ``candidate_sets`` table at all - publishes generation one instead of being refused.
+
+    Nothing reached this argument before, and a candidate set is immutable under its name, so any
+    run whose membership moved stopped here with ``a changed candidate set named '...' must
+    explicitly supersedes <hash>`` and no parameter could answer it. Widening the sweep changes
+    the members by construction, which made every wider run unreachable.
+    """
     _require_agreeing_feature_artifacts(members)
     return CandidateSet.create(
         study,
         name,
         members,
         comparison_contract=dict(_NORMALIZED_FEATURE_ARTIFACT_CONTRACT),
+        supersedes=candidate_set_supersedes(
+            study, name=name, declared=(supersedes_by_set or {}).get(name)
+        ),
     )
 
 
@@ -1030,8 +1049,13 @@ def create_label_candidate_sets(
     execution: FuturesBacktestExecution,
     *,
     stage: str,
+    supersedes_by_set: Mapping[str, str] | None = None,
 ) -> dict[str, CandidateSet]:
-    """Create one immutable comparable backtest set per label."""
+    """Create one immutable comparable backtest set per label.
+
+    ``supersedes_by_set`` is keyed by the set's own name, so one declaration covers every label
+    this stage freezes.
+    """
     labels = execution.catalog_rows.get_column("label").unique().sort().to_list()
     output = {}
     for label in labels:
@@ -1042,6 +1066,7 @@ def create_label_candidate_sets(
             study,
             candidate_set_name(stage, label),
             members,
+            supersedes_by_set=supersedes_by_set,
         )
     return output
 
@@ -1105,8 +1130,7 @@ def rank_by_validation_sharpe(
     refused rather than sorted to an end, which is what a null would otherwise do silently.
 
     Unless it is bankrupt. A null Sharpe used to mean exactly one thing - the run was not
-    measured - and refusing was the whole of the right answer. Since ml4t/agent-workspace#920
-    it means two, because a path whose equity reaches zero stops compounding and registers
+    measured - and refusing was the whole of the right answer. It now means two, because a path whose equity reaches zero stops compounding and registers
     `sharpe`, `sortino`, `calmar`, `omega`, `stability` and `tail_ratio` as null on purpose:
     ranking a bankrupt path is the thing that issue exists to prevent. The `ruin` column is what
     separates the two, so this reads it rather than testing the Sharpe alone:
@@ -1148,10 +1172,18 @@ def pre_overlay_results(
     *,
     label: str,
     execution_tier: str,
+    supersedes_by_set: Mapping[str, str] | None = None,
 ) -> tuple[BacktestResult, ...]:
-    """The signal and allocation pool for one label, at the tier that produced it."""
+    """The signal and allocation pool for one label, at the tier that produced it.
+
+    ``supersedes_by_set`` is forwarded to the set this builds. Without it a caller could declare
+    a generation for `cme_futures-pre-overlay-<label>-v1` and still be refused, because the
+    canonical branch creates that set here and the declaration never arrived: measured
+    2026-09-19, when the weekend risk lane passed all six set names as ``live`` and stopped on
+    the one name this function owns.
+    """
     if execution_tier == "canonical":
-        pool = pre_overlay_candidate_set(study, label=label)
+        pool = pre_overlay_candidate_set(study, label=label, supersedes_by_set=supersedes_by_set)
         return tuple(Result.open(study, value) for value in pool.members)
     return (
         *stage_backtest_results(study, stage="signal", label=label, execution_tier=execution_tier),
@@ -1166,13 +1198,21 @@ def final_validation_results(
     *,
     label: str,
     execution_tier: str,
+    supersedes_by_set: Mapping[str, str] | None = None,
 ) -> tuple[BacktestResult, ...]:
     """The full selection pool for one label: signal, allocation and the risk overlay."""
     if execution_tier == "canonical":
-        pool = final_validation_candidate_set(study, label=label)
+        pool = final_validation_candidate_set(
+            study, label=label, supersedes_by_set=supersedes_by_set
+        )
         return tuple(Result.open(study, value) for value in pool.members)
     return (
-        *pre_overlay_results(study, label=label, execution_tier=execution_tier),
+        *pre_overlay_results(
+            study,
+            label=label,
+            execution_tier=execution_tier,
+            supersedes_by_set=supersedes_by_set,
+        ),
         *stage_backtest_results(study, stage="risk", label=label, execution_tier=execution_tier),
     )
 
@@ -1184,7 +1224,17 @@ def shortlist_signal_configurations(
     limit: int,
     execution_tier: str = "canonical",
 ) -> tuple[BacktestResult, ...]:
-    """Select the strongest signal result for each distinct model configuration."""
+    """Select the strongest signal result for each distinct model configuration.
+
+    ``limit`` is a promise, not a cap: a positive one that the population cannot fill raises,
+    because a caller that asked for 20 and got 8 is looking at a degenerate population and
+    silently ranking the 8 would hide it. ``limit=0`` asks for every distinct configuration,
+    the spelling ``top_n_predictions.signal`` already uses in every ``setup.yaml``, and is the
+    only way to ask for all of them without first knowing how many there are - which is the
+    one thing this function exists to compute. Asking with a number large enough to be sure,
+    999 against a population of 50, is indistinguishable from the degenerate case and raises.
+    """
+    cap = top_n_cap(limit)
     pool = stage_backtest_results(study, stage="signal", label=label, execution_tier=execution_tier)
     selected = []
     configurations = set()
@@ -1196,9 +1246,12 @@ def shortlist_signal_configurations(
             continue
         configurations.add(key)
         selected.append(result)
-        if len(selected) == limit:
+        if len(selected) == cap:
             break
-    if len(selected) != limit:
+    if cap is None:
+        if not selected:
+            raise ValueError("signal population holds no distinct configurations")
+    elif len(selected) != cap:
         raise ValueError(
             f"signal population has {len(selected)} distinct configurations, expected {limit}"
         )
@@ -1222,23 +1275,39 @@ def _union_members(study: Study, *pools: Iterable[str]) -> list[Result]:
     return [Result.open(study, value) for value in seen]
 
 
-def pre_overlay_candidate_set(study: Study, *, label: str) -> CandidateSet:
+def pre_overlay_candidate_set(
+    study: Study, *, label: str, supersedes_by_set: Mapping[str, str] | None = None
+) -> CandidateSet:
     """Return the immutable union of signal and allocation validation results."""
     signal = CandidateSet.one(study, name=candidate_set_name("signal", label))
     allocation = CandidateSet.one(study, name=candidate_set_name("allocation", label))
     members = _union_members(study, signal.members, allocation.members)
-    return _create_comparable_set(study, candidate_set_name("pre-overlay", label), members)
+    return _create_comparable_set(
+        study,
+        candidate_set_name("pre-overlay", label),
+        members,
+        supersedes_by_set=supersedes_by_set,
+    )
 
 
-def final_validation_candidate_set(study: Study, *, label: str) -> CandidateSet:
+def final_validation_candidate_set(
+    study: Study, *, label: str, supersedes_by_set: Mapping[str, str] | None = None
+) -> CandidateSet:
     """Return the selection pool across signal, allocation, and risk-overlay stages."""
-    pre_overlay = pre_overlay_candidate_set(study, label=label)
+    pre_overlay = pre_overlay_candidate_set(study, label=label, supersedes_by_set=supersedes_by_set)
     risk = CandidateSet.one(study, name=candidate_set_name("risk", label))
     members = _union_members(study, pre_overlay.members, risk.members)
-    return _create_comparable_set(study, candidate_set_name("final-validation", label), members)
+    return _create_comparable_set(
+        study,
+        candidate_set_name("final-validation", label),
+        members,
+        supersedes_by_set=supersedes_by_set,
+    )
 
 
-def final_selection_candidate_set(study: Study) -> CandidateSet:
+def final_selection_candidate_set(
+    study: Study, *, supersedes_by_set: Mapping[str, str] | None = None
+) -> CandidateSet:
     """Return the one immutable pool the case-study configuration is selected from.
 
     The funnel runs per label through the risk overlay. The object of selection is one
@@ -1252,13 +1321,19 @@ def final_selection_candidate_set(study: Study) -> CandidateSet:
     """
     members = []
     for label in ALL_LABELS:
-        pool = final_validation_candidate_set(study, label=label)
+        pool = final_validation_candidate_set(
+            study, label=label, supersedes_by_set=supersedes_by_set
+        )
         members.extend(Result.open(study, value) for value in pool.members)
+    name = "cme_futures-final-selection-v1"
     return CandidateSet.create(
         study,
-        "cme_futures-final-selection-v1",
+        name,
         members,
         comparison_contract={"comparable_fields": list(HORIZON_DEPENDENT_PROTOCOL_FIELDS)},
+        supersedes=candidate_set_supersedes(
+            study, name=name, declared=(supersedes_by_set or {}).get(name)
+        ),
     )
 
 

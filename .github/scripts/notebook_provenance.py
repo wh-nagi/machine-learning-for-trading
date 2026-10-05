@@ -145,11 +145,14 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import importlib.util
 import json
 import re
 import subprocess
 import sys
-from datetime import UTC, datetime, timezone
+import tempfile
+from collections.abc import Callable
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import NamedTuple
@@ -203,6 +206,20 @@ PRODUCTION_SAFE_PARAMETERS: dict[str, object] = {
     # cannot reduce the run, and register_causal_run refuses a hash that is not a
     # current canonical identity for the same label.
     "SUPERSEDES_CAUSAL": VALIDATED_BY_CONSUMER,
+    # The candidate-set generations this run retires, as a mapping of set name to the
+    # generation it supersedes. Same shape as the two above and admitted for the same
+    # reason: it adds declarations rather than removing work, so it cannot reduce the run,
+    # and `candidate_set_supersedes` withholds anything that does not resolve to the tip
+    # while `CandidateSet.create` refuses a hash it did not require and names the one it
+    # did. Its absence was the expensive kind of omission. The supersedes gate tells a
+    # reader to declare an undeclared generation before launching, every freezing notebook
+    # that has already run is stamped, and a source edit therefore returns STALE and owes a
+    # full re-render - costed at 44.15 h across the five `us_equities_panel` notebooks that
+    # freeze the twelve live generations (ml4t/agent-workspace#1175). Without this entry the
+    # launch-time route was not an escape from that: the run would take the scratch-copy
+    # path and the reader-facing notebook would still show the run this one replaced, which
+    # is the failure the `SUPERSEDES_POPULATION` comment in `nb-run.sh` describes.
+    "SUPERSEDES_SETS": VALIDATED_BY_CONSUMER,
     # Replaces a holdout evaluation the window already carries instead of adding a second
     # one. It deletes rows, which is why it is worth saying why it belongs here: it cannot
     # reduce what the run computes - the refit, the registration and every check still
@@ -1134,7 +1151,20 @@ def stamp_notebook(
     py = paired_py(nb_path)
     if py is None:
         raise SystemExit(f"no paired .py for {display_path(nb_path)} — cannot stamp")
-    nb = json.loads(nb_path.read_text(encoding="utf-8"))
+    # Strip before anything reads the outputs, so the digest below describes the file
+    # as it will be committed. A fresh run writes the Plotly payload back every time,
+    # and doing this here is what keeps that from becoming an ordering trap: stamp
+    # then strip leaves a digest computed over outputs that no longer exist, and the
+    # gate reports OUTPUTS CHANGED on a notebook whose numbers never moved. Lossless
+    # and bounded - it removes only a payload duplicated by a static image, touches no
+    # source, no execution count and no other mime type, and skips any output where
+    # the payload is the figure's only copy. See strip_plotly_json.py.
+    raw = nb_path.read_text(encoding="utf-8")
+    stripped_raw, stripped_count, _ = _plotly_rewrite_counted(raw)
+    if stripped_count:
+        nb_path.write_text(stripped_raw, encoding="utf-8")
+        raw = stripped_raw
+    nb = json.loads(raw)
     conflict = contradicts_injected_cell(nb, parameters)
     if conflict:
         raise SystemExit(f"refusing to stamp {display_path(nb_path)}: {conflict}")
@@ -1500,6 +1530,225 @@ def drift_is_alt_and_prose_only(stamped_blob: str, py: Path) -> bool:
     return before is not None and after is not None and before == after
 
 
+def _import_bindings(body: str) -> dict[str, tuple[int, int]] | None:
+    """Name each import in *body* binds, mapped to the physical line span of its statement.
+
+    ``import a.b`` binds ``a``; ``import a.b as c`` binds ``c``; ``from x import y`` binds
+    ``y``. The span is the whole statement rather than the alias, because a comment
+    anywhere in a parenthesized import block is the author saying something about that
+    block and this refuses on any of them.
+    """
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return None
+    out: dict[str, tuple[int, int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        span = (node.lineno, node.end_lineno or node.lineno)
+        for alias in node.names:
+            bound = alias.asname or alias.name.split(".")[0]
+            out[bound] = span
+    return out
+
+
+def _ends_in_an_expression(body: str) -> bool | None:
+    """Whether the last statement of a cell body is an expression Jupyter would display.
+
+    ``ast_node_interactivity`` is ``last_expr``, so a cell renders the value of its final
+    statement when that statement is an ``ast.Expr`` and renders nothing when it is not.
+    An import is not an expression, so an import in final position renders nothing and
+    suppresses whatever the statement before it would have rendered.
+
+    A cell whose final statement is the literal ``None`` reads as displaying here and
+    Jupyter shows nothing for it. That direction only adds a refusal, so it is left
+    unhandled rather than carried as a branch no test can kill.
+    """
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return None
+    return bool(tree.body) and isinstance(tree.body[-1], ast.Expr)
+
+
+def _unused_imports_removed(source: str) -> str | None:
+    """*source* with every import ruff reports as F401 removed, or None if ruff cannot say.
+
+    Normalizing both sides with the tool that produced the edit is what makes this
+    decidable instead of a second, divergent implementation of ruff's binding analysis.
+    It also gives the ``# noqa: F401`` refusal for free and by construction: ruff does not
+    report a suppressed import, so a suppressed import survives this on both sides, and
+    deleting one therefore still reads as a code change and still needs the run.
+
+    ``--isolated`` deliberately ignores the repository's ``pyproject.toml``, which is where
+    ``F401`` is currently switched off. Reading that config would make this return the
+    input unchanged and silently classify every drift as executable.
+
+    **The precondition asks whether ruff is importable, not what the run printed.** Exit 1
+    means "ruff ran and reported something" and is also what ``python -m <missing module>``
+    exits with, so the exit code alone cannot tell them apart: ``test-unit`` installed no
+    ruff, this read the unmodified file back, both sides normalised to themselves, and the
+    tier went inert with nothing saying so. Checking stderr instead was the first fix and it
+    is disarmable, because ruff writes warnings there from runs that ran and succeeded -
+    ``No Python files found under the given path(s)`` at exit 0, and an incompatible-rules
+    warning alongside real diagnostics at exit 1. Neither can fire under the argv below, but
+    both are one flag away, and the failure would be the silent direction again.
+    ``find_spec`` answers the question being asked and no message ruff chooses to print can
+    change its answer.
+    """
+    if importlib.util.find_spec("ruff") is None:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "cell_source.py"
+        path.write_text(source, encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ruff",
+                "check",
+                "--isolated",
+                "--no-cache",
+                "--select",
+                "F401",
+                "--fix",
+                "--quiet",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode not in (0, 1):
+            return None
+        return path.read_text(encoding="utf-8")
+
+
+def removed_import_bindings(old_src: str, new_src: str) -> list[str] | None:
+    """Bindings the edit removed, if the edit removed nothing else, else None.
+
+    ``None`` is the refusal, and it covers a source that will not parse, a changed cell
+    count, and a removed binding whose statement carries a comment. It does not need a
+    branch for an *added* import: one that survives normalization changes the compared
+    ASTs, and one that does not means the current ``.py`` still carries an unused import,
+    which ``drift_is_unused_import_only`` refuses before reaching here.
+
+    The comment rule is the widening of the ``noqa`` refusal. ``# noqa: F401`` is the
+    annotation this repository uses for an import that is load-bearing while unreferenced,
+    and it is handled by construction upstream. A comment that is not spelled ``noqa`` is
+    the same author saying the same kind of thing in their own words, so it refuses too.
+
+    The display rule covers a way removing an import changes a cell's output without
+    changing what it computes. A cell ending ``frame`` then ``import json`` displays
+    nothing, because the import is the final statement; drop the import and ``frame`` is
+    final and the next execution renders a table the committed notebook does not have.
+    Every comparison this tier makes is blind to it - both sides normalize to the same
+    source, the code-cell ASTs agree, and the preserved output counts are the counts of a
+    notebook that has not been run since. So it is checked directly, against the two raw
+    sources, and it refuses only when the removal is what moved the expression into final
+    position: an import removed from in front of a trailing expression changes no display
+    and is accepted.
+    """
+    old_cells = _code_bodies(old_src)
+    new_cells = _code_bodies(new_src)
+    if len(old_cells) != len(new_cells):
+        return None
+    removed: list[str] = []
+    for old_body, new_body in zip(old_cells, new_cells, strict=True):
+        old_binds = _import_bindings(old_body)
+        new_binds = _import_bindings(new_body)
+        if old_binds is None or new_binds is None:
+            return None
+        # Both bodies are known to parse: `_import_bindings` refused above if either did
+        # not, so neither call returns None here. Written so that an unparseable old body
+        # would refuse rather than read as "displayed nothing", if that ever changes.
+        if _ends_in_an_expression(new_body) and not _ends_in_an_expression(old_body):
+            return None
+        old_lines = old_body.splitlines()
+        for name in sorted(set(old_binds) - set(new_binds)):
+            start, end = old_binds[name]
+            if any("#" in line for line in old_lines[start - 1 : end]):
+                return None
+            removed.append(name)
+    return removed
+
+
+def drift_is_unused_import_only(stamped_blob: str, py: Path) -> tuple[bool, list[str]]:
+    """Whether a stale-reading drift removed only imports no code cell referenced.
+
+    The three tiers before this one are safe by construction. A markdown cell is a comment
+    block in the ``.py`` and cannot change what a code cell computes; an alt literal reaches
+    the output as metadata that ``fig._repr_mimebundle_()`` never sees; a sanitized path is
+    compared byte for byte against the sanitizer's own output. **This tier is safe by
+    assumption, and the assumption is that an unreferenced import had no side effect.**
+
+    Nothing in the source distinguishes the two cases: an import that is load-bearing by
+    side effect has zero references by construction, so it reads exactly like a dead one.
+    ``case_studies/utils/latent_factors/__init__.py`` imports ``torch`` for cudart symbol
+    ordering and is referenced nowhere, and that is the shape this cannot see.
+
+    **There is a second shape, and it cost a CI failure before it was written down: a
+    re-export.** ``case_studies/utils/gbm.py`` imports ``fold_seed`` and never calls it,
+    because ``tests/test_fold_seed_coupling.py`` asserts ``gbm.fold_seed is fold_seed`` -
+    the consumer reads the name through the module object, so the defining file never
+    mentions it again and it is indistinguishable from dead. It also defeats the obvious
+    review check, "no file still references a name it lost", because the reference is in a
+    different file and is spelled ``<module>.<name>``. Sweep for that spelling when
+    clearing imports by hand.
+
+    This command is narrower than that sweep and today the shape cannot reach it: it only
+    ever edits a ``.py`` that has an ``.ipynb`` beside it, and measured 2026-09-15 none of
+    the 484 paired files is a target of any ``import_module`` call in the repo, so nothing
+    imports one as a module to read an attribute off. That is a fact about the current tree
+    rather than a guarantee - a numbered name is importable through ``import_module`` even
+    though it is not an identifier, and one unpaired file under ``data/`` is imported that
+    way already. Two things narrow it rather than close it. ``# noqa: F401`` and any other
+    comment on the statement refuse, which is the only signal the source carries. And
+    ``sync_imports`` records every removed binding in the stamp, so a pass here is a dated
+    claim a later reader can check rather than a silence.
+
+    **A third way an unreferenced import can be load-bearing is decidable, and is refused
+    rather than assumed away.** An import that is the last statement of a cell suppresses
+    the display of the expression before it, so removing it makes the next execution render
+    an output the committed notebook does not carry. ``removed_import_bindings`` compares
+    the two raw sources for that and refuses the file. Nothing else here can see it: both
+    sides normalize to the same source, the code-cell ASTs agree, and the output counts
+    being preserved is what a not-yet-re-run notebook looks like either way.
+
+    Returns the verdict and the bindings removed, because the caller needs both and
+    computing them twice would let the report and the stamp disagree.
+    """
+    old = subprocess.run(
+        ["git", "cat-file", "blob", stamped_blob],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if old.returncode != 0:
+        return False, []  # stamped blob is gone; cannot compare, so do not soften the report
+    old_src = old.stdout
+    new_src = py.read_text(encoding="utf-8")
+    fixed_old = _unused_imports_removed(old_src)
+    fixed_new = _unused_imports_removed(new_src)
+    if fixed_old is None or fixed_new is None:
+        return False, []
+    if fixed_new != new_src:
+        # The .py still carries an unused import ruff would remove. Refusing keeps the
+        # stamp's claim exact - "this source has none left" - and keeps a half-done pass
+        # from spending the tier twice on the same notebook.
+        return False, []
+    before = code_cells_only(_comparable(fixed_old, blank_alts=False))
+    after = code_cells_only(_comparable(fixed_new, blank_alts=False))
+    if before is None or after is None or before != after:
+        return False, []
+    removed = removed_import_bindings(old_src, new_src)
+    if not removed:
+        return False, []
+    return True, removed
+
+
 def _output_counts(nb: dict) -> list[int]:
     """Outputs per code cell, in order. The unit a prose sync must leave untouched."""
     return [len(c.get("outputs", [])) for c in nb.get("cells", []) if c.get("cell_type") == "code"]
@@ -1629,6 +1878,188 @@ def sync_prose(nb_path: Path) -> str:
     return stamp["source_py_blob"]
 
 
+def sync_imports(nb_path: Path) -> str:
+    """Fold the removal of unreferenced imports into an executed notebook, without re-running.
+
+    ``sync_prose`` refuses this and is right to: deleting an import changes a code cell's
+    AST, so ``_comparable`` reports a changed cell and the report says re-run. Rule 6 says
+    a fix that changes no computed value does not owe a re-run, so the obligation is
+    already gone - but the gate still refuses the commit, and rule 5 says never bypass a
+    hook. Without this command a dead ``import numpy`` in a 734-output notebook has no way
+    to land at all. That is the same gap ``sync-prose``, ``sync-alt`` and ``sync-paths``
+    were each built to close.
+
+    What makes it decidable is that ruff normalizes both sides. If removing every unused
+    import from the stamped source and from the current source leaves two identical code-cell
+    sequences, the edit removed nothing else. Read
+    ``drift_is_unused_import_only`` for the assumption this rests on and cannot check.
+
+    Outputs are preserved by the same mechanism ``sync_prose`` uses, and the same per-cell
+    count check enforces it. An import statement emits no output, so a removal that changed
+    an output count changed something else too.
+    """
+    py = paired_py(nb_path)
+    rel = nb_path.relative_to(REPO_ROOT)
+    if py is None:
+        raise SystemExit(f"no paired .py for {rel}")
+    nb = json.loads(nb_path.read_text(encoding="utf-8"))
+    stamp = nb.get("metadata", {}).get(STAMP_KEY)
+    if not stamp:
+        raise SystemExit(
+            f"{rel} carries no provenance stamp, so there is no executed state to preserve. Run it."
+        )
+    stamped_blob = stamp["source_py_blob"]
+    ok, removed = drift_is_unused_import_only(stamped_blob, py)
+    if not ok:
+        raise SystemExit(
+            f"{rel}: this is not an unused-import removal. Either a code cell changed for some "
+            "other reason, or an import was added, or a removed import carried a comment - "
+            "`# noqa: F401` marks an import that is load-bearing while unreferenced, and this "
+            "command will not delete the evidence that it was. Re-run the notebook, or use "
+            "sync-prose for a markdown-only edit."
+        )
+
+    before_counts = _output_counts(nb)
+    result = subprocess.run(
+        [sys.executable, "-m", "jupytext", "--to", "ipynb", "--update", str(py)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        if "No module named jupytext" in result.stderr:
+            raise SystemExit(
+                f"{rel}: jupytext is not installed in {sys.executable}. Run this command through "
+                "the repository environment with `uv run python`."
+            )
+        raise SystemExit(f"{rel}: jupytext --update failed:\n{result.stderr}")
+
+    after_counts = _output_counts(json.loads(nb_path.read_text(encoding="utf-8")))
+    if after_counts != before_counts:
+        lost = [i + 1 for i, (b, a) in enumerate(zip(before_counts, after_counts)) if a < b]
+        raise SystemExit(
+            f"{rel}: the update changed the outputs, which is the one thing it exists to "
+            + (
+                f"avoid - code cell(s) {lost} lost theirs. "
+                if lost
+                else f"avoid - {len(before_counts)} code cells before, {len(after_counts)} now. "
+            )
+            + "The file has been left as jupytext wrote it; restore it with `git checkout`."
+        )
+    nb = json.loads(nb_path.read_text(encoding="utf-8"))
+    stamp = dict(stamp)
+    stamp["source_py_blob"] = git_blob(py, write=True)
+    # Name every binding. This is the only record that says WHICH imports went, and the
+    # classifier's blind spot - an import that was load-bearing by side effect reads as dead -
+    # is checkable by a later reader only if the names are written down.
+    stamp["notes"] = (
+        f"unreferenced imports removed from the .py at {datetime.now(UTC).isoformat()} without "
+        f"re-executing: {', '.join(removed)}. Every other code cell is identical to blob "
+        f"{stamped_blob[:12]}; no output was rewritten."
+    )
+    nb.setdefault("metadata", {})[STAMP_KEY] = stamp
+    nb_path.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    return stamp["source_py_blob"]
+
+
+def sync_inert(nb_path: Path, reason: str) -> str:
+    """Fold a code edit that cannot change what the executed run computed, without re-running.
+
+    The last resort of the ``sync-*`` family, and the only one that is not decidable from
+    the source alone. ``sync-prose``, ``sync-alt``, ``sync-paths`` and ``sync-imports`` each
+    recognise their edit mechanically and refuse anything else. Some inert edits are not
+    recognisable that way: removing a conjunct from a guard that the executed run's own
+    parameters already made true, or threading an argument that does not enter any stored
+    identity. Rule 6 says such a fix does not owe a re-run, and for a notebook whose case
+    study froze its populations a re-run is not merely expensive - the freeze refuses it, so
+    the alternatives are shipping the notebook with no outputs or not fixing it at all.
+
+    What is checked mechanically is everything except the claim itself. The outputs on disk
+    must still be byte-for-byte the ones the recorded run produced, so no edited, re-rendered
+    or hand-written output can enter under this command; the ``.py`` must actually have moved;
+    and the ``.ipynb`` source is rebuilt from the ``.py`` so the pair cannot disagree.
+
+    What is not checked is why the edit is inert, which is why ``reason`` is required and is
+    written into the stamp. ``executed_at``, ``executor``, ``parameters`` and
+    ``outputs_digest`` are kept: the outputs are still that run's, and a fabricated execution
+    time would be the one part of the record nobody could later correct.
+    """
+    py = paired_py(nb_path)
+    rel = nb_path.relative_to(REPO_ROOT)
+    if py is None:
+        raise SystemExit(f"no paired .py for {rel}")
+    if len(reason.split()) < 5:
+        raise SystemExit(
+            f"{rel}: --reason must say why the edit cannot change what the run computed. "
+            "It is the only record of an assertion this command cannot check."
+        )
+    nb = json.loads(nb_path.read_text(encoding="utf-8"))
+    stamp = nb.get("metadata", {}).get(STAMP_KEY)
+    if not stamp:
+        raise SystemExit(
+            f"{rel} carries no provenance stamp, so there is no executed state to preserve. Run it."
+        )
+    recorded = stamp.get("outputs_digest")
+    if recorded is None:
+        raise SystemExit(
+            f"{rel}: the stamp records no outputs_digest, so nothing pins its outputs."
+        )
+    if recorded != outputs_digest(nb):
+        raise SystemExit(
+            f"{rel}: the outputs on disk are not the ones the stamp records, so this is not an "
+            "edit that left the run's results alone. Re-run the notebook, or use the sync-* "
+            "command that matches what actually changed."
+        )
+    stamped_blob = stamp["source_py_blob"]
+    if stamped_blob == git_blob(py):
+        raise SystemExit(
+            f"{rel}: the .py has not moved since the stamp, so there is nothing to fold in."
+        )
+
+    before_counts = _output_counts(nb)
+    result = subprocess.run(
+        [sys.executable, "-m", "jupytext", "--to", "ipynb", "--update", str(py)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        if "No module named jupytext" in result.stderr:
+            raise SystemExit(
+                f"{rel}: jupytext is not installed in {sys.executable}. Run this command through "
+                "the repository environment with `uv run python`."
+            )
+        raise SystemExit(f"{rel}: jupytext --update failed:\n{result.stderr}")
+
+    nb = json.loads(nb_path.read_text(encoding="utf-8"))
+    if _output_counts(nb) != before_counts:
+        raise SystemExit(
+            f"{rel}: the update changed the outputs, which is the one thing it exists to avoid. "
+            "The file has been left as jupytext wrote it; restore it with `git checkout`."
+        )
+    if outputs_digest(nb) != recorded:
+        raise SystemExit(
+            f"{rel}: the update changed outputs_digest, so the .py and the executed notebook "
+            "disagree about more than the source. Restore it with `git checkout`."
+        )
+
+    stamp = dict(stamp)
+    previous_library = stamp.get("library_digest")
+    stamp["source_py_blob"] = git_blob(py, write=True)
+    stamp["library_digest"] = library_digest(py)
+    stamp["inert_edit"] = {
+        "reason": reason,
+        "folded_at": datetime.now(UTC).isoformat(),
+        "previous_source_py_blob": stamped_blob,
+        "previous_library_digest": previous_library,
+    }
+    nb.setdefault("metadata", {})[STAMP_KEY] = stamp
+    nb_path.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    return stamp["source_py_blob"]
+
+
 def sync_paths(nb_path: Path) -> str:
     """Re-stamp a notebook whose only change is the path sanitizer's rewrite.
 
@@ -1650,9 +2081,76 @@ def sync_paths(nb_path: Path) -> str:
     The stamp keeps its `source_py_blob`, `executed_at` and `executor`, because the `.py`
     did not change and the outputs are still the ones that run produced.
     """
-    rel = nb_path.relative_to(REPO_ROOT)
+    return _fold_output_rewrite(
+        nb_path,
+        rewrite=_sanitize_rewrite,
+        what="paths sanitized",
+        note="machine-specific paths sanitized out of the outputs",
+    )
+
+
+def _sanitize_rewrite(raw: str) -> str:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from sanitize_notebook_paths import sanitize_notebook
+
+    return sanitize_notebook(raw)[0]
+
+
+def _plotly_rewrite(raw: str) -> str:
+    return _plotly_rewrite_counted(raw)[0]
+
+
+def _plotly_rewrite_counted(raw: str) -> tuple[str, int, int]:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from strip_plotly_json import strip_plotly
+
+    return strip_plotly(raw)
+
+
+def sync_plotly(nb_path: Path) -> str:
+    """Re-stamp a notebook whose only change is the Plotly JSON strip.
+
+    `strip_plotly_json.py` removes the embedded `application/vnd.plotly.v1+json`
+    payload from outputs that already carry a static `image/png` of the same figure.
+    That payload is hashed by `outputs_digest`, so the strip reads as stale.
+
+    A re-run is the wrong answer for the same reason it is wrong after a path
+    sanitize: re-executing writes the Plotly JSON straight back, so the gate would be
+    demanding the one action that undoes the fix. Nothing a reader sees moves - the
+    PNG the strip relies on is the figure every static reader was already shown, and
+    the stripper refuses to touch an output that has no PNG.
+
+    Decidable rather than trusted, exactly as `sync_paths` is: the committed notebook
+    is re-stripped and the result must equal the file on disk byte for byte.
+    """
+    return _fold_output_rewrite(
+        nb_path,
+        rewrite=_plotly_rewrite,
+        what="Plotly JSON stripped",
+        note="embedded Plotly figure JSON stripped from outputs carrying a static image",
+    )
+
+
+def _fold_output_rewrite(
+    nb_path: Path,
+    *,
+    rewrite: Callable[[str], str],
+    what: str,
+    note: str,
+) -> str:
+    """Fold a mechanical, re-derivable rewrite of a notebook's outputs into its stamp.
+
+    Shared by `sync_paths` and `sync_plotly`, which differ only in the rewrite and the
+    wording. Both are edits that re-executing cannot produce and would in fact reverse,
+    so the stamp keeps its `source_py_blob`, `executed_at` and `executor` and only
+    `outputs_digest` moves.
+
+    Nothing here takes the author's word for what changed. It re-applies *rewrite* to
+    the notebook as committed at HEAD and requires the result to equal the working copy
+    exactly; a moved number, an edited cell or a regenerated figure fails that and is
+    refused, because this cannot tell one from the other.
+    """
+    rel = nb_path.relative_to(REPO_ROOT)
 
     nb = json.loads(nb_path.read_text(encoding="utf-8"))
     stamp = nb.get("metadata", {}).get(STAMP_KEY)
@@ -1677,36 +2175,52 @@ def sync_paths(nb_path: Path) -> str:
     if committed.returncode != 0:
         raise SystemExit(
             f"{rel} is not committed at HEAD, so there is nothing to compare the rewrite "
-            "against. This command folds in a sanitize of an already-committed notebook."
+            "against. This command folds in a rewrite of an already-committed notebook."
         )
 
     old = json.loads(committed.stdout)
     old_stamp = old.get("metadata", {}).get(STAMP_KEY) or {}
+
+    # A stamp written before `outputs_digest` existed has nothing pinning its outputs,
+    # which the gate states explicitly: it counts such a notebook rather than failing
+    # it. There is therefore nothing for this rewrite to invalidate and nothing to
+    # re-stamp. Writing a digest here would assert that these outputs are the ones that
+    # run produced, which is the one claim the absent field means nobody can make.
+    #
+    # Without this branch the comparison below reads `<digest> != None` and refuses the
+    # notebook as "stale before this rewrite", which is false - it is undated, not
+    # stale. Six notebooks in `18_transaction_costs` and `19_risk_management` are in
+    # this state, and `sync_paths` has been refusing them the same way.
+    # This runs before any stamp comparison, and must: it is the only check that says
+    # the working copy is the rewrite and nothing besides, and every branch below needs
+    # that to be true - including the one that writes no stamp at all.
+    if json.loads(rewrite(committed.stdout)) != nb:
+        raise SystemExit(
+            f"{rel}: the file on disk is not the committed notebook with {what}, so something "
+            "else changed too. Refusing - this command cannot tell a moved number from a "
+            "mechanical rewrite, so it insists the two agree exactly."
+        )
+
+    if old_stamp.get("outputs_digest") is None:
+        return ""
+
     if old_stamp.get("outputs_digest") != stamp.get("outputs_digest"):
         raise SystemExit(
             f"{rel}: the stamp on disk is not the one at HEAD, so this working copy carries "
-            "more than a sanitize. Refusing rather than stamping over it."
+            "more than the rewrite. Refusing rather than stamping over it."
         )
     if outputs_digest(old) != old_stamp.get("outputs_digest"):
         raise SystemExit(
             f"{rel}: the committed notebook's outputs already disagree with its own stamp, so "
-            "it was stale before this rewrite. That is a re-run, not a sanitize."
-        )
-
-    expected_raw, _replaced, _skipped = sanitize_notebook(committed.stdout)
-    if json.loads(expected_raw) != nb:
-        raise SystemExit(
-            f"{rel}: the file on disk is not the committed notebook with its paths sanitized, "
-            "so something else changed too. Refusing - this command cannot tell a moved number "
-            "from a moved path, so it insists the two agree exactly."
+            "it was stale before this rewrite. That is a re-run, not a mechanical edit."
         )
 
     stamp = dict(stamp)
     stamp["outputs_digest"] = outputs_digest(nb)
     stamp["notes"] = (
-        f"machine-specific paths sanitized out of the outputs at "
-        f"{datetime.now(UTC).isoformat()} without re-executing; every other byte of every "
-        f"output is identical to the run stamped at {stamp.get('executed_at', 'unknown')}"
+        f"{note} at {datetime.now(UTC).isoformat()} without re-executing; every other "
+        f"byte of every output is identical to the run stamped at "
+        f"{stamp.get('executed_at', 'unknown')}"
     )
     nb.setdefault("metadata", {})[STAMP_KEY] = stamp
     nb_path.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -2011,13 +2525,53 @@ def _cmd_sync_alt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sync_imports(args: argparse.Namespace) -> int:
+    for name in args.notebooks:
+        path = Path(name).resolve()
+        if path.suffix == ".py":
+            path = path.with_suffix(".ipynb")
+        blob = sync_imports(path)
+        print(f"imports synced {path.relative_to(REPO_ROOT)}: source_py_blob={blob[:12]}")
+    return 0
+
+
+def _cmd_sync_inert(args: argparse.Namespace) -> int:
+    for name in args.notebooks:
+        path = Path(name).resolve()
+        if path.suffix == ".py":
+            path = path.with_suffix(".ipynb")
+        blob = sync_inert(path, args.reason)
+        print(f"inert edit synced {path.relative_to(REPO_ROOT)}: source_py_blob={blob[:12]}")
+    return 0
+
+
 def _cmd_sync_paths(args: argparse.Namespace) -> int:
     for name in args.notebooks:
         path = Path(name).resolve()
         if path.suffix == ".py":
             path = path.with_suffix(".ipynb")
         digest = sync_paths(path)
+        if not digest:
+            print(
+                f"paths synced {path.relative_to(REPO_ROOT)}: stamp predates outputs_digest, nothing to re-stamp"
+            )
+            continue
         print(f"paths synced {path.relative_to(REPO_ROOT)}: outputs_digest={digest[:12]}")
+    return 0
+
+
+def _cmd_sync_plotly(args: argparse.Namespace) -> int:
+    for name in args.notebooks:
+        path = Path(name).resolve()
+        if path.suffix == ".py":
+            path = path.with_suffix(".ipynb")
+        digest = sync_plotly(path)
+        if not digest:
+            print(
+                f"plotly stripped {path.relative_to(REPO_ROOT)}: stamp predates outputs_digest, nothing to re-stamp"
+            )
+            continue
+        print(f"plotly stripped {path.relative_to(REPO_ROOT)}: outputs_digest={digest[:12]}")
     return 0
 
 
@@ -2137,7 +2691,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
         for r in lost:
             print(f"  {r}")
     if stale:
-        prose, alt, executable = [], [], []
+        prose, alt, imports, executable = [], [], [], []
         for r in stale:
             nb_path = REPO_ROOT / r
             py = paired_py(nb_path)
@@ -2153,6 +2707,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
                 prose.append(r)
             elif drift_is_alt_and_prose_only(stamped, py):
                 alt.append(r)
+            elif drift_is_unused_import_only(stamped, py)[0]:
+                imports.append(r)
             else:
                 executable.append(r)
         if prose:
@@ -2169,6 +2725,14 @@ def _cmd_check(args: argparse.Namespace) -> int:
                 "  uv run python .github/scripts/notebook_provenance.py sync-alt <nb.py>):"
             )
             for r in alt:
+                print(f"  {r}")
+        if imports:
+            print(
+                "STALE, unreferenced imports removed (no code cell moved for anything else - "
+                "fold it in, do NOT re-run:\n"
+                "  uv run python .github/scripts/notebook_provenance.py sync-imports <nb.py>):"
+            )
+            for r in imports:
                 print(f"  {r}")
         if executable:
             print(
@@ -2321,6 +2885,20 @@ def main() -> int:
     sp.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
     sp.set_defaults(func=_cmd_sync_paths)
 
+    gp = sub.add_parser(
+        "sync-plotly",
+        help="fold the Plotly JSON strip into the executed .ipynb, keeping its outputs",
+        description=(
+            "For a notebook whose only change is `strip_plotly_json.py` removing the "
+            "embedded Plotly payload from outputs that already carry a static image of the "
+            "same figure. Re-running cannot fix that - it writes the payload straight back - "
+            "so the stamp keeps its executed_at and executor and only outputs_digest moves. "
+            "Refuses unless the file on disk is exactly the committed notebook re-stripped."
+        ),
+    )
+    gp.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
+    gp.set_defaults(func=_cmd_sync_plotly)
+
     pp = sub.add_parser(
         "prose",
         help="print every markdown cell, for a review pass that touches no code",
@@ -2353,6 +2931,42 @@ def main() -> int:
     )
     ap_alt.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
     ap_alt.set_defaults(func=_cmd_sync_alt)
+
+    ap_imp = sub.add_parser(
+        "sync-imports",
+        help="fold the removal of unreferenced imports into the executed .ipynb",
+        description=(
+            "For a change that removes only imports no code cell references. Rule 6 already "
+            "says such a fix does not owe a re-run; this is what lets it past the gate, which "
+            "compares whole blobs and cannot tell one edit from another. Refuses if a code "
+            "cell moved for any other reason, if an import was added, if the .py still carries "
+            "an unused import, or if a removed import carried `# noqa: F401` or any other "
+            "comment - that comment is the only signal in the source that an unreferenced "
+            "import is load-bearing. Records every removed binding in the stamp."
+        ),
+    )
+    ap_imp.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
+    ap_imp.set_defaults(func=_cmd_sync_imports)
+
+    ap_inert = sub.add_parser(
+        "sync-inert",
+        help="fold a code edit that cannot change what the executed run computed",
+        description=(
+            "The last resort of the sync-* family, for an inert edit none of the others "
+            "recognises - a guard the run's own parameters already decided, an argument that "
+            "enters no stored identity. It checks everything but the claim: the outputs must "
+            "still be byte-identical to the recorded run's, the .py must have moved, and the "
+            ".ipynb source is rebuilt from the .py. The claim itself goes in --reason and is "
+            "written into the stamp, which keeps executed_at, executor and outputs_digest."
+        ),
+    )
+    ap_inert.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
+    ap_inert.add_argument(
+        "--reason",
+        required=True,
+        help="why this edit cannot change what the run computed",
+    )
+    ap_inert.set_defaults(func=_cmd_sync_inert)
 
     args = ap.parse_args()
     return args.func(args)

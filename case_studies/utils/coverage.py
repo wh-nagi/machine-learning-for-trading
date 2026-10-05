@@ -36,7 +36,7 @@ separate answer.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -896,6 +896,40 @@ class CrossSectionReport:
             )
 
 
+# One process asks for the same cross-section once per prediction set it checks, and the
+# answer depends only on the case study, the label, the split and the registry directory -
+# never on the member being checked. `undercovered_prediction_members` walks every member in
+# force, so nasdaq100_microstructure rebuilt an identical 9.6M-row frame 784 times: measured
+# 5.9 s each against a 0.14 s parquet read and 1.3 s of joins, which is 4,600 s of the 8,608 s
+# that function spends before a sweep starts. Keyed on the resolved directory rather than the
+# passed one so `None` and an explicit path share an entry.
+#
+# Only the `decision_axis is None` calls are cached: a Series is not hashable, and a caller
+# narrowing the axis is asking a different question per call. The entry is the frame itself,
+# which is safe because every consumer filters, joins or selects, and each of those returns a
+# new frame. The label artifact is written by an earlier stage and not during a run, so there
+# is no invalidation to do inside one process; `declared_cross_section.cache_clear()` exists
+# for a test that writes one.
+_CROSS_SECTION_CACHE: dict[tuple[str, str, str, str], pl.DataFrame] = {}
+
+
+# The input panel's distinct `(entity, session)` keys, keyed on `id(input_panel)` in
+# `check_prediction_cross_section` below and holding a reference to that frame so the id
+# cannot be recycled while the entry lives. Declared here so one call drops both memos.
+#
+# Deliberately not keyed on the case study, label, split or folds: what it holds is a property
+# of the panel alone. An entry that depended on the declared cross-section would have to name
+# everything that narrows it, and that list can only be as complete as somebody's memory - see
+# the comment at the use site.
+_PANEL_KEYS_CACHE: dict[int, tuple[pl.DataFrame, pl.DataFrame]] = {}
+
+
+def _clear_cross_section_cache() -> None:
+    """Drop both memos. For a test that rewrites a label artifact inside one process."""
+    _CROSS_SECTION_CACHE.clear()
+    _PANEL_KEYS_CACHE.clear()
+
+
 def declared_cross_section(
     case_study: str,
     label: str,
@@ -916,6 +950,10 @@ def declared_cross_section(
     ``product`` and its prediction panels by ``symbol``, so comparing by the source
     name would report every row missing.
     """
+    key = (case_study, label, split, str(_label_artifact(case_study, label, case_dir)))
+    if decision_axis is None and key in _CROSS_SECTION_CACHE:
+        return _CROSS_SECTION_CACHE[key]
+
     sessions = declared_sessions(
         case_study, label, split=split, case_dir=case_dir, decision_axis=decision_axis
     )
@@ -950,7 +988,10 @@ def declared_cross_section(
             f"{case_study}/{label}/{split}: no declared fold carries a session, so the "
             "cross-section is empty and coverage cannot be evaluated"
         )
-    return pl.concat(parts).select("fold", "entity", "session")
+    result = pl.concat(parts).select("fold", "entity", "session")
+    if decision_axis is None:
+        _CROSS_SECTION_CACHE[key] = result
+    return result
 
 
 def check_prediction_cross_section(
@@ -964,6 +1005,7 @@ def check_prediction_cross_section(
     decision_axis: pl.Series | None = None,
     input_panel: pl.DataFrame | None = None,
     folds: Collection[int] | None = None,
+    eligible_entities: Mapping[int, Collection[str]] | None = None,
     minimum: float | None = None,
 ) -> CrossSectionReport:
     """Measure a prediction set against the ``(entity, session)`` grid the label declares.
@@ -981,6 +1023,18 @@ def check_prediction_cross_section(
     An entity absent from every fold and one missing its first weeks produce the same
     percentage and are different failures, so ``never_scored`` and ``partially_scored``
     are reported apart.
+
+    ``eligible_entities`` narrows the *symbol* axis, per fold, to the entities the run's
+    own panel builder would have admitted. The fold narrowing above deliberately leaves the
+    symbol axis on the panel, because a family that lost names inside the folds it ran must
+    still be charged for them - that stays true. This is the one case it does not cover: a
+    model whose builder refuses an entity before the fit sees it never lost that name, it
+    was never offered it, and charging it is charging it for a denominator it cannot reach.
+    Only ``latent_factors/pca`` is in that position today
+    (``latent_factors.panel.PERSISTENT_PANEL_MODELS``), and the admitted set comes from
+    ``eligible_persistent_entities``, the same function the builder itself calls, so the
+    two cannot drift apart. Sessions stay fully charged inside the admitted entities, so a
+    member short a session for an entity it does carry still fails.
 
     ``folds`` is the fold axis the run was asked to produce, and it is not derivable from
     the case study: ``declared_sessions`` reads the fold windows from the configuration,
@@ -1011,27 +1065,75 @@ def check_prediction_cross_section(
                 "configuration declares none of them, so the cross-section is empty and "
                 "coverage cannot be evaluated"
             )
+    if eligible_entities is not None:
+        admitted = pl.DataFrame(
+            [
+                {"fold": int(fold), "entity": str(entity)}
+                for fold, entities in eligible_entities.items()
+                for entity in entities
+            ],
+            schema={"fold": pl.Int64, "entity": pl.String},
+        )
+        if admitted.is_empty():
+            raise CoverageError(
+                f"{case_study}/{label}/{split}: the run's panel builder admitted no entity "
+                "in any declared fold, so the cross-section is empty and coverage cannot be "
+                "evaluated"
+            )
+        want = want.join(admitted, on=["fold", "entity"], how="semi")
+        if want.is_empty():
+            raise CoverageError(
+                f"{case_study}/{label}/{split}: no entity the run's panel builder admitted "
+                "appears in the declared cross-section, so coverage cannot be evaluated"
+            )
     delivered = want.join(got, on=["entity", "session"], how="semi")
     missing = want.join(got, on=["entity", "session"], how="anti")
 
     achievable = delivered_achievable = None
     if input_panel is not None:
-        # `feature_panel_keys` hands back the canonical two columns already; a caller
-        # passing a raw panel gets them resolved. Without this branch the canonical shape
-        # is the one shape that fails, because "entity" is not among the source names a
-        # panel is allowed to use.
-        if {"entity", "session"} <= set(input_panel.columns):
-            panel_entity, panel_time = "entity", "session"
+        # `offered` is the panel's distinct `(entity, session)` keys. A caller walking every
+        # member in force rebuilds it once per member: 1.26 s to unique a 16.9M-row panel,
+        # measured on nasdaq100_microstructure, against 0.14 s to read the member's own
+        # predictions. So it is memoized, and `reachable` - `want` narrowed to it - is not.
+        #
+        # **The memo holds what cannot depend on a narrowing.** `offered` is a function of
+        # `input_panel` and nothing else. The previous version memoized `reachable`, which is
+        # derived from `want`, against a key that enumerated `want`'s inputs by hand; a
+        # narrowing parameter absent from that list read an entry built on the wider axis and
+        # reported the member against a denominator the call had just removed - right code,
+        # wrong number, nothing raised. `eligible_entities` hit exactly that, and the list
+        # could only ever be as complete as somebody's memory of what `want` depends on. Keyed
+        # on the panel alone, no parameter anyone adds later can make this entry stale.
+        #
+        # The join is paid per member instead: 1.07 s, measured the same way. That is the
+        # price of the property, and it is charged against the members the caller can act on
+        # rather than every published member - see `prediction_members_in_force`'s
+        # `candidates`, which is what makes it affordable.
+        #
+        # The key holds `id(input_panel)` and the entry holds a reference to that frame, so
+        # the id cannot be recycled onto a different panel while the entry is live - an id is
+        # unique among live objects and this keeps the object live.
+        cached = _PANEL_KEYS_CACHE.get(id(input_panel))
+        if cached is not None and cached[0] is input_panel:
+            offered = cached[1]
         else:
-            panel_entity = _entity_column(input_panel.columns, where="input panel")
-            panel_time = _time_column(input_panel.columns)
-        offered = input_panel.select(
-            pl.col(panel_entity).cast(pl.String).alias("entity"),
-            pl.col(panel_time).alias("session"),
-        ).unique()
-        offered = offered.with_columns(
-            _normalize_time(offered.get_column("session")).alias("session")
-        )
+            # `feature_panel_keys` hands back the canonical two columns already; a caller
+            # passing a raw panel gets them resolved. Without this branch the canonical
+            # shape is the one shape that fails, because "entity" is not among the source
+            # names a panel is allowed to use.
+            if {"entity", "session"} <= set(input_panel.columns):
+                panel_entity, panel_time = "entity", "session"
+            else:
+                panel_entity = _entity_column(input_panel.columns, where="input panel")
+                panel_time = _time_column(input_panel.columns)
+            offered = input_panel.select(
+                pl.col(panel_entity).cast(pl.String).alias("entity"),
+                pl.col(panel_time).alias("session"),
+            ).unique()
+            offered = offered.with_columns(
+                _normalize_time(offered.get_column("session")).alias("session")
+            )
+            _PANEL_KEYS_CACHE[id(input_panel)] = (input_panel, offered)
         reachable = want.join(offered, on=["entity", "session"], how="semi")
         achievable = reachable.height
         delivered_achievable = reachable.join(got, on=["entity", "session"], how="semi").height

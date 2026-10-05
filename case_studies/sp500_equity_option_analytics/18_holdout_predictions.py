@@ -68,14 +68,11 @@
 
 import hashlib
 import sqlite3
-import warnings
 from pathlib import Path
 
 import polars as pl
 
-warnings.filterwarnings("ignore")
-
-from case_studies.research import CandidateSet, open_selection_field, open_study
+from case_studies.research import open_selection_field, open_study
 from case_studies.research.holdout import build_holdout_training_spec
 from case_studies.research.models import (
     reconstruct_locked_model_request,
@@ -86,13 +83,24 @@ from case_studies.utils.backtest_presets import strategy_view
 from case_studies.utils.notebook_contracts import prediction_members_in_force
 from case_studies.utils.registry import resolve_best_backtest_runs
 from case_studies.utils.registry.specs import training_hash_from_spec
-from case_studies.utils.strategy_analysis import resolve_solvent_carrier
+from case_studies.utils.strategy_analysis import (
+    holdout_generations_to_retire,
+    refuse_a_second_look,
+    resolve_solvent_carrier,
+)
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "sp500_equity_option_analytics"
 EXECUTION_TIER = "canonical"
 WORKSPACE: str = ""
 LABEL = ""
+# Prediction sets this run accepts retiring, when the holdout window already carries a refit
+# of a different configuration. Empty is the default and the refusal is the default with it.
+# Per generation rather than a boolean on purpose: a boolean is set once and left set, and the
+# guard is decorative after that. Naming the prediction set makes each override a statement
+# about one window that somebody had to look up, and the run fails if what it names is not
+# what is registered. Section 2.1 prints what was retired when this is non-empty.
+RETIRE_HOLDOUT_GENERATIONS: list[str] = []
 
 # %% [markdown]
 # ### What is asked for, and what it resolves to
@@ -155,11 +163,20 @@ CANDIDATE_SET_NAME = f"{CASE_STUDY_ID}:holdout-candidates"
 # be separate copies and they disagreed: the freeze spanned every declared label and this
 # fallback spanned one, so which configuration a reader selected depended on whether their
 # registry held a `candidate_sets` table.
+# The notes are printed rather than discarded, because the second element is where the filter
+# says what it removed. On this registry it drops 143 of the 947 members in force - every
+# `deep_learning` fit and every `pca` one - for covering less of the cross-section than their
+# feature panels offered. Taking `[0]` alone applies that filter and publishes a holdout
+# selection over the survivors with nothing saying which candidates were never in the running.
+# `14_backtest`, `19_holdout_backtest` and `20_strategy_analysis` all print it.
+MEMBERS_IN_FORCE, _population_notes = prediction_members_in_force(study)
+for _note in _population_notes:
+    print(_note)
 FIELD = open_selection_field(
     study,
     case_study=CASE_STUDY_ID,
     name=CANDIDATE_SET_NAME,
-    prediction_hashes=prediction_members_in_force(study)[0],
+    prediction_hashes=MEMBERS_IN_FORCE,
     resolve_best_backtest_runs=resolve_best_backtest_runs,
 )
 CANDIDATES = FIELD.candidate_set
@@ -353,6 +370,41 @@ HOLDOUT_SPEC = build_holdout_training_spec(
     study, VALIDATION_SPEC, timeline=OBSERVATIONS, case_study=CASE_STUDY_ID
 )
 HOLDOUT_TRAINING_HASH = training_hash_from_spec(HOLDOUT_SPEC)
+
+# The window is evaluated once. `refuse_a_second_look` divides what is already registered
+# against it into three buckets and refuses on any of them; with the selected configuration
+# unchanged this is an idempotent replay, because the derivation is deterministic and the
+# training identity covers it, so the same identity comes back and nothing is in any bucket.
+#
+# What makes the check worth running is that backtests keep being registered after a holdout
+# has been spent. None of them has to move the rank-1, and while it does not move this replay
+# is idempotent; without the check, the one time it does move there is nothing standing between
+# that and a second evaluation.
+RETIRED_GENERATIONS = refuse_a_second_look(
+    holdout_generations_to_retire(
+        CASE_DIR,
+        this_generation=(HOLDOUT_TRAINING_HASH, (CHECKPOINT_KIND, CHECKPOINT_VALUE)),
+    ),
+    # `.get`, like the summary at line 227: a spec without the key must reach the guard
+    # and be refused on what the registry holds, not crash before the check runs.
+    this_configuration=str(VALIDATION_SPEC.get("config_name")),
+    this_training_hash=HOLDOUT_TRAINING_HASH,
+    checkpoint=(CHECKPOINT_KIND, CHECKPOINT_VALUE),
+    retiring=RETIRE_HOLDOUT_GENERATIONS,
+)
+if RETIRED_GENERATIONS:
+    # Printed rather than left in the launch line: the registry will show two evaluations of
+    # this window and the notebook has to show the same thing, or a reader learns about only
+    # one of them.
+    print(
+        "This run retired an earlier evaluation of the holdout window, named at launch:\n"
+        + "\n".join(
+            f"  {row['prediction_hash']}  {row['config_name']}  training {row['training_hash']}"
+            for row in RETIRED_GENERATIONS
+        )
+        + "\nThe window has now been measured more than once, and the registry carries both."
+    )
+
 holdout_cv = HOLDOUT_SPEC["computation"]["cv"]
 holdout_fold = holdout_cv["folds"][0]
 cv_request = holdout_cv["request"]

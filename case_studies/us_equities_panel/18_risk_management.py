@@ -105,23 +105,29 @@ from utils.style import add_message_title, ml4t_palette, show_with_alt, zero_lin
 CASE_STUDY_ID = "us_equities_panel"
 BASELINE_SET_NAMES = [
     "us-equities-fwd-ret-1d-baseline-v1",
-    "us-equities-fwd-ret-5d-baseline-v1",
-    "us-equities-fwd-ret-21d-baseline-v1",
 ]
 ALLOCATION_SET_NAMES = [
     "us-equities-fwd-ret-1d-allocation-v1",
-    "us-equities-fwd-ret-5d-allocation-v1",
-    "us-equities-fwd-ret-21d-allocation-v1",
 ]
 VALIDATION_SET_NAME_TEMPLATE = "us-equities-{label}-validation-strategies-v1"
 EXECUTION_TIER = "canonical"
 POPULATION_NAME = ""
 SUPERSEDES_POPULATION = ""
 SUPERSEDES_SETS: dict = {}
-WORKSPACE = "experiments"
+# Empty means this run writes to the case study's own store, which is what canonical
+# production execution wants. Any other value routes the run's writes there instead, at
+# either tier, and is how a rehearsal at full scale is compared against the published
+# result without being able to damage it.
+WORKSPACE = ""
 PREVIEW_LABELS = []
 PREVIEW_MAX_SOURCE_ROWS = 0
 PREVIEW_MAX_RISK_CONTROLS = 0
+# How many parents per label the overlay grid sits on. `None` reads
+# `backtest.sweep.top_n_predictions.risk_overlay`, which this case study declares as 1. The
+# declaration was read unconditionally until 2026-09-20 and no parameter was bound, so a
+# launcher could not move the width and only an edit to the private config copy reached it,
+# which is the shape the four notebooks that do bind it were built to avoid.
+TOP_N_COMBOS = None
 MAX_SYMBOLS = 0
 
 # %% [markdown]
@@ -136,12 +142,17 @@ declared_set_names = [*BASELINE_SET_NAMES, *ALLOCATION_SET_NAMES]
 # Both tiers resolve the study through `open_study`. It reads the labels and features in place and
 # redirects only writes, so a preview run scores the same inputs a canonical one does and cannot
 # publish over it.
+workspace_override = os.environ.get("ML4T_OUTPUT_DIR") or WORKSPACE
 if EXECUTION_TIER == "canonical":
     if PREVIEW_LABELS or PREVIEW_MAX_SOURCE_ROWS or PREVIEW_MAX_RISK_CONTROLS or MAX_SYMBOLS:
         raise ValueError("Canonical execution cannot declare preview reductions")
     if not declared_set_names or len(declared_set_names) != len(set(declared_set_names)):
         raise ValueError("Canonical execution requires unique named strategy sets")
-    study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER)
+    study = open_study(
+        CASE_STUDY_ID,
+        execution_tier=EXECUTION_TIER,
+        workspace=Path(workspace_override) if workspace_override else None,
+    )
 elif EXECUTION_TIER == "preview":
     if (
         not PREVIEW_LABELS
@@ -155,7 +166,7 @@ elif EXECUTION_TIER == "preview":
     study = open_study(
         CASE_STUDY_ID,
         execution_tier=EXECUTION_TIER,
-        workspace=Path(os.environ.get("ML4T_OUTPUT_DIR") or WORKSPACE),
+        workspace=Path(workspace_override or "experiments"),
     )
 else:
     raise ValueError(f"Unsupported execution tier: {EXECUTION_TIER!r}")
@@ -236,7 +247,13 @@ def prices_for(label, warmup_periods):
     return _price_cache[key]
 
 
-top_n = get_top_n_predictions(CASE_STUDY_ID, "risk_overlay")
+top_n = (
+    TOP_N_COMBOS
+    if TOP_N_COMBOS is not None
+    else get_top_n_predictions(CASE_STUDY_ID, "risk_overlay")
+)
+if top_n < 1:
+    raise ValueError("the risk overlay needs at least one parent per label")
 selected_parts = []
 for label in eligible.get_column("label").unique().sort().to_list():
     selected_parts.append(
@@ -504,7 +521,8 @@ execution_diagnostics
 # this is what refuses to freeze them together.
 
 # %%
-completed_risk = study.backtests.table(include_preview=True).filter(
+post_sweep_catalog = study.backtests.table(include_preview=True)
+completed_risk = post_sweep_catalog.filter(
     pl.col("backtest_hash").is_in(planned_population.get_column("backtest_hash"))
 )
 if (
@@ -515,6 +533,20 @@ if (
     or completed_risk.filter(pl.col("sharpe").is_null() | ~pl.col("sharpe").is_finite()).height
 ):
     raise RuntimeError("The risk catalog is incomplete or mis-staged")
+
+# The rows this sweep just published carry two spec leaves that no signal or allocation row has,
+# `strategy.risk.name` and `strategy.risk.position_rules`, and `study.backtests.table()` derives
+# its columns from the specs present in the registry. So `backtest_catalog`, read before the sweep,
+# is two columns narrower than the read above, and concatenating a frame from each raises
+# ShapeError on any run where the risk stage starts empty - which is every first run. Re-deriving
+# the selection-eligible rows from this read puts both sides of that concatenation on one schema by
+# construction. A `how="diagonal"` concat would also pass, by filling the two columns with nulls,
+# and would keep passing silently the next time the schemas diverge for a reason that matters.
+eligible_post_sweep = post_sweep_catalog.filter(
+    pl.col("backtest_hash").is_in(eligible.get_column("backtest_hash"))
+)
+if eligible_post_sweep.height != eligible.height:
+    raise RuntimeError("The post-sweep catalog lost a declared strategy member")
 
 # %% [markdown]
 # **Did the control fire, and did anything move?** Those are two questions and the catalog answers
@@ -650,7 +682,7 @@ if EXECUTION_TIER == "canonical":
         # label_artifact, and every other protocol field being required-constant is the guard.
         validation_candidates = pl.concat(
             [
-                eligible.filter(pl.col("label") == label),
+                eligible_post_sweep.filter(pl.col("label") == label),
                 completed_risk.filter(pl.col("label") == label),
             ]
         ).sort("backtest_hash")

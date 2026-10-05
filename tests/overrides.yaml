@@ -232,6 +232,11 @@
     EPOCHS: 1
     N_GENERATE: 10
     N_SAMPLES: 50
+    # Sampling is this notebook's dominant cost - 332.5 s for one 500-row pass in the
+    # production render - and the four extra draws buy nothing here: at N_GENERATE 10
+    # every draw short-circuits on `len(X_draw) <= 10` and the cell prints that no draw
+    # produced a usable training set either way.
+    TSTR_DRAWS: 1
   timeout: 120
 05_synthetic_data/07_dp_gan:
   docker_env: py312
@@ -1001,24 +1006,6 @@
   timeout: 300
 19_risk_management/11_systematic_risk_sweep:
   timeout: 900
-20_strategy_synthesis/00_holdout_predictions:
-  # No `skip: true` ever stood above the skip_reason this replaces, so the notebook has
-  # always run; the reason was describing a state that had stopped being true. It also
-  # carried no timeout, so it inherited the 300s default while 01 and 03 next to it carry
-  # 600 - it had never been priced, only kept under the default by work it was not doing.
-  #
-  # It is doing that work now. Until #746 the seeded fixtures gave cme_futures' two cohort
-  # leaders a fabricated entity grid (the RuntimeWarning naming b099266d758c and
-  # fbeb779467d5 is in the last green run's log), the holdout retrain found nothing real to
-  # fit, and the cell finished in about 135s while stepping over the case study. Seeding
-  # those leaders from the case study's own label parquet makes the retrain run: measured
-  # here at 350s for cme_futures and 60s for sp500_equity_option_analytics against 426s for
-  # the whole loop, with every other case study in single figures. Measured at 590s in the
-  # ml4t image with the wider fixture panels of #749 on top.
-  #
-  # 1800s is three times the widest of those against a runner slower than either machine,
-  # the same ratio 11d_conditional_autoencoder's cap carries, and it absorbs #749.
-  timeout: 1800
 20_strategy_synthesis/01_aggregate_synthesis:
   parameters:
     # Isolated test registry has no nasdaq out-of-band cost-feasible carrier,
@@ -2214,11 +2201,34 @@ case_studies/etfs/11c_conditional_autoencoder:
   # cuda and the library refuses to substitute; the device is inside the training identity,
   # so the CPU fit publishes under its own name. n_epochs stays out - preset_patches.py
   # already reduces these presets and declaring it here would replace that patch.
+  #
+  # `folds` for the reason 11d states below - the etfs fixture seeds eight, and this fixture
+  # spans 2007-2025 where seoa spans 2017-2021, so the same model walks about four times as
+  # many sessions here. 11d took the reduction when it hit the cap; 11c and 11e were left at
+  # all eight because they fit inside 900s, which is a different question from whether the
+  # eighth fold says anything the second does not. Priced from CI rather than from a
+  # workstation: on the `e2e649ed` run of `cs-etfs`, 11c took 501s and 11e 521s of a 3,041s
+  # job, the longest in the matrix and therefore the one that sets how long `main` takes to
+  # report. Two of eight is 23% of the training rows, not 25%: the fixture's fold manifest
+  # (`intermediates/etfs/folds/41c82095b332d9ce/manifest.json`) records n_train per fold, and
+  # folds 0 and 1 hold 247,370 of 1,060,808. The window expands over the first three folds
+  # and is nearly flat after, so the two cheapest folds are barely cheaper than the average -
+  # which is worth stating, because the opposite is true where the window expands throughout
+  # and a two-fold reduction there buys much more than a quarter.
+  #
+  # Two rather than one: every other latent member in the fleet runs two (11a, 11b, 11d here,
+  # us_firm_characteristics 08a through 08d), and a single fold cannot show a factor loading
+  # moving between windows, which is what these notebooks are about.
+  #
+  # The 900s cap stays until a run prices the reduced notebook. It is loose for a 130s
+  # notebook, and tightening it against a predicted figure rather than a measured one is the
+  # mistake 11d's own comment records.
   parameters:
     DEVICE: cpu
     LABELS: ['fwd_ret_21d']
     POPULATION_NAME: etfs-cae-preview
     PREVIEW_REDUCTIONS:
+      folds: [0, 1]
       max_symbols: 6
   timeout: 900
 case_studies/etfs/11d_stochastic_discount_factor:
@@ -2272,12 +2282,13 @@ case_studies/etfs/11d_stochastic_discount_factor:
   # line against the loaded measurement rather than against a quiet-machine guess.
   timeout: 3600
 case_studies/etfs/11e_supervised_autoencoder:
-  # Same restriction and the same reason as 11c above.
+  # Same restriction, same fold reduction, and the same reasons as 11c above.
   parameters:
     DEVICE: cpu
     LABELS: ['fwd_ret_21d']
     POPULATION_NAME: etfs-sae-preview
     PREVIEW_REDUCTIONS:
+      folds: [0, 1]
       max_symbols: 6
   timeout: 900
 case_studies/etfs/12_causal_dml:
@@ -2707,6 +2718,12 @@ case_studies/nasdaq100_microstructure/08_dl_nlinear:
   # max_train_sequences is what keeps this affordable on a minute panel, where five symbols of
   # a fold still hold six figures of overlapping windows. It is a reduction below the declared
   # `modeling.dl.max_train_sequences`, which a preview may lower and cannot raise.
+  # vram_gb: free VRAM this run needs before nb-run lets it start. Measured 2026-09-11 on the
+  # RTX 3090 with torch.cuda.max_memory_allocated over three optimizer steps of the declared
+  # preset at this case study's own width - 90 features, lookback 60, batch 2048 - which is
+  # the shape the canonical run trains: nlinear peaked at 0.14 GiB. Declared value is that
+  # peak plus the CUDA context and allocator fragmentation, rounded up.
+  vram_gb: 2
   parameters:
     DEVICE: cpu
     POPULATION_NAME: nasdaq100_microstructure-nlinear-preview
@@ -2727,6 +2744,12 @@ case_studies/nasdaq100_microstructure/09_dl_lstm:
   # max_train_sequences is what keeps this affordable on a minute panel, where five symbols of
   # a fold still hold six figures of overlapping windows. It is a reduction below the declared
   # `modeling.dl.max_train_sequences`, which a preview may lower and cannot raise.
+  # vram_gb: free VRAM this run needs before nb-run lets it start. Measured 2026-09-11 on the
+  # RTX 3090 with torch.cuda.max_memory_allocated over three optimizer steps of the declared
+  # preset at this case study's own width - 90 features, lookback 60, batch 2048 - which is
+  # the shape the canonical run trains: lstm_h64 peaked at 1.25 GiB. Declared value is that
+  # peak plus the CUDA context and allocator fragmentation, rounded up.
+  vram_gb: 3
   parameters:
     DEVICE: cpu
     POPULATION_NAME: nasdaq100_microstructure-lstm_h64-preview
@@ -2747,6 +2770,12 @@ case_studies/nasdaq100_microstructure/10_dl_tcn:
   # max_train_sequences is what keeps this affordable on a minute panel, where five symbols of
   # a fold still hold six figures of overlapping windows. It is a reduction below the declared
   # `modeling.dl.max_train_sequences`, which a preview may lower and cannot raise.
+  # vram_gb: free VRAM this run needs before nb-run lets it start. Measured 2026-09-11 on the
+  # RTX 3090 with torch.cuda.max_memory_allocated over three optimizer steps of the declared
+  # preset at this case study's own width - 90 features, lookback 60, batch 2048 - which is
+  # the shape the canonical run trains: tcn peaked at 0.49 GiB. Declared value is that
+  # peak plus the CUDA context and allocator fragmentation, rounded up.
+  vram_gb: 2
   parameters:
     DEVICE: cpu
     POPULATION_NAME: nasdaq100_microstructure-tcn-preview
@@ -2763,6 +2792,17 @@ case_studies/nasdaq100_microstructure/11_dl_patchtst:
   # every runner without a card - which is all of them - so the attention architecture had no
   # coverage at all. The declared cap is what makes CPU affordable: the run is bounded by
   # max_train_sequences rather than by the panel, so it no longer scales with the fixture.
+  # vram_gb: free VRAM this run needs before nb-run lets it start. Measured 2026-09-11 on the
+  # RTX 3090 with torch.cuda.max_memory_allocated over three optimizer steps of the declared
+  # preset at this case study's own width - 90 features, lookback 60, batch 2048 - which is
+  # the shape the canonical run trains: patchtst peaked at 14.52 GiB. Declared value is that
+  # peak plus the CUDA context and allocator fragmentation, rounded up.
+  #
+  # patchtst is the one that needs the gate. It is channel-independent, so its batch dimension
+  # is B x n_features and its demand scales with feature width where the other three are flat
+  # in it: the same preset and batch measured 7.74 GiB at 48 features. 17 GB of a 24 GB card
+  # means this run waits for the card rather than starting beside a job already holding it.
+  vram_gb: 17
   parameters:
     DEVICE: cpu
     POPULATION_NAME: nasdaq100_microstructure-patchtst-preview
@@ -3853,6 +3893,16 @@ case_studies/us_equities_panel/11_dl_tsmixer:
     PREVIEW_MAX_SYMBOLS: 8
   timeout: 600
 case_studies/us_equities_panel/12_dl_weekly:
+  # vram_gb: free VRAM this run needs before nb-run lets it start. MEASURED WITH A DIFFERENT
+  # INSTRUMENT FROM THE FOUR nasdaq100_microstructure ENTRIES ABOVE, and the difference is why
+  # this number looks small beside them. Those sample torch.cuda.max_memory_allocated, which
+  # counts tensors and not the CUDA context, so their declared value is the peak plus that
+  # context plus fragmentation. This one samples the kernel process's own VRAM over the whole
+  # canonical run - 2026-09-14, 12 trainings in 2.14 h, 8 PyTorch and 4 Darts N-BEATS - and a
+  # per-process figure already includes the context. Peak was 544 MiB = 0.53 GiB, first sample
+  # to last. Declaring 1 rounds that up with headroom; declaring 2 to match the entries above
+  # would pad a total that is already complete.
+  vram_gb: 1
   parameters:
     BATCH_SIZE: 32
     LOOKBACK: 5

@@ -49,19 +49,15 @@
 
 import json
 import sqlite3
-import warnings
 
 import matplotlib.pyplot as plt
 import polars as pl
 
-warnings.filterwarnings("ignore")
-
 # %% [markdown]
 # Shared helpers reconstruct the configured funnel and its uncertainty from
 # registry artifacts without launching another training or evaluation run.
-
 # %%
-from case_studies.research import CandidateSet, Study, open_selection_field
+from case_studies.research import Study, open_selection_field
 from case_studies.research.holdout import build_holdout_training_spec
 from case_studies.utils.backtest_loaders import get_backtest_config
 from case_studies.utils.backtest_presets import (
@@ -94,7 +90,7 @@ from case_studies.utils.uncertainty import (
 )
 from utils.paths import get_case_study_dir
 from utils.reproducibility import set_global_seeds
-from utils.style import COLORS, FIGSIZE, add_message_title
+from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
 # %% tags=["parameters"]
 CASE_STUDY = "sp500_equity_option_analytics"
@@ -708,7 +704,11 @@ add_message_title(
     "Validation Sharpe at each stage of the funnel",
     f"Validation 2019-2020; {CONFIGURED_COST_BPS:.1f} bps/side; 95% block-bootstrap intervals",
 )
-fig_stage.show()
+show_with_alt(
+    fig_stage,
+    "Annualized validation Sharpe at each stage of the selection funnel, one marker per stage "
+    "joined in order, each with its 95% block-bootstrap interval, against a dashed line at zero.",
+)
 
 # %% [markdown]
 # ## 2. Cost survival on the strategy the case study selected
@@ -853,7 +853,12 @@ add_message_title(
     "Where the point path and its lower bound stand across the cost grid",
     "Validation 2019-2020; one-way costs; 95% block-bootstrap band",
 )
-fig_cost.show()
+show_with_alt(
+    fig_cost,
+    "Annualized validation Sharpe against one-way cost per traded notional, drawn as a marked "
+    "line with its 95% block-bootstrap band shaded, a dashed line at zero, and a dotted vertical "
+    "line where the lower bound first reaches zero if it does so inside the grid.",
+)
 
 
 # %%
@@ -977,14 +982,13 @@ risk_diagnostics
 # `19_holdout_backtest`, on the configuration this funnel selected. This section reads
 # that result; it does not create one, and it applies no gate to it.
 #
-# There is deliberately no seal here, and an earlier version of this notebook had an elaborate one
-# - a research lock, a four-state ordering check on when the fit ran against when the lock was
-# taken, a field-by-field identity diff between the sealed and published fits, and a
-# `holdout_evaluations` lineage read. All of it existed to make the holdout unrepeatable and to
-# adjudicate what to do when the selected configuration changed underneath it. The holdout is
-# repeatable: if it is run on the wrong configuration, it is run again on the right one. Machinery
-# whose purpose is to prevent that is machinery whose purpose is to preserve a stale answer, so it
-# is gone rather than parked. What replaces it is a count: the earlier rows stay, and a window
+# There is deliberately no seal here. A seal - a research lock, an ordering check on when the fit
+# ran against when the lock was taken, a field-by-field identity diff between the sealed and the
+# published fit, a `holdout_evaluations` lineage read - exists to make the holdout unrepeatable
+# and to adjudicate what to do when the selected configuration changes underneath it. The holdout
+# is repeatable: if it is run on the wrong configuration, it is run again on the right one, and
+# machinery whose purpose is to prevent that is machinery whose purpose is to preserve a stale
+# answer. What stands in its place is a count: every fit stays on the record, and a window
 # carrying more than one holdout fit is reported as one that has been read more than once.
 #
 # What remains worth checking is not whether the holdout was allowed to run, but whether the

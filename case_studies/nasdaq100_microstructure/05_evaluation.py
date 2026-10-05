@@ -79,7 +79,6 @@ from IPython.display import display
 from ml4t.diagnostic.evaluation.stats import benjamini_hochberg_fdr
 from ml4t.diagnostic.metrics import compute_ic_hac_stats, compute_ic_uncertainty
 from plotly.subplots import make_subplots
-from scipy.stats import spearmanr
 from scipy.stats import t as student_t
 
 from case_studies.utils.feature_engineering import quantile_profile
@@ -320,11 +319,9 @@ label_df = _normalize_symbol_column(label_df.filter(before_holdout).collect())
 # `generate_cv_splits` returns, so the holdout stays out by the same cut, on top of the
 # `before_holdout` filter already applied above.
 #
-# The assertion below is kept and its job has changed: it used to establish that two
-# validation windows did not overlap, because an overlap would have made one bar take two
-# refitted values. There is now one value per bar by construction, so what it checks is
-# that the artifact is keyed the way this notebook believes it is - a duplicate here means
-# the writer changed and this cell did not.
+# The assertion below checks that the artifact is keyed the way this notebook believes it is.
+# There is one value per bar by construction - a fold column would mean one bar carrying two
+# refitted values - so a duplicate here means the writer changed and this cell did not.
 
 # %%
 assert "fold" not in temporal.columns, (
@@ -1631,7 +1628,11 @@ if high_corr_pairs:
     )
     show_plotly_with_alt(
         fig,
-        "A histogram of the Spearman rank correlation between feature pairs over the sampled development bars, with the pairs drawn from within a family separated from those spanning two families.",
+        "A horizontal bar chart of the twenty feature pairs whose Spearman rank correlation "
+        "across the sampled development bars is largest in size, one bar per pair, ordered "
+        "with the largest at the top. Each bar is labelled with both feature names and the "
+        "family each belongs to, is annotated with its correlation, and is blue where that "
+        "correlation is positive and copper where it is negative.",
     )
     print(f"Of the {len(ranked)} strongest pairs, {cross_family} span two families")
     print(f"Of the {len(ranked)} strongest pairs, {same_twin} are a level against its own z-score")

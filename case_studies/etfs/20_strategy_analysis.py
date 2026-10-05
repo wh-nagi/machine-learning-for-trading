@@ -45,14 +45,14 @@
 # the locked registry (`case_studies/etfs/run_log/registry.db`).
 #
 # **Scope**: no training and no re-backtesting. It does write two derived tables,
-# `cohort_metrics` and `backtest_paired_metrics`, and that is a deliberate change from the
-# read-only scope this notebook used to declare.
+# `cohort_metrics` and `backtest_paired_metrics`, which is deliberate rather than a read-only
+# scope.
 #
 # Both tables are derived from backtests that already exist - selection-bias statistics over the
 # cohorts, and paired-bootstrap comparisons between registered return series. Nothing is refitted
-# and no backtest is added. They were previously produced by a chapter-20 notebook looping over
-# every case study, which made a case study's own strategy analysis unreadable until a later
-# chapter had been run, and left both tables empty for any reader working the case study in order.
+# and no backtest is added. Producing them in a chapter-20 notebook looping over every case study
+# would make a case study's own strategy analysis unreadable until a later chapter had been run,
+# and leave both tables empty for any reader working the case study in order.
 # A stage that cannot be read without running a chapter that comes after it is not a stage. So the
 # notebook that has every stage in front of it produces them, and re-running it recomputes only
 # what is missing.
@@ -62,18 +62,17 @@
 
 import json
 import sqlite3
-import warnings
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import polars as pl
-import torch  # ml4t.diagnostic loads cudart; torch must import first
+
+# ml4t.diagnostic loads cudart; torch must import first, so its bundled runtime wins symbol
+# resolution. Imported for that side effect alone, which ruff cannot see - without the noqa
+# a dead-import sweep deletes it and the notebook fails on the cudart load.
+import torch  # noqa: F401
 import yaml
-
-warnings.filterwarnings("ignore")
-
 from ml4t.diagnostic.evaluation import PortfolioAnalysis
 from ml4t.diagnostic.integration import (
     BacktestReportMetadata,
@@ -117,6 +116,7 @@ from case_studies.utils.strategy_analysis import (
 )
 from case_studies.utils.uncertainty import STAGE_SEQUENCE, descends_from
 from utils.paths import get_case_study_dir, get_output_dir
+from utils.style import show_with_alt
 
 # %% tags=["parameters"]
 # MAX_SYMBOLS is gone. Nothing below read it, and a declared cap the run does not apply is
@@ -618,11 +618,15 @@ ax.axvline(0, color="#9E9E9E", linewidth=0.8, linestyle="--")
 ax.set_yticks(y)
 ax.set_yticklabels(fams)
 ax.set_xlabel("Validation Sharpe")
-ax.set_title("Signal-stage Sharpe by family: interquartile range and maximum")
+ax.set_title("Baseline Sharpe by family: interquartile range and maximum")
 ax.invert_yaxis()
 ax.legend(loc="lower right", frameon=False)
 fig.tight_layout()
-fig.show()
+show_with_alt(
+    fig,
+    "Validation Sharpe by model family, one row per family: a marker at the median with a bar "
+    "spanning the interquartile range, a cross at the family maximum, and a dashed line at zero.",
+)
 
 # %% [markdown]
 # **The median and the maximum answer different questions, which is why both are drawn.** A
@@ -659,7 +663,11 @@ for s, info in lineage.items():
 
 # %%
 fig = plot_sharpe_waterfall(lineage, ci_lo=ci_lo, ci_hi=ci_hi)
-fig.show()
+show_with_alt(
+    fig,
+    "One bar per stage of the locked lineage, from the baseline backtest through allocation, cost "
+    "and risk overlay, each carrying its block-bootstrap interval as an error bar.",
+)
 
 # %%
 # Stage-transition deltas via load_paired_metrics — never recompute paired
@@ -743,10 +751,19 @@ for prev_stage, stage_name in zip(present, present[1:]):
 # that differs between them, and no paired row is written for it.
 
 # %%
-conc_df = explorer.concentration_curve(TOP_PHASH)
+# The stage is named rather than defaulted. This notebook plots one line per
+# allocator, so it wants the allocation stage, and it happens to be what the old
+# default gave it - but most predictions in this registry hold signal rows and no
+# allocation rows, so a carrier that had not been through the allocator menu used
+# to make this cell raise with the stage nowhere in the call.
+conc_df = explorer.concentration_curve(TOP_PHASH, stage="allocation")
 if not conc_df.is_empty():
     fig = plot_concentration_curve(conc_df)
-    fig.show()
+    show_with_alt(
+        fig,
+        "Validation Sharpe against the number of positions held, one marker per top-k with the "
+        "best allocator at that k annotated beside it and the best k highlighted.",
+    )
     best_per_k = conc_df.sort("sharpe", descending=True).group_by("top_k").first().sort("top_k")
     print("Allocation: best Sharpe by top_k:")
     print(best_per_k.select("top_k", "allocator", "sharpe", "max_drawdown"))
@@ -948,7 +965,12 @@ ax.set_xlabel("Value")
 ax.set_title("The selected configuration Headline Metrics with 95% CIs")
 ax.legend(loc="lower right", fontsize=8, frameon=False)
 fig.tight_layout()
-fig.show()
+show_with_alt(
+    fig,
+    "One row per headline metric, each a point estimate with a bar spanning its 95% interval, "
+    "against a dashed line at zero and dotted reference lines for the equal-weight and risk- "
+    "overlay comparisons where those are available.",
+)
 
 # %%
 # Equity-curve overlay vs validation EW benchmark
@@ -987,7 +1009,11 @@ ax.set_ylabel("Cumulative return")
 ax.set_title("Validation-window cumulative return: rank-1 strategy vs EW universe")
 ax.legend(loc="best", frameon=False)
 fig.tight_layout()
-fig.show()
+show_with_alt(
+    fig,
+    "Cumulative return over the validation window, one line for the selected strategy and one for "
+    "the equal-weight universe, against a dashed line at zero.",
+)
 
 # %% [markdown]
 # **The lower bound of the Sharpe interval is what the first gate reads**, and it answers a
@@ -1037,7 +1063,11 @@ print(dd)
 
 # %%
 fig = plot_equity_drawdown(strat_returns_path)
-fig.show()
+show_with_alt(
+    fig,
+    "Two panels sharing a date axis: cumulative return of the strategy above, and its peak-to- "
+    "trough drawdown below.",
+)
 
 # %%
 # Rolling Sharpe + rolling beta (window 126 ~ 6 months)
@@ -1201,10 +1231,15 @@ ax.axvspan(0.2, 1.0, color="#43A047", alpha=0.10, label="most-liquid ETF (0.2–
 ax.axvspan(2.0, 5.0, color="#FB8C00", alpha=0.10, label="typical ETF (2 to 5 bps)")
 ax.set_xlabel("Per-leg cost (bps)")
 ax.set_ylabel("Sharpe (validation)")
-ax.set_title("Cost sensitivity - etfs (validation, signal+allocation+cost stage)")
+ax.set_title("Cost sensitivity - etfs (validation, baseline+allocation+cost stages)")
 ax.legend(loc="best", fontsize=8, frameon=False)
 fig.tight_layout()
-fig.show()
+show_with_alt(
+    fig,
+    "Sharpe against per-leg cost in basis points: the median across configurations as a line, the "
+    "best configuration dashed, the best-to-worst envelope shaded, a dashed line at zero, and "
+    "shaded bands for the most-liquid and typical ETF spread ranges.",
+)
 
 # %%
 # Breakeven cost: where the best-config Sharpe lower bound crosses zero.
@@ -1531,7 +1566,11 @@ _rolling = compute_rolling_exposures(
 fig_roll = plot_rolling_exposures(
     _rolling, title="ETFs Strategy: Rolling Factor Exposures (63-day)"
 )
-fig_roll.show()
+show_with_alt(
+    fig_roll,
+    "One panel per common factor plus annualized alpha, each tracing its 63-day rolling estimate "
+    "over time against a dashed line at zero.",
+)
 
 # %% [markdown]
 # **Placebo benchmark (random ETF portfolios):**
@@ -1607,7 +1646,11 @@ if _boot.get("n_boot", 0) > 0:
 
 # %%
 fig_attr = plot_attribution_waterfall(_reg, title="ETFs Strategy: Factor Attribution")
-fig_attr.show()
+show_with_alt(
+    fig_attr,
+    "One bar per common factor plus a residual bar, each sized by that term's contribution to "
+    "Sharpe, with a dashed line at the strategy's total Sharpe.",
+)
 
 # %% [markdown]
 # Layer-1 placebo-regression alpha and Layer-2 FF5+MOM attribution

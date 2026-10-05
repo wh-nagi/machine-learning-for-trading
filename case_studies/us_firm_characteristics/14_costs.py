@@ -49,14 +49,9 @@
 
 import json
 import time
-import warnings
 from collections import Counter
 
 import polars as pl
-
-from utils.style import COLORS, add_message_title, show_with_alt
-
-warnings.filterwarnings("ignore")
 
 from case_studies.research import open_study, reuse_disclosure
 from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
@@ -76,6 +71,7 @@ from case_studies.utils.registry import (
 from case_studies.utils.strategy_analysis import resolve_solvent_carrier
 from case_studies.utils.sweep_config import get_cost_grid_bps
 from utils.paths import get_case_study_dir
+from utils.style import COLORS, add_message_title, show_with_alt
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "us_firm_characteristics"
@@ -388,12 +384,14 @@ if not cost_df.is_empty():
         subtitle="Validation months; the strategy is unchanged, only what it pays to trade",
     )
     ax.legend(frameon=False)
-    fig.tight_layout()
+    # No tight_layout(): matplotlibrc sets `figure.constrained_layout.use: True` repo-wide,
+    # and calling tight_layout() over it makes matplotlib switch layout engines and say so in
+    # a stderr block under the figure.
     show_with_alt(
         fig,
         "Line chart of validation Sharpe against the total commission and slippage "
         "charged per leg, from zero to fifty basis points. The line starts just under "
-        "2.95 and falls almost straight to about 2.65 at the right edge, staying far "
+        "3.66 and falls almost straight to about 3.36 at the right edge, staying far "
         "above the dashed zero reference across the whole grid. A dotted vertical "
         "marker near the left shows the cost level the rest of the case study was "
         "charged at, with most of the swept range lying to its right.",

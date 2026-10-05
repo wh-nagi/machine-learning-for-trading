@@ -98,7 +98,7 @@ from case_studies.cme_futures.research_workflow import (
     strategy_request_frame,
 )
 from case_studies.research.population import supersedes_for_run
-from case_studies.utils.sweep_config import get_position_risk_controls
+from case_studies.utils.sweep_config import get_position_risk_controls, get_top_n_predictions
 
 # %% tags=["parameters"]
 EXECUTION_TIER = "canonical"
@@ -113,6 +113,35 @@ PREVIEW_LABELS: list[str] = []
 # the population on record. Empty for a first snapshot.
 RISK_POPULATION = "cme_futures-risk-validation-v1"
 SUPERSEDES_RISK_POPULATION: str = ""
+
+# How many parents per label the overlay grid sits on. `None` reads
+# `backtest.sweep.top_n_predictions.risk_overlay`, which every case study declares as 1, and one
+# is narrow on purpose: an overlay is a second search over the same validation folds, so the
+# question the book asks is whether a control improves the configuration the funnel already
+# chose. Until 2026-09-20 that 1 was a literal `[0]` below rather than a number read from the
+# declaration, which left this case study unable to answer at any other width while four others
+# could. A run at a wider width changes the member list of every name this notebook publishes,
+# so it needs its own `RISK_POPULATION` and `SUPERSEDES_CANDIDATE_SETS` the same way a narrowed
+# run does.
+TOP_N_COMBOS = None
+
+# The per-label candidate sets this notebook freezes are immutable under their names too, and
+# for the same reason as the population above: `CandidateSet.create` refuses a changed member
+# list under a name that already exists. Nothing reached that argument before, so any run whose
+# membership moved - which a wider sweep does by construction - stopped at the freeze after the
+# fit, with no parameter able to answer it.
+#
+# Each name maps to the generation this run retires. `"live"` names the lineage and looks the
+# generation up, which is the form that does not decay: naming the head instead is correct only
+# until the next publish, because `create` accepts the head and nothing else. The declaration is
+# resolved through `candidate_set_supersedes` rather than offered straight, so a reader's clean
+# clone - which has no generation to replace, and often no `candidate_sets` table at all -
+# publishes generation one instead of being refused. An unchanged re-run never reads it: a set's
+# hash is computed from its members and its contract, so the existing name binding answers.
+SUPERSEDES_CANDIDATE_SETS: dict[str, str] = {
+    "cme_futures-risk-fwd_ret_5d-v1": "live",
+    "cme_futures-risk-fwd_ret_21d-v1": "live",
+}
 
 # %% [markdown]
 # ## Fixed per-label inputs and risk rules
@@ -152,6 +181,10 @@ elif EXECUTION_TIER == "preview":
     labels = tuple(PREVIEW_LABELS)
 else:
     raise ValueError(f"unsupported execution tier: {EXECUTION_TIER!r}")
+if TOP_N_COMBOS is None:
+    TOP_N_COMBOS = get_top_n_predictions("cme_futures", "risk_overlay")
+if TOP_N_COMBOS < 1:
+    raise ValueError("the risk overlay needs at least one parent per label")
 universe = product_universe_table()
 universe
 
@@ -162,25 +195,32 @@ if not risk_controls:
 
 request_rows = []
 for label in labels:
-    selected = rank_by_validation_sharpe(
-        study, pre_overlay_results(study, label=label, execution_tier=EXECUTION_TIER)
-    )[0]
-    strategy = selected.spec()["strategy"]
-    prediction_hash = selected.registry_record()["prediction_hash"]
-    for control in risk_controls:
-        rule = {key: value for key, value in control.items() if key != "name"}
-        request_rows.append(
-            {
-                "request_name": f"{selected.hash}-risk-{control['name']}",
-                "prediction_hash": prediction_hash,
-                "label": label,
-                "signal": strategy["signal"],
-                "allocation": strategy.get("allocation"),
-                "risk": {"position_rules": [rule]},
-                "costs": None,
-                "chapter": "ch19",
-            }
-        )
+    ranked = rank_by_validation_sharpe(
+        study,
+        pre_overlay_results(
+            study,
+            label=label,
+            execution_tier=EXECUTION_TIER,
+            supersedes_by_set=SUPERSEDES_CANDIDATE_SETS,
+        ),
+    )
+    for selected in ranked[:TOP_N_COMBOS]:
+        strategy = selected.spec()["strategy"]
+        prediction_hash = selected.registry_record()["prediction_hash"]
+        for control in risk_controls:
+            rule = {key: value for key, value in control.items() if key != "name"}
+            request_rows.append(
+                {
+                    "request_name": f"{selected.hash}-risk-{control['name']}",
+                    "prediction_hash": prediction_hash,
+                    "label": label,
+                    "signal": strategy["signal"],
+                    "allocation": strategy.get("allocation"),
+                    "risk": {"position_rules": [rule]},
+                    "costs": None,
+                    "chapter": "ch19",
+                }
+            )
 requests = strategy_request_frame(request_rows)
 requests.select("request_name", "prediction_hash", "label", "risk")
 
@@ -214,7 +254,9 @@ execution = run_official_backtest_requests(
     ),
 )
 candidate_sets = (
-    create_label_candidate_sets(study, execution, stage="risk")
+    create_label_candidate_sets(
+        study, execution, stage="risk", supersedes_by_set=SUPERSEDES_CANDIDATE_SETS
+    )
     if EXECUTION_TIER == "canonical"
     else {}
 )

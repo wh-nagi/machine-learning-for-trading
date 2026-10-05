@@ -51,7 +51,6 @@
 """US Firm Characteristics: Label Engineering."""
 
 import json
-import warnings
 from datetime import date
 
 import matplotlib.pyplot as plt
@@ -64,13 +63,14 @@ from ml4t.diagnostic.metrics import compute_ic_hac_stats, cross_sectional_ic_ser
 from case_studies.utils.artifact_digest import value_digest, write_artifact
 from case_studies.utils.artifact_quality import quality_report, render_quality_report
 from case_studies.utils.label_diagnostics import effective_sample_size, panel_autocorrelation
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from data import load_firm_characteristics
 from utils.artifact_specs import resolve_label_buffer, resolve_label_horizon
 from utils.cv_splits import generate_cv_splits
 from utils.paths import display_path, get_case_study_dir
 from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
-warnings.filterwarnings("ignore")
+apply_notebook_warning_policy()
 
 CASE_STUDY_ID = "us_firm_characteristics"
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
@@ -256,29 +256,20 @@ print(
 # ## D. Window validity
 #
 # A column of the right length always arrives; the question is whether what it holds is the
-# quantity the label claims. Each property below fails silently and leaves plausible numbers
-# behind, so each is asserted rather than described.
+# quantity the label claims. Here the provider computed the return, so this notebook shifts
+# nothing and there is no window of its own to validate. The label is `ret` under another
+# name, the winsorized label is `ret` clipped to its month's percentiles, and the class label
+# is defined only where `ret` is. Asserting any of those three would restate the expression
+# that built the column, which cannot fail, so none is asserted.
 #
-# The first assertion is the one that catches a fabricated tail. A firm's last month in the
-# panel closes its label window, and a construction that shifted a price series would leave
-# that month with no outcome - which has to be a null, never a value. The rest check the two
-# monthly joins: a duplicated month-end in either would multiply the panel's rows, and a
-# clipped return falling outside its own month's percentiles would mean a join had matched
-# the wrong month.
+# What can go wrong is the two monthly joins, and a duplicated month-end in either would
+# multiply the panel's rows without raising. That is asserted. Whether the provider's pairing
+# of characteristics and return is the one Section B describes is a property of the release,
+# not of this code, and the next cell reads it out of the data.
 
 # %%
-missing = labels_df["ret"].is_null()
-inside = pl.col(WINSORIZED_LABEL).is_between(pl.col("_lo"), pl.col("_hi"))
-for name in LABEL_NAMES:
-    # 1. Null exactly where the outcome was not observed.
-    assert (labels_df[name].is_null() == missing).all(), name
-# 2. One row per firm-month, so neither monthly join fanned the panel out.
+# One row per firm-month, so neither monthly join fanned the panel out.
 assert labels_df.select(pl.struct(KEYS).n_unique()).item() == labels_df.height
-# 3. Each label is a transform of its own row's return, inside its own month.
-assert labels_df.filter(pl.col(PRIMARY_LABEL) != pl.col("ret")).height == 0
-assert labels_df.filter(~inside).height == 0
-# 4. No discrete label is derived from a null return.
-assert labels_df.filter(missing & pl.col(CLASS_LABEL).is_not_null()).height == 0
 
 clipped = labels_df.filter(pl.col(PRIMARY_LABEL) != pl.col(WINSORIZED_LABEL)).height
 skipped = labels_df.select((pl.col("month").diff().over("symbol") > 1).sum()).item()

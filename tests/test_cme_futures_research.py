@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
-import json
-import os
 import re
 import sqlite3
 from datetime import datetime, timedelta
@@ -42,15 +39,11 @@ from tests.test_research_contract_catalog import _resolved_spec
 from tests.test_research_registry import _training_spec
 from utils.paths import REPO_ROOT
 
-
-@pytest.fixture(autouse=True)
-def _restore_output_root():
-    yield
-    os.environ.pop("ML4T_OUTPUT_DIR", None)
-    from case_studies.research import workspace
-
-    workspace._ACTIVE_OUTPUT_ROOT = None
-    workspace._clear_root_sensitive_caches()
+# `_restore_output_root` is deliberately NOT defined here. An autouse fixture of that name
+# in a test module shadows the one in `tests/conftest.py` for every test in the module, and
+# the copy that used to sit here popped ML4T_OUTPUT_DIR unconditionally. The session-scoped
+# `seeded_output_dir` installs that variable exactly once, so the pop removed it for the rest
+# of the worker. The conftest fixture restores the session value instead.
 
 
 def _study(tmp_path: Path) -> Study:
@@ -813,7 +806,7 @@ def test_final_selection_pool_spans_both_return_horizons(
     study = _study(tmp_path)
     by_label = _labelled_execution(study, monkeypatch)
 
-    def fake_pool(_study, *, label):
+    def fake_pool(_study, *, label, supersedes_by_set=None):
         from case_studies.research import CandidateSet, Result
 
         return CandidateSet.create(
@@ -845,7 +838,6 @@ def test_final_selection_pool_spans_both_return_horizons(
 def test_selection_catalog_rejects_a_candidate_the_catalog_does_not_describe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from case_studies.research import CandidateSet
 
     study = _study(tmp_path)
     by_label = _labelled_execution(study, monkeypatch)

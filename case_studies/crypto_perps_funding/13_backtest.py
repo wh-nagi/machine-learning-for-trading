@@ -66,7 +66,6 @@
 # %%
 """Run the equal-weight baseline for every declared crypto perpetuals prediction set."""
 
-import json
 from datetime import UTC, timedelta
 
 import plotly.graph_objects as go
@@ -81,7 +80,9 @@ from case_studies.crypto_perps_funding.research_workflow import (
 from case_studies.research import (
     CandidateSet,
     Result,
+    candidate_set_supersedes,
     open_study,
+    population_supersedes,
     run_backtests,
 )
 from case_studies.utils.backtest_loaders import (
@@ -108,8 +109,25 @@ POPULATION_SUFFIX = "v1"
 SUPERSEDES_POPULATION: str = ""
 # The baseline sweep publishes one population per (label, entry rule), so a run that changes
 # them cannot name the generation it retires with a single value the way the model population
-# can. Keyed by population name; the refusal prints the name and the hash to put here.
-SUPERSEDES_BACKTESTS: dict[str, str] = {}
+# can. Keyed by population name, and every entry declares `live` rather than a hash: this run
+# intends to extend whatever generation each name currently publishes, which is a property of
+# the run and does not decay, where a hash is a committed constant against a value the registry
+# moves on every publish. A name with no generation yet resolves to nothing and publishes
+# generation one, so listing all twelve costs nothing.
+SUPERSEDES_BACKTESTS: dict[str, str] = {
+    "crypto-signal-fwd_ret_8h-ew_top3-v1": "live",
+    "crypto-signal-fwd_ret_8h-ew_top5-v1": "live",
+    "crypto-signal-fwd_ret_8h-quintile_ls-v1": "live",
+    "crypto-signal-fwd_ret_24h-ew_top3-v1": "live",
+    "crypto-signal-fwd_ret_24h-ew_top5-v1": "live",
+    "crypto-signal-fwd_ret_24h-quintile_ls-v1": "live",
+    "crypto-signal-fwd_dir_8h-ew_top3-v1": "live",
+    "crypto-signal-fwd_dir_8h-ew_top5-v1": "live",
+    "crypto-signal-fwd_dir_8h-quintile_ls-v1": "live",
+    "crypto-signal-fwd_dir_8h_3c-ew_top3-v1": "live",
+    "crypto-signal-fwd_dir_8h_3c-ew_top5-v1": "live",
+    "crypto-signal-fwd_dir_8h_3c-quintile_ls-v1": "live",
+}
 # The folds a reduced upstream run actually fitted. Empty on a canonical run, which is measured
 # against every fold `config/setup.yaml` declares. A preview that reduced to a subset has no rows
 # for the rest by construction, and the coverage gate below would report the reduction itself as
@@ -117,8 +135,13 @@ SUPERSEDES_BACKTESTS: dict[str, str] = {}
 # compares against setup.yaml's windows rather than against whatever the frame happens to hold.
 PREVIEW_FOLDS: list[int] = []
 # The candidate set each label hands downstream is a third generation-bearing name, one per
-# label. Keyed the same way; the refusal prints the name and the hash.
-SUPERSEDES_CANDIDATES: dict[str, str] = {}
+# label. Keyed and declared the same way, and for the same reason.
+SUPERSEDES_CANDIDATES: dict[str, str] = {
+    "crypto-signal-fwd_ret_8h": "live",
+    "crypto-signal-fwd_ret_24h": "live",
+    "crypto-signal-fwd_dir_8h": "live",
+    "crypto-signal-fwd_dir_8h_3c": "live",
+}
 # How many prediction sets a preview run backtests per label. A preview reads the predictions
 # its own model notebooks wrote into its workspace, and what it is proving is that the chain
 # executes rather than that the sweep is wide, so it is capped instead of taking whatever the
@@ -148,7 +171,7 @@ labels = list(LABELS) if LABELS else list(ALL_LABELS)
 # does not redeclare it.
 
 # %%
-CANONICAL_RUN = EXECUTION_TIER == "canonical" and not WORKSPACE
+CANONICAL_RUN = EXECUTION_TIER == "canonical"
 if PREVIEW_FOLDS and CANONICAL_RUN:
     raise ValueError(
         "PREVIEW_FOLDS narrows the coverage gate and a canonical run may not narrow it: "
@@ -250,9 +273,9 @@ catalog.group_by("family", "label").agg(
 # The cell below reads the decision times out of the prediction sets, locates each one on the
 # panel's settlement index, and reports how far apart consecutive decisions are.
 #
-# **It reports rather than adjudicates, and the reason is that the only thing it could adjudicate
-# was wrong.** It used to require the advance to equal `step` exactly. Of the two directions that
-# reading refuses, one is unreachable and the other is not this cell's to judge:
+# **It reports rather than adjudicates, because the one thing it could adjudicate is not worth
+# asserting.** Requiring the advance to equal `step` exactly refuses two directions, one of them
+# unreachable and the other not this cell's to judge:
 #
 # - *Closer together than `step`* is the direction that would corrupt a result, because two
 #   positions whose holding periods overlap count the same return twice. It cannot occur here.
@@ -793,7 +816,21 @@ for label in labels:
             # whatever tier is active, so a preview run names none and the stages below read
             # its executions directly instead.
             population_name=signal_population if CANONICAL_RUN else None,
-            supersedes=SUPERSEDES_BACKTESTS.get(signal_population) if CANONICAL_RUN else None,
+            # The declaration is a name, not a hash, so it has to be resolved against the
+            # registry before `create` sees it: `create` compares the value it is handed to the
+            # generation in force and refuses anything else, and the string "live" is not a
+            # hash. `population_supersedes` turns it into the tip, and withholds it where
+            # offering it would be refused - a clean clone, a preview, or a name with no
+            # generation yet - so a reader still publishes generation one.
+            supersedes=(
+                population_supersedes(
+                    study,
+                    name=signal_population,
+                    declared=SUPERSEDES_BACKTESTS.get(signal_population),
+                )
+                if CANONICAL_RUN
+                else None
+            ),
         )
         executions.append((label, scheme["name"], execution))
         print(
@@ -830,7 +867,11 @@ for label in labels:
             study,
             candidate_set_name,
             members,
-            supersedes=SUPERSEDES_CANDIDATES.get(candidate_set_name),
+            supersedes=candidate_set_supersedes(
+                study,
+                name=candidate_set_name,
+                declared=SUPERSEDES_CANDIDATES.get(candidate_set_name),
+            ),
         )
         signal_candidate_members[label] = list(candidates.members)
         print(f"{candidates.name}: {len(candidates.members)} members")

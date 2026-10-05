@@ -30,9 +30,10 @@
 #   Ch19 overlay backtests, however many that currently is - the count is printed
 #   when the overlays load
 # - Identify which rule categories help vs hurt by case study
-# - Understand why tight stops destroy value in most cross-asset strategies
+# - Understand the mechanism by which a tight stop can cost a cross-asset
+#   strategy more than it saves
 #
-# **Book Reference**: Chapter 20, Section 20.7 (Risk Overlays and Stability Across Regimes)
+# **Book Reference**: Chapter 20, Section 20.7 (Risk overlays)
 #
 # **Prerequisites**: Run [`01_aggregate_synthesis`](01_aggregate_synthesis.ipynb) first.
 # Each case study's registry must contain Ch19 `risk_overlay`-stage backtests
@@ -54,6 +55,7 @@ from case_studies.utils.analytics import (
     SHORT_NAMES,
     load_chapter_backtests,
 )
+from case_studies.utils.strategy_analysis import rank_one
 from utils.style import show_with_alt
 
 # %% tags=["parameters"]
@@ -62,8 +64,6 @@ MAX_CASE_STUDIES = 0
 
 # %%
 CS_LIST = CASE_STUDY_IDS[:MAX_CASE_STUDIES] if MAX_CASE_STUDIES else CASE_STUDY_IDS
-DEFERRED_V31_CASE_STUDIES = {"nasdaq100_microstructure"}
-ACTIVE_CS_LIST = [cs for cs in CS_LIST if cs not in DEFERRED_V31_CASE_STUDIES]
 
 # %% [markdown]
 # ## Risk Configuration Classifier
@@ -122,7 +122,7 @@ def extract_risk_name(spec_json: str) -> str:
 # %%
 ch19_raw = load_chapter_backtests(
     "ch19",
-    case_studies=ACTIVE_CS_LIST,
+    case_studies=CS_LIST,
     metrics=["sharpe", "max_drawdown", "sortino", "total_return", "cagr"],
 )
 
@@ -138,15 +138,11 @@ risk_df = ch19_raw.with_columns(
 
 # %%
 # Baseline comes from Ch17 (allocation stage); per-CS fallback to Ch16 if absent.
-_ch17_raw = load_chapter_backtests(
-    "ch17", case_studies=ACTIVE_CS_LIST, metrics=["sharpe", "max_drawdown"]
-)
-_ch16_raw = load_chapter_backtests(
-    "ch16", case_studies=ACTIVE_CS_LIST, metrics=["sharpe", "max_drawdown"]
-)
+_ch17_raw = load_chapter_backtests("ch17", case_studies=CS_LIST, metrics=["sharpe", "max_drawdown"])
+_ch16_raw = load_chapter_backtests("ch16", case_studies=CS_LIST, metrics=["sharpe", "max_drawdown"])
 
 _baseline_rows = []
-for cs_id in ACTIVE_CS_LIST:
+for cs_id in CS_LIST:
     ch17_cs = (
         _ch17_raw.filter(pl.col("case_study") == cs_id)
         if not _ch17_raw.is_empty()
@@ -157,11 +153,14 @@ for cs_id in ACTIVE_CS_LIST:
         if not _ch16_raw.is_empty()
         else pl.DataFrame()
     )
+    # backtest_hash decides a tie: it is unique per row, so the baseline this loop
+    # picks is a function of the registry rather than of the order the frames were
+    # concatenated in. Allocations whose Sharpe repeats exactly are ordinary.
     if not ch17_cs.is_empty():
-        best = ch17_cs.sort("sharpe", descending=True).head(1)
+        best = rank_one(ch17_cs, by="sharpe", name="backtest_hash")
         _baseline_rows.append(best.with_columns(baseline_source=pl.lit("ch17")))
     elif not ch16_cs.is_empty():
-        best = ch16_cs.sort("sharpe", descending=True).head(1)
+        best = rank_one(ch16_cs, by="sharpe", name="backtest_hash")
         _baseline_rows.append(best.with_columns(baseline_source=pl.lit("ch16")))
 
 if _baseline_rows:
@@ -195,7 +194,6 @@ overlay_df = overlay_df.with_columns(
 
 n_cs = overlay_df["case_study"].n_unique()
 print(f"Loaded {len(overlay_df)} overlay results across {n_cs} case studies")
-print("Deferred to v3.1: NASDAQ-100 timing-corrected broad carrier risk grid")
 overlay_df.group_by("case_study").agg(
     n_overlays=pl.len(),
     best_sharpe=pl.col("sharpe").max(),
@@ -412,7 +410,6 @@ for i in range(len(hm_matrix.index)):
 
 fig.colorbar(im, ax=ax, label="Best Sharpe Delta", shrink=0.8)
 ax.set_title("Best Risk Overlay Effect by Rule Category × Case Study")
-fig.subplots_adjust(left=0.12, right=0.92, top=0.9, bottom=0.18)
 show_with_alt(
     fig,
     "Heatmap of the best Sharpe change achieved by each overlay category within "
@@ -422,8 +419,9 @@ show_with_alt(
 # %% [markdown]
 # ## Drawdown Protection
 #
-# Compare max drawdown reduction across case studies. Some overlays
-# reduce drawdown at the cost of Sharpe; others improve both.
+# Compare max drawdown reduction across case studies. An overlay can reduce
+# drawdown at the cost of Sharpe or improve both, and the table below separates
+# the two rather than reporting drawdown alone.
 
 # %%
 dd_improvement = (
@@ -677,9 +675,9 @@ display(
 #
 # ## Known Limitations
 #
-# - Only case studies with Ch19 overlay backtests appear; NASDAQ-100 is excluded
-#   pending a corrected risk grid and the rest have no overlay sweep. The loaded
-#   count is printed above.
+# - Only case studies with Ch19 overlay backtests appear; a case study that ran no
+#   overlay sweep is absent rather than shown as zero. The loaded count is printed
+#   above.
 # - Every Sharpe here is a validation-fold number, and the overlay was chosen by
 #   looking at it. The improvement of a best-of-sweep configuration is inflated by
 #   the size of the sweep, and no deflation is applied.
